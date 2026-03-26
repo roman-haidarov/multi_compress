@@ -236,7 +236,9 @@ end
 
 Dramatically improves compression on small, similar data (JSON APIs, configs, logs).
 
-### Training Dictionary
+**Important**: Dictionary training is only available for **Brotli** algorithm in this implementation.
+
+### Training Dictionary (Brotli only)
 
 ```ruby
 # Collect training samples (similar structure)
@@ -247,25 +249,27 @@ api_responses = [
   # ... more samples
 ]
 
-# Train dictionary (only zstd and brotli support dictionaries)
-dict = MultiCompress::Dictionary.train(api_responses, algo: :zstd, dict_size: 16384)
+# Train dictionary - only available for Brotli
+dict = MultiCompress::Brotli.train_dictionary(api_responses, size: 16384)
 
 # Save for reuse
 dict.save("api_v1.dict")
 ```
 
+**Note**: While ZSTD supports using pre-trained dictionaries, dictionary training is not available in this implementation. Only Brotli can both train and use dictionaries.
+
 ### Using Dictionary
 
 ```ruby
-# Load dictionary
-dict = MultiCompress::Dictionary.load("api_v1.dict", algo: :zstd)
+# Load dictionary (created with Brotli training)
+dict = MultiCompress::Dictionary.load("api_v1.dict", algo: :brotli)
 
-# MultiCompress with dictionary
+# MultiCompress with dictionary - use Brotli
 response = '{"status":"ok","users":[{"id":4,"name":"David"}]}'
-compressed = MultiCompress.compress(response, algo: :zstd, dictionary: dict)
+compressed = MultiCompress.compress(response, algo: :brotli, dictionary: dict)
 
 # Decompress with same dictionary
-original = MultiCompress.decompress(compressed, dictionary: dict)
+original = MultiCompress.decompress(compressed, algo: :brotli, dictionary: dict)
 
 puts original == response  # => true
 ```
@@ -273,10 +277,11 @@ puts original == response  # => true
 ### Dictionary with Streaming
 
 ```ruby
-dict = MultiCompress::Dictionary.load("api_v1.dict", algo: :zstd)
+# Load Brotli-trained dictionary 
+dict = MultiCompress::Dictionary.load("api_v1.dict", algo: :brotli)
 
-# MultiCompress multiple API responses
-deflater = MultiCompress::Deflater.new(algo: :zstd, level: 3, dictionary: dict)
+# MultiCompress multiple API responses using Brotli
+deflater = MultiCompress::Deflater.new(algo: :brotli, level: 6, dictionary: dict)
 
 api_responses.each do |response|
   compressed = deflater.write(response)
