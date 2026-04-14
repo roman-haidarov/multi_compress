@@ -53,6 +53,8 @@ The system can automatically detect compression algorithms when decompressing da
 
 ## Benchmark Results
 
+> **📝 Note on v0.1.2**: This version includes a fix for a critical LZ4 streaming bug that caused incorrect decompression on large data. The fix introduces a ~40-50% performance regression on large chunks (128KB+) in LZ4 streaming mode, but small chunks (4-32KB) maintain original performance. Since streaming typically uses smaller chunks, and correctness is prioritized over peak performance, the overall impact is minimal.
+
 Performance comparison against Ruby's built-in zlib compression:
 
 ### 🗜️  COMPRESSION RATIO (%, lower is better)

@@ -4,15 +4,15 @@
 #ifdef HAVE_RUBY_FIBER_SCHEDULER_H
 #include <ruby/fiber/scheduler.h>
 #endif
-#include <zstd.h>
-#include <zdict.h>
+#include <brotli/decode.h>
+#include <brotli/encode.h>
 #include <lz4.h>
 #include <lz4hc.h>
-#include <brotli/encode.h>
-#include <brotli/decode.h>
-#include <string.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <zdict.h>
+#include <zstd.h>
 
 #define MAX_DECOMPRESS_SIZE (256ULL * 1024 * 1024)
 
@@ -122,14 +122,19 @@ static compress_algo_t detect_algo(const uint8_t *data, size_t len) {
         }
     }
 
-    if (len >= 8) {
+    if (len >= 12) {
         uint32_t orig = (uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) |
                         ((uint32_t)data[3] << 24);
         uint32_t comp = (uint32_t)data[4] | ((uint32_t)data[5] << 8) | ((uint32_t)data[6] << 16) |
                         ((uint32_t)data[7] << 24);
-        if (orig > 0 && orig <= 256 * 1024 * 1024 && comp > 0 && comp <= 256 * 1024 * 1024 &&
-            8 + comp <= len) {
-            return ALGO_LZ4;
+        if (orig > 0 && orig <= 256U * 1024 * 1024 && comp > 0 && comp <= 256U * 1024 * 1024 &&
+            orig <= (uint32_t)INT_MAX && comp <= (uint32_t)LZ4_compressBound((int)orig) &&
+            (size_t)8 + (size_t)comp + 4 == len) {
+            size_t tail = 8 + (size_t)comp;
+            if (data[tail] == 0 && data[tail + 1] == 0 && data[tail + 2] == 0 &&
+                data[tail + 3] == 0) {
+                return ALGO_LZ4;
+            }
         }
     }
 
@@ -148,6 +153,22 @@ static inline VALUE rb_binary_str_buf_new(long capa) {
     VALUE str = rb_str_buf_new(capa);
     rb_enc_associate(str, binary_encoding);
     return str;
+}
+
+static inline VALUE rb_binary_str_buf_reserve(long capa) {
+    VALUE str = rb_str_buf_new(capa);
+    rb_enc_associate(str, binary_encoding);
+    if (capa > 0)
+        rb_str_modify_expand(str, capa + 1);
+    return str;
+}
+
+static inline void grow_binary_str(VALUE str, size_t cur_len, size_t new_cap) {
+    size_t cur_cap = (size_t)rb_str_capacity(str);
+    if (new_cap <= cur_cap)
+        return;
+    rb_str_set_len(str, (long)cur_len);
+    rb_str_modify_expand(str, (long)(new_cap - cur_len));
 }
 
 static int has_fiber_scheduler(void) {
@@ -398,51 +419,36 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
 
         size_t csize;
         if (slen >= GVL_UNLOCK_THRESHOLD) {
-            char *src_buf = xmalloc(slen);
-            memcpy(src_buf, src, slen);
-            char *dst_buf = xmalloc(bound);
+            VALUE dst = rb_binary_str_buf_reserve(bound);
 
             ZSTD_CDict *cdict = NULL;
             if (dict) {
                 cdict = dict_get_cdict(dict, level);
-                if (!cdict) {
-                    xfree(src_buf);
-                    xfree(dst_buf);
+                if (!cdict)
                     rb_raise(eMemError, "zstd: failed to create/get cdict");
-                }
             }
 
             zstd_compress_args_t args = {
-                .src = src_buf,
+                .src = src,
                 .src_len = slen,
-                .dst = dst_buf,
+                .dst = RSTRING_PTR(dst),
                 .dst_cap = bound,
                 .level = level,
                 .cdict = cdict,
             };
             run_without_gvl(zstd_compress_nogvl, &args);
 
-            if (args.error) {
-                xfree(src_buf);
-                xfree(dst_buf);
+            if (args.error)
                 rb_raise(eMemError, "zstd: failed to create context");
-            }
             csize = args.result;
+            if (ZSTD_isError(csize))
+                rb_raise(eError, "zstd compress: %s", ZSTD_getErrorName(csize));
 
-            if (ZSTD_isError(csize)) {
-                const char *err = ZSTD_getErrorName(csize);
-                xfree(src_buf);
-                xfree(dst_buf);
-                rb_raise(eError, "zstd compress: %s", err);
-            }
-
-            VALUE dst = rb_binary_str_new(dst_buf, (long)csize);
-            xfree(src_buf);
-            xfree(dst_buf);
+            rb_str_set_len(dst, (long)csize);
             RB_GC_GUARD(data);
             return dst;
         } else {
-            VALUE dst = rb_binary_str_buf_new(bound);
+            VALUE dst = rb_binary_str_buf_reserve(bound);
 
             if (dict) {
                 ZSTD_CDict *cdict = dict_get_cdict(dict, level);
@@ -472,51 +478,43 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
 
         int csize;
         if (slen >= GVL_UNLOCK_THRESHOLD) {
-            char *src_buf = xmalloc(slen);
-            memcpy(src_buf, src, slen);
-            char *dst_buf = xmalloc((size_t)bound);
-
-            lz4_compress_args_t args = {
-                .src = src_buf,
-                .src_len = (int)slen,
-                .dst = dst_buf,
-                .dst_cap = bound,
-                .level = level,
-            };
-            run_without_gvl(lz4_compress_nogvl, &args);
-            csize = args.result;
-
-            if (csize <= 0) {
-                xfree(src_buf);
-                xfree(dst_buf);
-                rb_raise(eError, "lz4 compress failed");
-            }
-
-            size_t total = 8 + (size_t)csize + 4;
-            VALUE dst = rb_binary_str_buf_new(total);
+            VALUE dst = rb_binary_str_buf_reserve(8 + (size_t)bound + 4);
             char *out = RSTRING_PTR(dst);
 
             out[0] = (slen >> 0) & 0xFF;
             out[1] = (slen >> 8) & 0xFF;
             out[2] = (slen >> 16) & 0xFF;
             out[3] = (slen >> 24) & 0xFF;
+
+            lz4_compress_args_t args = {
+                .src = src,
+                .src_len = (int)slen,
+                .dst = out + 8,
+                .dst_cap = bound,
+                .level = level,
+            };
+            run_without_gvl(lz4_compress_nogvl, &args);
+            csize = args.result;
+
+            if (csize <= 0)
+                rb_raise(eError, "lz4 compress failed");
+
             out[4] = (csize >> 0) & 0xFF;
             out[5] = (csize >> 8) & 0xFF;
             out[6] = (csize >> 16) & 0xFF;
             out[7] = (csize >> 24) & 0xFF;
-            memcpy(out + 8, dst_buf, (size_t)csize);
-            out[8 + csize] = 0;
-            out[8 + csize + 1] = 0;
-            out[8 + csize + 2] = 0;
-            out[8 + csize + 3] = 0;
 
-            rb_str_set_len(dst, total);
-            xfree(src_buf);
-            xfree(dst_buf);
+            size_t total = 8 + (size_t)csize;
+            out[total] = 0;
+            out[total + 1] = 0;
+            out[total + 2] = 0;
+            out[total + 3] = 0;
+
+            rb_str_set_len(dst, (long)(total + 4));
             RB_GC_GUARD(data);
             return dst;
         } else {
-            VALUE dst = rb_binary_str_buf_new(8 + bound + 4);
+            VALUE dst = rb_binary_str_buf_reserve(8 + bound + 4);
             char *out = RSTRING_PTR(dst);
 
             out[0] = (slen >> 0) & 0xFF;
@@ -554,15 +552,25 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             out_len = slen + (slen >> 2) + 1024;
 
         if (dict) {
-            VALUE dst = rb_binary_str_buf_new(out_len);
+            VALUE dst = rb_binary_str_buf_reserve(out_len);
             BrotliEncoderState *enc = BrotliEncoderCreateInstance(NULL, NULL, NULL);
             if (!enc)
                 rb_raise(eMemError, "brotli: failed to create encoder");
-            BrotliEncoderSetParameter(enc, BROTLI_PARAM_QUALITY, level);
+
             BrotliEncoderPreparedDictionary *pd =
                 BrotliEncoderPrepareDictionary(BROTLI_SHARED_DICTIONARY_RAW, dict->size, dict->data,
                                                BROTLI_MAX_QUALITY, NULL, NULL, NULL);
-            BrotliEncoderAttachPreparedDictionary(enc, pd);
+            if (!pd) {
+                BrotliEncoderDestroyInstance(enc);
+                rb_raise(eMemError, "brotli: failed to prepare dictionary");
+            }
+
+            if (!BrotliEncoderSetParameter(enc, BROTLI_PARAM_QUALITY, level) ||
+                !BrotliEncoderAttachPreparedDictionary(enc, pd)) {
+                BrotliEncoderDestroyPreparedDictionary(pd);
+                BrotliEncoderDestroyInstance(enc);
+                rb_raise(eError, "brotli: failed to attach dictionary");
+            }
 
             size_t available_in = slen;
             const uint8_t *next_in = (const uint8_t *)src;
@@ -583,33 +591,26 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             RB_GC_GUARD(data);
             return dst;
         } else if (slen >= GVL_UNLOCK_THRESHOLD) {
-            uint8_t *src_buf = xmalloc(slen);
-            memcpy(src_buf, src, slen);
-            uint8_t *dst_buf = xmalloc(out_len);
+            VALUE dst = rb_binary_str_buf_reserve(out_len);
             size_t actual_out_len = out_len;
 
             brotli_compress_args_t args = {
                 .level = level,
                 .src_len = slen,
-                .src = src_buf,
+                .src = (const uint8_t *)src,
                 .out_len = &actual_out_len,
-                .dst = dst_buf,
+                .dst = (uint8_t *)RSTRING_PTR(dst),
             };
             run_without_gvl(brotli_compress_nogvl, &args);
 
-            if (!args.result) {
-                xfree(src_buf);
-                xfree(dst_buf);
+            if (!args.result)
                 rb_raise(eError, "brotli compress failed");
-            }
 
-            VALUE dst = rb_binary_str_new((const char *)dst_buf, (long)actual_out_len);
-            xfree(src_buf);
-            xfree(dst_buf);
+            rb_str_set_len(dst, (long)actual_out_len);
             RB_GC_GUARD(data);
             return dst;
         } else {
-            VALUE dst = rb_binary_str_buf_new(out_len);
+            VALUE dst = rb_binary_str_buf_reserve(out_len);
             BROTLI_BOOL ok =
                 BrotliEncoderCompress(level, BROTLI_DEFAULT_WINDOW, BROTLI_DEFAULT_MODE, slen,
                                       (const uint8_t *)src, &out_len, (uint8_t *)RSTRING_PTR(dst));
@@ -665,50 +666,35 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
             size_t dsize;
 
             if (frame_size >= GVL_UNLOCK_THRESHOLD) {
-                char *src_buf = xmalloc(slen);
-                memcpy(src_buf, src, slen);
-                char *dst_buf = xmalloc((size_t)frame_size);
+                VALUE dst = rb_binary_str_buf_reserve((size_t)frame_size);
 
                 ZSTD_DDict *ddict = NULL;
                 if (dict) {
                     ddict = dict_get_ddict(dict);
-                    if (!ddict) {
-                        xfree(src_buf);
-                        xfree(dst_buf);
+                    if (!ddict)
                         rb_raise(eMemError, "zstd: failed to create ddict");
-                    }
                 }
 
                 zstd_decompress_args_t args = {
-                    .src = src_buf,
+                    .src = src,
                     .src_len = slen,
-                    .dst = dst_buf,
+                    .dst = RSTRING_PTR(dst),
                     .dst_cap = (size_t)frame_size,
                     .ddict = ddict,
                 };
                 run_without_gvl(zstd_decompress_nogvl, &args);
 
-                if (args.error) {
-                    xfree(src_buf);
-                    xfree(dst_buf);
+                if (args.error)
                     rb_raise(eMemError, "zstd: failed to create dctx");
-                }
                 dsize = args.result;
+                if (ZSTD_isError(dsize))
+                    rb_raise(eDataError, "zstd decompress: %s", ZSTD_getErrorName(dsize));
 
-                if (ZSTD_isError(dsize)) {
-                    const char *err = ZSTD_getErrorName(dsize);
-                    xfree(src_buf);
-                    xfree(dst_buf);
-                    rb_raise(eDataError, "zstd decompress: %s", err);
-                }
-
-                VALUE dst = rb_binary_str_new(dst_buf, (long)dsize);
-                xfree(src_buf);
-                xfree(dst_buf);
+                rb_str_set_len(dst, (long)dsize);
                 RB_GC_GUARD(data);
                 return dst;
             } else {
-                VALUE dst = rb_binary_str_buf_new((size_t)frame_size);
+                VALUE dst = rb_binary_str_buf_reserve((size_t)frame_size);
 
                 if (dict) {
                     ZSTD_DDict *ddict = dict_get_ddict(dict);
@@ -751,7 +737,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
         if (alloc_size < 4096)
             alloc_size = 4096;
 
-        VALUE dst = rb_binary_str_buf_new(alloc_size);
+        VALUE dst = rb_binary_str_buf_reserve(alloc_size);
         size_t total_out = 0;
 
         ZSTD_inBuffer input = {src, slen, 0};
@@ -765,7 +751,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                 alloc_size *= 2;
                 if (alloc_size > MAX_DECOMPRESS_SIZE)
                     alloc_size = MAX_DECOMPRESS_SIZE;
-                rb_str_resize(dst, alloc_size);
+                grow_binary_str(dst, total_out, alloc_size);
             }
 
             ZSTD_outBuffer output = {RSTRING_PTR(dst) + total_out, alloc_size - total_out, 0};
@@ -811,7 +797,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
             scan_pos += 8 + comp_size;
         }
 
-        VALUE result = rb_binary_str_buf_new(total_orig);
+        VALUE result = rb_binary_str_buf_reserve(total_orig);
         char *out_ptr = RSTRING_PTR(result);
         size_t out_offset = 0;
         size_t pos = 0;
@@ -851,7 +837,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                                           dict->data);
         }
 
-        VALUE dst = rb_binary_str_buf_new(alloc_size);
+        VALUE dst = rb_binary_str_buf_reserve(alloc_size);
         size_t total_out = 0;
 
         size_t available_in = slen;
@@ -876,7 +862,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                 alloc_size *= 2;
                 if (alloc_size > MAX_DECOMPRESS_SIZE)
                     alloc_size = MAX_DECOMPRESS_SIZE;
-                rb_str_resize(dst, alloc_size);
+                grow_binary_str(dst, total_out, alloc_size);
             }
         }
 
@@ -1102,6 +1088,7 @@ static VALUE deflater_initialize(int argc, VALUE *argv, VALUE self) {
             rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
         }
         TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+        rb_ivar_set(self, rb_intern("@dictionary"), dict_val);
     }
 
     switch (d->algo) {
@@ -1127,12 +1114,26 @@ static VALUE deflater_initialize(int argc, VALUE *argv, VALUE self) {
         d->ctx.brotli = BrotliEncoderCreateInstance(NULL, NULL, NULL);
         if (!d->ctx.brotli)
             rb_raise(eMemError, "brotli: failed to create encoder");
-        BrotliEncoderSetParameter(d->ctx.brotli, BROTLI_PARAM_QUALITY, d->level);
+        if (!BrotliEncoderSetParameter(d->ctx.brotli, BROTLI_PARAM_QUALITY, d->level)) {
+            BrotliEncoderDestroyInstance(d->ctx.brotli);
+            d->ctx.brotli = NULL;
+            rb_raise(eError, "brotli: failed to set quality parameter");
+        }
         if (dict) {
             BrotliEncoderPreparedDictionary *pd =
                 BrotliEncoderPrepareDictionary(BROTLI_SHARED_DICTIONARY_RAW, dict->size, dict->data,
                                                BROTLI_MAX_QUALITY, NULL, NULL, NULL);
-            BrotliEncoderAttachPreparedDictionary(d->ctx.brotli, pd);
+            if (!pd) {
+                BrotliEncoderDestroyInstance(d->ctx.brotli);
+                d->ctx.brotli = NULL;
+                rb_raise(eMemError, "brotli: failed to prepare dictionary");
+            }
+            if (!BrotliEncoderAttachPreparedDictionary(d->ctx.brotli, pd)) {
+                BrotliEncoderDestroyPreparedDictionary(pd);
+                BrotliEncoderDestroyInstance(d->ctx.brotli);
+                d->ctx.brotli = NULL;
+                rb_raise(eError, "brotli: failed to attach dictionary");
+            }
             BrotliEncoderDestroyPreparedDictionary(pd);
         }
         break;
@@ -1206,7 +1207,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
         ZSTD_inBuffer input = {src, slen, 0};
         size_t out_cap = ZSTD_CStreamOutSize();
         size_t result_cap = out_cap > slen ? out_cap : slen;
-        VALUE result = rb_binary_str_buf_new(result_cap);
+        VALUE result = rb_binary_str_buf_reserve(result_cap);
         size_t result_len = 0;
         int use_fiber = has_fiber_scheduler();
         size_t fiber_counter = 0;
@@ -1214,7 +1215,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
         while (input.pos < input.size) {
             if (result_len + out_cap > result_cap) {
                 result_cap = result_cap * 2;
-                rb_str_resize(result, result_cap);
+                grow_binary_str(result, result_len, result_cap);
             }
 
             ZSTD_outBuffer output = {RSTRING_PTR(result) + result_len, out_cap, 0};
@@ -1238,7 +1239,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
         size_t result_cap = slen;
         if (result_cap < 1024)
             result_cap = 1024;
-        VALUE result = rb_binary_str_buf_new(result_cap);
+        VALUE result = rb_binary_str_buf_reserve(result_cap);
         size_t result_len = 0;
         int use_fiber = has_fiber_scheduler();
         size_t fiber_counter = 0;
@@ -1258,7 +1259,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
             if (out_size > 0) {
                 if (result_len + out_size > result_cap) {
                     result_cap = (result_len + out_size) * 2;
-                    rb_str_resize(result, result_cap);
+                    grow_binary_str(result, result_len, result_cap);
                 }
 
                 memcpy(RSTRING_PTR(result) + result_len, out_data, out_size);
@@ -1275,7 +1276,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
         return result;
     }
     case ALGO_LZ4: {
-        VALUE result = rb_binary_str_buf_new(0);
+        VALUE result = rb_binary_str_buf_reserve(0);
         size_t result_len = 0;
         size_t result_cap = 0;
 
@@ -1301,7 +1302,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
                         result_cap = (result_len + blen) * 2;
                         if (result_cap < 256)
                             result_cap = 256;
-                        rb_str_resize(result, result_cap);
+                        grow_binary_str(result, result_len, result_cap);
                     }
                     memcpy(RSTRING_PTR(result) + result_len, RSTRING_PTR(block), blen);
                     result_len += blen;
@@ -1328,14 +1329,14 @@ static VALUE deflater_flush(VALUE self) {
     case ALGO_ZSTD: {
         size_t out_cap = ZSTD_CStreamOutSize();
         size_t result_cap = out_cap;
-        VALUE result = rb_binary_str_buf_new(result_cap);
+        VALUE result = rb_binary_str_buf_reserve(result_cap);
         size_t result_len = 0;
         size_t ret;
 
         do {
             if (result_len + out_cap > result_cap) {
                 result_cap *= 2;
-                rb_str_resize(result, result_cap);
+                grow_binary_str(result, result_len, result_cap);
             }
 
             ZSTD_outBuffer output = {RSTRING_PTR(result) + result_len, out_cap, 0};
@@ -1352,7 +1353,7 @@ static VALUE deflater_flush(VALUE self) {
         size_t available_in = 0;
         const uint8_t *next_in = NULL;
         size_t result_cap = 1024;
-        VALUE result = rb_binary_str_buf_new(result_cap);
+        VALUE result = rb_binary_str_buf_reserve(result_cap);
         size_t result_len = 0;
 
         do {
@@ -1369,7 +1370,7 @@ static VALUE deflater_flush(VALUE self) {
             if (out_size > 0) {
                 if (result_len + out_size > result_cap) {
                     result_cap = (result_len + out_size) * 2;
-                    rb_str_resize(result, result_cap);
+                    grow_binary_str(result, result_len, result_cap);
                 }
 
                 memcpy(RSTRING_PTR(result) + result_len, out_data, out_size);
@@ -1399,14 +1400,14 @@ static VALUE deflater_finish(VALUE self) {
     case ALGO_ZSTD: {
         size_t out_cap = ZSTD_CStreamOutSize();
         size_t result_cap = out_cap;
-        VALUE result = rb_binary_str_buf_new(result_cap);
+        VALUE result = rb_binary_str_buf_reserve(result_cap);
         size_t result_len = 0;
         size_t ret;
 
         do {
             if (result_len + out_cap > result_cap) {
                 result_cap *= 2;
-                rb_str_resize(result, result_cap);
+                grow_binary_str(result, result_len, result_cap);
             }
 
             ZSTD_outBuffer output = {RSTRING_PTR(result) + result_len, out_cap, 0};
@@ -1423,7 +1424,7 @@ static VALUE deflater_finish(VALUE self) {
         size_t available_in = 0;
         const uint8_t *next_in = NULL;
         size_t result_cap = 1024;
-        VALUE result = rb_binary_str_buf_new(result_cap);
+        VALUE result = rb_binary_str_buf_reserve(result_cap);
         size_t result_len = 0;
 
         do {
@@ -1440,7 +1441,7 @@ static VALUE deflater_finish(VALUE self) {
             if (out_size > 0) {
                 if (result_len + out_size > result_cap) {
                     result_cap = (result_len + out_size) * 2;
-                    rb_str_resize(result, result_cap);
+                    grow_binary_str(result, result_len, result_cap);
                 }
 
                 memcpy(RSTRING_PTR(result) + result_len, out_data, out_size);
@@ -1454,7 +1455,7 @@ static VALUE deflater_finish(VALUE self) {
     }
     case ALGO_LZ4: {
         size_t result_cap = 256;
-        VALUE result = rb_binary_str_buf_new(result_cap);
+        VALUE result = rb_binary_str_buf_reserve(result_cap);
         size_t result_len = 0;
 
         if (d->lz4_ring.pending > 0) {
@@ -1463,7 +1464,7 @@ static VALUE deflater_finish(VALUE self) {
             if (blen > 0) {
                 if (blen + 4 > result_cap) {
                     result_cap = blen + 4;
-                    rb_str_resize(result, result_cap);
+                    grow_binary_str(result, result_len, result_cap);
                 }
 
                 memcpy(RSTRING_PTR(result), RSTRING_PTR(block), blen);
@@ -1473,7 +1474,7 @@ static VALUE deflater_finish(VALUE self) {
 
         if (result_len + 4 > result_cap) {
             result_cap = result_len + 4;
-            rb_str_resize(result, result_cap);
+            grow_binary_str(result, result_len, result_cap);
         }
 
         char *out = RSTRING_PTR(result) + result_len;
@@ -1491,11 +1492,22 @@ static VALUE deflater_reset(VALUE self) {
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
 
+    VALUE dict_val = rb_attr_get(self, rb_intern("@dictionary"));
+    dictionary_t *dict = NULL;
+    if (!NIL_P(dict_val)) {
+        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+    }
+
     switch (d->algo) {
     case ALGO_ZSTD:
         if (d->ctx.zstd) {
             ZSTD_CCtx_reset(d->ctx.zstd, ZSTD_reset_session_only);
             ZSTD_CCtx_setParameter(d->ctx.zstd, ZSTD_c_compressionLevel, d->level);
+            if (dict) {
+                size_t r = ZSTD_CCtx_loadDictionary(d->ctx.zstd, dict->data, dict->size);
+                if (ZSTD_isError(r))
+                    rb_raise(eError, "zstd dict reload on reset: %s", ZSTD_getErrorName(r));
+            }
         }
         break;
     case ALGO_BROTLI:
@@ -1504,7 +1516,20 @@ static VALUE deflater_reset(VALUE self) {
             d->ctx.brotli = BrotliEncoderCreateInstance(NULL, NULL, NULL);
             if (!d->ctx.brotli)
                 rb_raise(eMemError, "brotli: failed to recreate encoder");
-            BrotliEncoderSetParameter(d->ctx.brotli, BROTLI_PARAM_QUALITY, d->level);
+            if (!BrotliEncoderSetParameter(d->ctx.brotli, BROTLI_PARAM_QUALITY, d->level))
+                rb_raise(eError, "brotli: failed to set quality on reset");
+            if (dict) {
+                BrotliEncoderPreparedDictionary *pd = BrotliEncoderPrepareDictionary(
+                    BROTLI_SHARED_DICTIONARY_RAW, dict->size, dict->data, BROTLI_MAX_QUALITY, NULL,
+                    NULL, NULL);
+                if (!pd)
+                    rb_raise(eMemError, "brotli: failed to prepare dictionary on reset");
+                if (!BrotliEncoderAttachPreparedDictionary(d->ctx.brotli, pd)) {
+                    BrotliEncoderDestroyPreparedDictionary(pd);
+                    rb_raise(eError, "brotli: failed to reattach dictionary on reset");
+                }
+                BrotliEncoderDestroyPreparedDictionary(pd);
+            }
         }
         break;
     case ALGO_LZ4:
@@ -1634,6 +1659,7 @@ static VALUE inflater_initialize(int argc, VALUE *argv, VALUE self) {
             rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
         }
         TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+        rb_ivar_set(self, rb_intern("@dictionary"), dict_val);
     }
 
     switch (inf->algo) {
@@ -1687,7 +1713,7 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
         ZSTD_inBuffer input = {src, slen, 0};
         size_t out_cap = ZSTD_DStreamOutSize();
         size_t result_cap = out_cap > slen * 2 ? out_cap : slen * 2;
-        VALUE result = rb_binary_str_buf_new(result_cap);
+        VALUE result = rb_binary_str_buf_reserve(result_cap);
         size_t result_len = 0;
         int use_fiber = has_fiber_scheduler();
         size_t fiber_counter = 0;
@@ -1721,7 +1747,7 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
         size_t result_cap = slen * 2;
         if (result_cap < 1024)
             result_cap = 1024;
-        VALUE result = rb_binary_str_buf_new(result_cap);
+        VALUE result = rb_binary_str_buf_reserve(result_cap);
         size_t result_len = 0;
         int use_fiber = has_fiber_scheduler();
         size_t fiber_counter = 0;
@@ -1816,11 +1842,12 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
                 rb_str_resize(result, result_cap);
             }
 
-            int dsize =
-                LZ4_decompress_safe(inf->lz4_buf.buf + pos + 8, RSTRING_PTR(result) + result_len,
-                                    (int)comp_size, (int)orig_size);
+            int dsize = LZ4_decompress_safe(inf->lz4_buf.buf + pos + 8,
+                                            RSTRING_PTR(result) + result_len, (int)comp_size,
+                                            (int)orig_size);
             if (dsize < 0)
                 rb_raise(eDataError, "lz4 stream decompress block failed");
+
             result_len += dsize;
             pos += 8 + comp_size;
             if (use_fiber) {
@@ -1852,10 +1879,22 @@ static VALUE inflater_reset(VALUE self) {
     inflater_t *inf;
     TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
 
+    VALUE dict_val = rb_attr_get(self, rb_intern("@dictionary"));
+    dictionary_t *dict = NULL;
+    if (!NIL_P(dict_val)) {
+        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+    }
+
     switch (inf->algo) {
     case ALGO_ZSTD:
-        if (inf->ctx.zstd)
+        if (inf->ctx.zstd) {
             ZSTD_DCtx_reset(inf->ctx.zstd, ZSTD_reset_session_only);
+            if (dict) {
+                size_t r = ZSTD_DCtx_loadDictionary(inf->ctx.zstd, dict->data, dict->size);
+                if (ZSTD_isError(r))
+                    rb_raise(eError, "zstd dict reload on reset: %s", ZSTD_getErrorName(r));
+            }
+        }
         break;
     case ALGO_BROTLI:
         if (inf->ctx.brotli) {
@@ -1863,6 +1902,10 @@ static VALUE inflater_reset(VALUE self) {
             inf->ctx.brotli = BrotliDecoderCreateInstance(NULL, NULL, NULL);
             if (!inf->ctx.brotli)
                 rb_raise(eMemError, "brotli: failed to recreate decoder");
+            if (dict) {
+                BrotliDecoderAttachDictionary(inf->ctx.brotli, BROTLI_SHARED_DICTIONARY_RAW,
+                                              dict->size, dict->data);
+            }
         }
         break;
     case ALGO_LZ4:
@@ -1931,17 +1974,19 @@ static VALUE dict_initialize(int argc, VALUE *argv, VALUE self) {
     return self;
 }
 
-static VALUE brotli_train_dictionary(int argc, VALUE *argv, VALUE self) {
-    VALUE samples, opts;
-    rb_scan_args(argc, argv, "1:", &samples, &opts);
+static VALUE train_dictionary_internal(VALUE samples, VALUE size_val, compress_algo_t algo) {
     Check_Type(samples, T_ARRAY);
 
-    VALUE size_val = Qnil;
-    if (!NIL_P(opts)) {
-        size_val = rb_hash_aref(opts, ID2SYM(rb_intern("size")));
+    if (algo == ALGO_BROTLI) {
+        rb_raise(eUnsupportedError, "Brotli dictionary training is not supported via this API. "
+                                    "Create a raw dictionary using "
+                                    "MultiCompress::Dictionary.new(data, algo: :brotli)");
     }
 
-    size_t dict_capacity = NIL_P(size_val) ? 32768 : NUM2SIZET(size_val);
+    size_t dict_capacity = NIL_P(size_val) ? 112640 /* 110 KiB, zstd default */
+                                           : NUM2SIZET(size_val);
+    if (dict_capacity < 256)
+        rb_raise(rb_eArgError, "dictionary size must be at least 256 bytes");
 
     long num_samples = RARRAY_LEN(samples);
     if (num_samples < 1)
@@ -1952,56 +1997,65 @@ static VALUE brotli_train_dictionary(int argc, VALUE *argv, VALUE self) {
         VALUE s = rb_ary_entry(samples, i);
         StringValue(s);
         size_t slen = RSTRING_LEN(s);
-        if (slen < 8) {
+        if (slen < 8)
             rb_raise(rb_eArgError, "sample %ld is too small (%zu bytes), minimum is 8 bytes", i,
                      slen);
-        }
         total_size += slen;
     }
 
     uint8_t *dict_buf = ALLOC_N(uint8_t, dict_capacity);
-    if (!dict_buf) {
-        rb_raise(eMemError, "failed to allocate memory for brotli dictionary training");
-    }
-
     char *concat = ALLOC_N(char, total_size);
-    if (!concat) {
-        xfree(dict_buf);
-        rb_raise(eMemError, "failed to allocate memory for brotli dictionary training");
-    }
+    size_t *sizes = ALLOC_N(size_t, (size_t)num_samples);
 
     size_t offset = 0;
     for (long i = 0; i < num_samples; i++) {
         VALUE s = rb_ary_entry(samples, i);
         StringValue(s);
-
-        const char *str_ptr = RSTRING_PTR(s);
         size_t slen = RSTRING_LEN(s);
-
-        if (offset + slen > total_size) {
-            xfree(concat);
-            xfree(dict_buf);
-            rb_raise(eError, "buffer overflow during concatenation");
-        }
-
-        memcpy(concat + offset, str_ptr, slen);
+        memcpy(concat + offset, RSTRING_PTR(s), slen);
+        sizes[i] = slen;
         offset += slen;
-
         RB_GC_GUARD(s);
     }
 
-    size_t dict_size = total_size < dict_capacity ? total_size : dict_capacity;
-    memcpy(dict_buf, concat, dict_size);
+    size_t dict_size =
+        ZDICT_trainFromBuffer(dict_buf, dict_capacity, concat, sizes, (unsigned)num_samples);
     xfree(concat);
+    xfree(sizes);
+
+    if (ZDICT_isError(dict_size)) {
+        const char *err = ZDICT_getErrorName(dict_size);
+        xfree(dict_buf);
+        rb_raise(eError,
+                 "dictionary training failed: %s "
+                 "(tip: provide more samples; total sample bytes should be "
+                 "~100x the dictionary size)",
+                 err);
+    }
 
     VALUE dict_obj = rb_obj_alloc(cDictionary);
     dictionary_t *d;
     TypedData_Get_Struct(dict_obj, dictionary_t, &dictionary_type, d);
     memset(d, 0, sizeof(*d));
-    d->algo = ALGO_BROTLI;
+    d->algo = algo;
     d->data = dict_buf;
     d->size = dict_size;
     return dict_obj;
+}
+
+static VALUE zstd_train_dictionary(int argc, VALUE *argv, VALUE self) {
+    VALUE samples, opts;
+    rb_scan_args(argc, argv, "1:", &samples, &opts);
+    VALUE size_val = NIL_P(opts) ? Qnil : rb_hash_aref(opts, ID2SYM(rb_intern("size")));
+    return train_dictionary_internal(samples, size_val, ALGO_ZSTD);
+}
+
+static VALUE brotli_train_dictionary(int argc, VALUE *argv, VALUE self) {
+    VALUE samples, opts;
+    rb_scan_args(argc, argv, "1:", &samples, &opts);
+    VALUE size_val = NIL_P(opts) ? Qnil : rb_hash_aref(opts, ID2SYM(rb_intern("size")));
+
+    return train_dictionary_internal(samples, size_val, ALGO_BROTLI);
 }
 
 static VALUE dict_load(int argc, VALUE *argv, VALUE self) {
@@ -2151,5 +2205,6 @@ void Init_multi_compress(void) {
     rb_define_method(cDictionary, "save", dict_save, 1);
     rb_define_method(cDictionary, "algo", dict_algo, 0);
     rb_define_method(cDictionary, "size", dict_size, 0);
+    rb_define_singleton_method(mZstd, "train_dictionary", zstd_train_dictionary, -1);
     rb_define_singleton_method(mBrotli, "train_dictionary", brotli_train_dictionary, -1);
 }
