@@ -6,13 +6,15 @@ Gem::Specification.new do |spec|
   spec.authors       = ["Roman Haydarov"]
   spec.email         = ["romnhajdarov@gmail.com"]
 
-  spec.summary       = "Modern compression for Ruby: zstd, lz4, brotli in one gem"
+  spec.summary       = "Modern fiber-friendly compression for Ruby: zstd, lz4, brotli in one gem"
   spec.description   = "Unified C-extension gem for zstd, lz4, and brotli compression. " \
                         "One-shot, streaming, IO wrappers, dictionary support. " \
+                        "Fiber-friendly: cooperates with Fiber::Scheduler (async, falcon) " \
+                        "so CPU-heavy compression never blocks the event loop. " \
                         "Ships vendored sources — no system libraries required."
   spec.homepage      = "https://github.com/roman-haidarov/multi_compress"
   spec.license       = "MIT"
-  spec.required_ruby_version = ">= 2.7.0"
+  spec.required_ruby_version = ">= 3.1.0"
 
   spec.metadata["homepage_uri"]    = spec.homepage
   spec.metadata["source_code_uri"] = spec.homepage
