@@ -166,6 +166,10 @@ end
 $CFLAGS += " -O2"
 $CFLAGS += " -DXXH_NAMESPACE=MULTICOMPRESS_"
 
+have_header("ruby/fiber/scheduler.h")
+
+have_library("pthread") unless RUBY_PLATFORM.include?("darwin")
+
 create_makefile("multi_compress/multi_compress")
 
 patch_makefile_vpath!(vpath_dirs) if VENDORED && !USE_SYSTEM && vpath_dirs

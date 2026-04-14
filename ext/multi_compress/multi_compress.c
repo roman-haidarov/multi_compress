@@ -1,16 +1,16 @@
 #include <ruby.h>
 #include <ruby/encoding.h>
 #include <ruby/thread.h>
-#ifdef HAVE_RUBY_FIBER_SCHEDULER_H
 #include <ruby/fiber/scheduler.h>
-#endif
 #include <brotli/decode.h>
 #include <brotli/encode.h>
 #include <lz4.h>
 #include <lz4hc.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <zdict.h>
 #include <zstd.h>
 
@@ -18,6 +18,7 @@
 
 #define GVL_UNLOCK_THRESHOLD (64 * 1024)
 #define FIBER_YIELD_CHUNK    (64 * 1024)
+#define FIBER_STREAM_THRESHOLD (16 * 1024)
 
 static VALUE mMultiCompress;
 static VALUE eError;
@@ -171,13 +172,15 @@ static inline void grow_binary_str(VALUE str, size_t cur_len, size_t new_cap) {
     rb_str_modify_expand(str, (long)(new_cap - cur_len));
 }
 
+static VALUE current_fiber_scheduler(void) {
+    VALUE sched = rb_fiber_scheduler_current();
+    if (sched == Qnil || sched == Qfalse)
+        return Qnil;
+    return sched;
+}
+
 static int has_fiber_scheduler(void) {
-#ifdef HAVE_RB_FIBER_SCHEDULER_CURRENT
-    VALUE scheduler = rb_fiber_scheduler_current();
-    return scheduler != Qnil && scheduler != Qfalse;
-#else
-    return 0;
-#endif
+    return current_fiber_scheduler() != Qnil;
 }
 
 static void unblock_noop(void *arg) {
@@ -188,13 +191,49 @@ static inline void run_without_gvl(void *(*func)(void *), void *arg) {
     rb_thread_call_without_gvl(func, arg, unblock_noop, NULL);
 }
 
+typedef struct {
+    void *(*func)(void *);
+    void *arg;
+
+    VALUE scheduler;
+    VALUE blocker;
+    VALUE fiber;
+} fiber_worker_ctx_t;
+
+static void *fiber_worker_nogvl(void *arg) {
+    fiber_worker_ctx_t *c = (fiber_worker_ctx_t *)arg;
+    c->func(c->arg);
+    return NULL;
+}
+
+static VALUE fiber_worker_thread(void *arg) {
+    fiber_worker_ctx_t *c = (fiber_worker_ctx_t *)arg;
+    rb_thread_call_without_gvl(fiber_worker_nogvl, c, RUBY_UBF_PROCESS, NULL);
+    rb_fiber_scheduler_unblock(c->scheduler, c->blocker, c->fiber);
+    return Qnil;
+}
+
+static void run_via_fiber_worker(VALUE scheduler, void *(*func)(void *), void *arg) {
+    fiber_worker_ctx_t ctx = {
+        .func      = func,
+        .arg       = arg,
+        .scheduler = scheduler,
+        .blocker   = rb_obj_alloc(rb_cObject),
+        .fiber     = rb_fiber_current(),
+    };
+    VALUE th = rb_thread_create(fiber_worker_thread, &ctx);
+    rb_fiber_scheduler_block(scheduler, ctx.blocker, Qnil);
+    rb_funcall(th, rb_intern("join"), 0);
+}
+
 static inline size_t fiber_maybe_yield(size_t bytes_since_yield, size_t just_processed,
                                        int *did_yield) {
     *did_yield = 0;
     bytes_since_yield += just_processed;
     if (bytes_since_yield >= FIBER_YIELD_CHUNK) {
-        if (has_fiber_scheduler()) {
-            rb_thread_schedule();
+        VALUE scheduler = current_fiber_scheduler();
+        if (scheduler != Qnil) {
+            rb_funcall(scheduler, rb_intern("yield"), 0);
             *did_yield = 1;
         }
         return 0;
@@ -353,6 +392,48 @@ static void *zstd_decompress_nogvl(void *arg) {
 }
 
 typedef struct {
+    const uint8_t *src;
+    size_t src_len;
+    char *dst;
+    size_t out_offset;
+    int error;
+    char err_msg[64];
+} lz4_decompress_all_args_t;
+
+static void *lz4_decompress_all_nogvl(void *arg) {
+    lz4_decompress_all_args_t *a = (lz4_decompress_all_args_t *)arg;
+    const uint8_t *src = a->src;
+    size_t slen = a->src_len;
+    char *out_ptr = a->dst;
+    size_t out_offset = 0;
+    size_t pos = 0;
+
+    while (pos + 4 <= slen) {
+        uint32_t orig_size = (uint32_t)src[pos] | ((uint32_t)src[pos + 1] << 8) |
+                             ((uint32_t)src[pos + 2] << 16) | ((uint32_t)src[pos + 3] << 24);
+        if (orig_size == 0)
+            break;
+        uint32_t comp_size = (uint32_t)src[pos + 4] | ((uint32_t)src[pos + 5] << 8) |
+                             ((uint32_t)src[pos + 6] << 16) | ((uint32_t)src[pos + 7] << 24);
+
+        int dsize = LZ4_decompress_safe((const char *)(src + pos + 8), out_ptr + out_offset,
+                                        (int)comp_size, (int)orig_size);
+        if (dsize < 0) {
+            a->error = 1;
+            snprintf(a->err_msg, sizeof(a->err_msg), "lz4 decompress failed");
+            return NULL;
+        }
+
+        out_offset += dsize;
+        pos += 8 + comp_size;
+    }
+
+    a->out_offset = out_offset;
+    a->error = 0;
+    return NULL;
+}
+
+typedef struct {
     const char *src;
     int src_len;
     char *dst;
@@ -387,6 +468,152 @@ static void *brotli_compress_nogvl(void *arg) {
     return NULL;
 }
 
+typedef struct {
+    ZSTD_CStream *cstream;
+    ZSTD_outBuffer *output;
+    ZSTD_inBuffer *input;
+    size_t result;
+} zstd_stream_chunk_args_t;
+
+static void *zstd_compress_stream_chunk_nogvl(void *arg) {
+    zstd_stream_chunk_args_t *a = (zstd_stream_chunk_args_t *)arg;
+    a->result = ZSTD_compressStream(a->cstream, a->output, a->input);
+    return NULL;
+}
+
+typedef struct {
+    const char  *src;
+    size_t       src_len;
+    int          level;
+    ZSTD_CDict *cdict;
+    char        *dst;
+    size_t       dst_cap;
+    size_t       result;
+    int          error;
+
+    VALUE        scheduler;
+    VALUE        blocker;
+    VALUE        fiber;
+} zstd_fiber_compress_t;
+
+typedef struct {
+    ZSTD_CStream *cstream;
+    ZSTD_inBuffer *input;
+    ZSTD_outBuffer *output;
+    size_t result;
+
+    VALUE scheduler;
+    VALUE blocker;
+    VALUE fiber;
+} zstd_stream_chunk_fiber_t;
+
+static void *zstd_stream_chunk_fiber_nogvl(void *arg) {
+    zstd_stream_chunk_fiber_t *a = (zstd_stream_chunk_fiber_t *)arg;
+    a->result = ZSTD_compressStream(a->cstream, a->output, a->input);
+    return NULL;
+}
+
+static VALUE zstd_stream_chunk_fiber_thread(void *arg) {
+    zstd_stream_chunk_fiber_t *a = (zstd_stream_chunk_fiber_t *)arg;
+    rb_thread_call_without_gvl(zstd_stream_chunk_fiber_nogvl, a, RUBY_UBF_PROCESS, NULL);
+    rb_fiber_scheduler_unblock(a->scheduler, a->blocker, a->fiber);
+    return Qnil;
+}
+
+typedef struct {
+    BrotliEncoderState *enc;
+    BrotliEncoderOperation op;
+    size_t *available_in;
+    const uint8_t **next_in;
+    size_t *available_out;
+    uint8_t **next_out;
+    BROTLI_BOOL result;
+
+    VALUE scheduler;
+    VALUE blocker;
+    VALUE fiber;
+} brotli_stream_chunk_fiber_t;
+
+static void *brotli_stream_chunk_fiber_nogvl(void *arg) {
+    brotli_stream_chunk_fiber_t *a = (brotli_stream_chunk_fiber_t *)arg;
+    a->result = BrotliEncoderCompressStream(a->enc, a->op, a->available_in, a->next_in,
+                                            a->available_out, a->next_out, NULL);
+    return NULL;
+}
+
+static VALUE brotli_stream_chunk_fiber_thread(void *arg) {
+    brotli_stream_chunk_fiber_t *a = (brotli_stream_chunk_fiber_t *)arg;
+    rb_thread_call_without_gvl(brotli_stream_chunk_fiber_nogvl, a, RUBY_UBF_PROCESS, NULL);
+    rb_fiber_scheduler_unblock(a->scheduler, a->blocker, a->fiber);
+    return Qnil;
+}
+
+typedef struct {
+    size_t encoded_size;
+    const uint8_t *encoded_buffer;
+    size_t *decoded_size;
+    uint8_t *decoded_buffer;
+    BrotliDecoderResult result;
+} brotli_decompress_args_t;
+
+static void *brotli_decompress_nogvl(void *arg) {
+    brotli_decompress_args_t *a = (brotli_decompress_args_t *)arg;
+    a->result = BrotliDecoderDecompress(a->encoded_size, a->encoded_buffer,
+                                        a->decoded_size, a->decoded_buffer);
+    return NULL;
+}
+
+typedef struct {
+    ZSTD_DStream *dstream;
+    ZSTD_outBuffer *output;
+    ZSTD_inBuffer *input;
+    size_t result;
+} zstd_decompress_stream_chunk_args_t;
+
+static void *zstd_decompress_stream_chunk_nogvl(void *arg) {
+    zstd_decompress_stream_chunk_args_t *a = (zstd_decompress_stream_chunk_args_t *)arg;
+    a->result = ZSTD_decompressStream(a->dstream, a->output, a->input);
+    return NULL;
+}
+
+typedef struct {
+    BrotliDecoderState *dec;
+    size_t *available_in;
+    const uint8_t **next_in;
+    size_t *available_out;
+    uint8_t **next_out;
+    BrotliDecoderResult result;
+} brotli_decompress_stream_args_t;
+
+static void *brotli_decompress_stream_nogvl(void *arg) {
+    brotli_decompress_stream_args_t *a = (brotli_decompress_stream_args_t *)arg;
+    a->result = BrotliDecoderDecompressStream(a->dec, a->available_in, a->next_in,
+                                              a->available_out, a->next_out, NULL);
+    return NULL;
+}
+
+static void *zstd_fiber_compress_nogvl(void *arg) {
+    zstd_fiber_compress_t *a = (zstd_fiber_compress_t *)arg;
+    if (a->cdict) {
+        ZSTD_CCtx *cctx = ZSTD_createCCtx();
+        if (!cctx) { a->error = 1; return NULL; }
+        a->result = ZSTD_compress_usingCDict(cctx, a->dst, a->dst_cap,
+                                              a->src, a->src_len, a->cdict);
+        ZSTD_freeCCtx(cctx);
+    } else {
+        a->result = ZSTD_compress(a->dst, a->dst_cap,
+                                   a->src, a->src_len, a->level);
+    }
+    return NULL;
+}
+
+static VALUE zstd_fiber_compress_thread(void *arg) {
+    zstd_fiber_compress_t *a = (zstd_fiber_compress_t *)arg;
+    rb_thread_call_without_gvl(zstd_fiber_compress_nogvl, a, RUBY_UBF_PROCESS, NULL);
+    rb_fiber_scheduler_unblock(a->scheduler, a->blocker, a->fiber);
+    return Qnil;
+}
+
 static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
     VALUE data, opts;
     rb_scan_args(argc, argv, "1:", &data, &opts);
@@ -417,43 +644,17 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
     case ALGO_ZSTD: {
         size_t bound = ZSTD_compressBound(slen);
 
-        size_t csize;
-        if (slen >= GVL_UNLOCK_THRESHOLD) {
+        ZSTD_CDict *cdict = NULL;
+        if (dict) {
+            cdict = dict_get_cdict(dict, level);
+            if (!cdict)
+                rb_raise(eMemError, "zstd: failed to create/get cdict");
+        }
+
+        if (slen < GVL_UNLOCK_THRESHOLD) {
             VALUE dst = rb_binary_str_buf_reserve(bound);
-
-            ZSTD_CDict *cdict = NULL;
-            if (dict) {
-                cdict = dict_get_cdict(dict, level);
-                if (!cdict)
-                    rb_raise(eMemError, "zstd: failed to create/get cdict");
-            }
-
-            zstd_compress_args_t args = {
-                .src = src,
-                .src_len = slen,
-                .dst = RSTRING_PTR(dst),
-                .dst_cap = bound,
-                .level = level,
-                .cdict = cdict,
-            };
-            run_without_gvl(zstd_compress_nogvl, &args);
-
-            if (args.error)
-                rb_raise(eMemError, "zstd: failed to create context");
-            csize = args.result;
-            if (ZSTD_isError(csize))
-                rb_raise(eError, "zstd compress: %s", ZSTD_getErrorName(csize));
-
-            rb_str_set_len(dst, (long)csize);
-            RB_GC_GUARD(data);
-            return dst;
-        } else {
-            VALUE dst = rb_binary_str_buf_reserve(bound);
-
-            if (dict) {
-                ZSTD_CDict *cdict = dict_get_cdict(dict, level);
-                if (!cdict)
-                    rb_raise(eMemError, "zstd: failed to create/get cdict");
+            size_t csize;
+            if (cdict) {
                 ZSTD_CCtx *cctx = ZSTD_createCCtx();
                 if (!cctx)
                     rb_raise(eMemError, "zstd: failed to create context");
@@ -462,11 +663,76 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             } else {
                 csize = ZSTD_compress(RSTRING_PTR(dst), bound, src, slen, level);
             }
-
-            if (ZSTD_isError(csize)) {
+            if (ZSTD_isError(csize))
                 rb_raise(eError, "zstd compress: %s", ZSTD_getErrorName(csize));
+            rb_str_set_len(dst, (long)csize);
+            RB_GC_GUARD(data);
+            return dst;
+        }
+
+        {
+            VALUE scheduler = current_fiber_scheduler();
+            if (scheduler != Qnil) {
+                char *out_buf = (char *)malloc(bound);
+                if (!out_buf)
+                    rb_raise(eMemError, "zstd: malloc failed");
+
+                VALUE blocker = rb_obj_alloc(rb_cObject);
+
+                zstd_fiber_compress_t fargs = {
+                    .src       = src,
+                    .src_len   = slen,
+                    .level     = level,
+                    .cdict     = cdict,
+                    .dst       = out_buf,
+                    .dst_cap   = bound,
+                    .result    = 0,
+                    .error     = 0,
+                    .scheduler = scheduler,
+                    .blocker   = blocker,
+                    .fiber     = rb_fiber_current(),
+                };
+
+                VALUE rb_thread = rb_thread_create(zstd_fiber_compress_thread, &fargs);
+                rb_fiber_scheduler_block(scheduler, blocker, Qnil);
+                rb_funcall(rb_thread, rb_intern("join"), 0);
+
+                if (fargs.error) {
+                    free(out_buf);
+                    rb_raise(eMemError, "zstd: failed to create context");
+                }
+                if (ZSTD_isError(fargs.result)) {
+                    free(out_buf);
+                    rb_raise(eError, "zstd compress: %s", ZSTD_getErrorName(fargs.result));
+                }
+
+                VALUE result = rb_binary_str_new(out_buf, (long)fargs.result);
+                free(out_buf);
+                RB_GC_GUARD(data);
+                return result;
             }
-            rb_str_set_len(dst, csize);
+        }
+
+        {
+            VALUE dst = rb_binary_str_buf_reserve(bound);
+            zstd_compress_args_t args = {
+                .src     = src,
+                .src_len = slen,
+                .dst     = RSTRING_PTR(dst),
+                .dst_cap = bound,
+                .level   = level,
+                .cdict   = cdict,
+                .result  = 0,
+                .error   = 0,
+            };
+            run_without_gvl(zstd_compress_nogvl, &args);
+
+            if (args.error)
+                rb_raise(eMemError, "zstd: failed to create context");
+            if (ZSTD_isError(args.result))
+                rb_raise(eError, "zstd compress: %s", ZSTD_getErrorName(args.result));
+
+            rb_str_set_len(dst, (long)args.result);
             RB_GC_GUARD(data);
             return dst;
         }
@@ -493,7 +759,13 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
                 .dst_cap = bound,
                 .level = level,
             };
-            run_without_gvl(lz4_compress_nogvl, &args);
+
+            VALUE scheduler = current_fiber_scheduler();
+            if (scheduler != Qnil) {
+                run_via_fiber_worker(scheduler, lz4_compress_nogvl, &args);
+            } else {
+                run_without_gvl(lz4_compress_nogvl, &args);
+            }
             csize = args.result;
 
             if (csize <= 0)
@@ -601,7 +873,13 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
                 .out_len = &actual_out_len,
                 .dst = (uint8_t *)RSTRING_PTR(dst),
             };
-            run_without_gvl(brotli_compress_nogvl, &args);
+
+            VALUE scheduler = current_fiber_scheduler();
+            if (scheduler != Qnil) {
+                run_via_fiber_worker(scheduler, brotli_compress_nogvl, &args);
+            } else {
+                run_without_gvl(brotli_compress_nogvl, &args);
+            }
 
             if (!args.result)
                 rb_raise(eError, "brotli compress failed");
@@ -682,7 +960,13 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                     .dst_cap = (size_t)frame_size,
                     .ddict = ddict,
                 };
-                run_without_gvl(zstd_decompress_nogvl, &args);
+
+                VALUE scheduler = current_fiber_scheduler();
+                if (scheduler != Qnil) {
+                    run_via_fiber_worker(scheduler, zstd_decompress_nogvl, &args);
+                } else {
+                    run_without_gvl(zstd_decompress_nogvl, &args);
+                }
 
                 if (args.error)
                     rb_raise(eMemError, "zstd: failed to create dctx");
@@ -798,28 +1082,30 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
         }
 
         VALUE result = rb_binary_str_buf_reserve(total_orig);
-        char *out_ptr = RSTRING_PTR(result);
-        size_t out_offset = 0;
-        size_t pos = 0;
 
-        while (pos + 4 <= slen) {
-            uint32_t orig_size = (uint32_t)src[pos] | ((uint32_t)src[pos + 1] << 8) |
-                                 ((uint32_t)src[pos + 2] << 16) | ((uint32_t)src[pos + 3] << 24);
-            if (orig_size == 0)
-                break;
-            uint32_t comp_size = (uint32_t)src[pos + 4] | ((uint32_t)src[pos + 5] << 8) |
-                                 ((uint32_t)src[pos + 6] << 16) | ((uint32_t)src[pos + 7] << 24);
+        lz4_decompress_all_args_t args = {
+            .src = src,
+            .src_len = slen,
+            .dst = RSTRING_PTR(result),
+            .out_offset = 0,
+            .error = 0,
+        };
 
-            int dsize = LZ4_decompress_safe((const char *)(src + pos + 8), out_ptr + out_offset,
-                                            (int)comp_size, (int)orig_size);
-            if (dsize < 0)
-                rb_raise(eDataError, "lz4 decompress failed");
-
-            out_offset += dsize;
-            pos += 8 + comp_size;
+        if (total_orig >= GVL_UNLOCK_THRESHOLD) {
+            VALUE scheduler = current_fiber_scheduler();
+            if (scheduler != Qnil) {
+                run_via_fiber_worker(scheduler, lz4_decompress_all_nogvl, &args);
+            } else {
+                run_without_gvl(lz4_decompress_all_nogvl, &args);
+            }
+        } else {
+            lz4_decompress_all_nogvl(&args);
         }
 
-        rb_str_set_len(result, out_offset);
+        if (args.error)
+            rb_raise(eDataError, "%s", args.err_msg);
+
+        rb_str_set_len(result, args.out_offset);
         RB_GC_GUARD(data);
         return result;
     }
@@ -843,13 +1129,28 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
         size_t available_in = slen;
         const uint8_t *next_in = src;
 
+        VALUE scheduler = current_fiber_scheduler();
+
         BrotliDecoderResult res = BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT;
         while (res == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
             size_t available_out = alloc_size - total_out;
             uint8_t *next_out = (uint8_t *)RSTRING_PTR(dst) + total_out;
 
-            res = BrotliDecoderDecompressStream(dec, &available_in, &next_in, &available_out,
-                                                &next_out, NULL);
+            if (scheduler != Qnil && available_in >= FIBER_STREAM_THRESHOLD) {
+                brotli_decompress_stream_args_t sargs = {
+                    .dec           = dec,
+                    .available_in  = &available_in,
+                    .next_in       = &next_in,
+                    .available_out = &available_out,
+                    .next_out      = &next_out,
+                    .result        = BROTLI_DECODER_RESULT_ERROR,
+                };
+                run_via_fiber_worker(scheduler, brotli_decompress_stream_nogvl, &sargs);
+                res = sargs.result;
+            } else {
+                res = BrotliDecoderDecompressStream(dec, &available_in, &next_in, &available_out,
+                                                    &next_out, NULL);
+            }
 
             total_out = next_out - (uint8_t *)RSTRING_PTR(dst);
 
@@ -1204,13 +1505,12 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
 
     switch (d->algo) {
     case ALGO_ZSTD: {
-        ZSTD_inBuffer input = {src, slen, 0};
-        size_t out_cap = ZSTD_CStreamOutSize();
-        size_t result_cap = out_cap > slen ? out_cap : slen;
-        VALUE result = rb_binary_str_buf_reserve(result_cap);
-        size_t result_len = 0;
-        int use_fiber = has_fiber_scheduler();
-        size_t fiber_counter = 0;
+        ZSTD_inBuffer input  = {src, slen, 0};
+        size_t out_cap       = ZSTD_CStreamOutSize();
+        size_t result_cap    = out_cap > slen ? out_cap : slen;
+        VALUE  result        = rb_binary_str_buf_reserve(result_cap);
+        size_t result_len    = 0;
+        VALUE  scheduler     = current_fiber_scheduler();
 
         while (input.pos < input.size) {
             if (result_len + out_cap > result_cap) {
@@ -1219,15 +1519,39 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
             }
 
             ZSTD_outBuffer output = {RSTRING_PTR(result) + result_len, out_cap, 0};
-            size_t ret = ZSTD_compressStream(d->ctx.zstd, &output, &input);
-            if (ZSTD_isError(ret))
-                rb_raise(eError, "zstd compress stream: %s", ZSTD_getErrorName(ret));
-            result_len += output.pos;
-            if (use_fiber) {
-                int did_yield = 0;
-                fiber_counter = fiber_maybe_yield(fiber_counter, output.pos, &did_yield);
-                (void)did_yield;
+
+            if (scheduler != Qnil && (input.size - input.pos) >= FIBER_STREAM_THRESHOLD) {
+                zstd_stream_chunk_fiber_t fargs = {
+                    .cstream   = d->ctx.zstd,
+                    .input     = &input,
+                    .output    = &output,
+                    .result    = 0,
+                    .scheduler = scheduler,
+                    .blocker   = rb_obj_alloc(rb_cObject),
+                    .fiber     = rb_fiber_current(),
+                };
+                VALUE th = rb_thread_create(zstd_stream_chunk_fiber_thread, &fargs);
+                rb_fiber_scheduler_block(scheduler, fargs.blocker, Qnil);
+                rb_funcall(th, rb_intern("join"), 0);
+
+                if (ZSTD_isError(fargs.result))
+                    rb_raise(eError, "zstd compress stream: %s", ZSTD_getErrorName(fargs.result));
+            } else if (scheduler == Qnil && (input.size - input.pos) >= GVL_UNLOCK_THRESHOLD) {
+                zstd_stream_chunk_args_t args = {
+                    .cstream = d->ctx.zstd,
+                    .output  = &output,
+                    .input   = &input,
+                    .result  = 0,
+                };
+                run_without_gvl(zstd_compress_stream_chunk_nogvl, &args);
+                if (ZSTD_isError(args.result))
+                    rb_raise(eError, "zstd compress stream: %s", ZSTD_getErrorName(args.result));
+            } else {
+                size_t ret = ZSTD_compressStream(d->ctx.zstd, &output, &input);
+                if (ZSTD_isError(ret))
+                    rb_raise(eError, "zstd compress stream: %s", ZSTD_getErrorName(ret));
             }
+            result_len += output.pos;
         }
         rb_str_set_len(result, result_len);
         RB_GC_GUARD(chunk);
@@ -1241,15 +1565,37 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
             result_cap = 1024;
         VALUE result = rb_binary_str_buf_reserve(result_cap);
         size_t result_len = 0;
-        int use_fiber = has_fiber_scheduler();
+        VALUE scheduler = current_fiber_scheduler();
+        int   use_fiber = (scheduler != Qnil);
         size_t fiber_counter = 0;
 
         while (available_in > 0 || BrotliEncoderHasMoreOutput(d->ctx.brotli)) {
             size_t available_out = 0;
             uint8_t *next_out = NULL;
-            BROTLI_BOOL ok =
-                BrotliEncoderCompressStream(d->ctx.brotli, BROTLI_OPERATION_PROCESS, &available_in,
-                                            &next_in, &available_out, &next_out, NULL);
+            BROTLI_BOOL ok;
+
+            if (use_fiber && available_in >= FIBER_STREAM_THRESHOLD) {
+                brotli_stream_chunk_fiber_t fargs = {
+                    .enc           = d->ctx.brotli,
+                    .op            = BROTLI_OPERATION_PROCESS,
+                    .available_in  = &available_in,
+                    .next_in       = &next_in,
+                    .available_out = &available_out,
+                    .next_out      = &next_out,
+                    .result        = BROTLI_FALSE,
+                    .scheduler     = scheduler,
+                    .blocker       = rb_obj_alloc(rb_cObject),
+                    .fiber         = rb_fiber_current(),
+                };
+                VALUE th = rb_thread_create(brotli_stream_chunk_fiber_thread, &fargs);
+                rb_fiber_scheduler_block(scheduler, fargs.blocker, Qnil);
+                rb_funcall(th, rb_intern("join"), 0);
+                ok = fargs.result;
+            } else {
+                ok = BrotliEncoderCompressStream(d->ctx.brotli, BROTLI_OPERATION_PROCESS,
+                                                 &available_in, &next_in, &available_out,
+                                                 &next_out, NULL);
+            }
             if (!ok)
                 rb_raise(eError, "brotli compress stream failed");
 
@@ -1279,6 +1625,8 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
         VALUE result = rb_binary_str_buf_reserve(0);
         size_t result_len = 0;
         size_t result_cap = 0;
+        int    use_fiber = has_fiber_scheduler();
+        size_t fiber_counter = 0;
 
         while (slen > 0) {
             size_t space = LZ4_RING_BUFFER_SIZE - d->lz4_ring.pending;
@@ -1306,6 +1654,12 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
                     }
                     memcpy(RSTRING_PTR(result) + result_len, RSTRING_PTR(block), blen);
                     result_len += blen;
+                }
+                if (use_fiber) {
+                    int did_yield = 0;
+                    fiber_counter =
+                        fiber_maybe_yield(fiber_counter, LZ4_RING_BUFFER_SIZE, &did_yield);
+                    (void)did_yield;
                 }
             }
         }
@@ -1715,8 +2069,7 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
         size_t result_cap = out_cap > slen * 2 ? out_cap : slen * 2;
         VALUE result = rb_binary_str_buf_reserve(result_cap);
         size_t result_len = 0;
-        int use_fiber = has_fiber_scheduler();
-        size_t fiber_counter = 0;
+        VALUE scheduler = current_fiber_scheduler();
 
         while (input.pos < input.size) {
             if (result_len + out_cap > result_cap) {
@@ -1725,15 +2078,24 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
             }
 
             ZSTD_outBuffer output = {RSTRING_PTR(result) + result_len, out_cap, 0};
-            size_t ret = ZSTD_decompressStream(inf->ctx.zstd, &output, &input);
+            size_t ret;
+
+            if (scheduler != Qnil && (input.size - input.pos) >= FIBER_STREAM_THRESHOLD) {
+                zstd_decompress_stream_chunk_args_t args = {
+                    .dstream = inf->ctx.zstd,
+                    .output  = &output,
+                    .input   = &input,
+                    .result  = 0,
+                };
+                run_via_fiber_worker(scheduler, zstd_decompress_stream_chunk_nogvl, &args);
+                ret = args.result;
+            } else {
+                ret = ZSTD_decompressStream(inf->ctx.zstd, &output, &input);
+            }
+
             if (ZSTD_isError(ret))
                 rb_raise(eDataError, "zstd decompress stream: %s", ZSTD_getErrorName(ret));
             result_len += output.pos;
-            if (use_fiber) {
-                int did_yield = 0;
-                fiber_counter = fiber_maybe_yield(fiber_counter, output.pos, &did_yield);
-                (void)did_yield;
-            }
             if (ret == 0)
                 break;
         }
@@ -1749,14 +2111,28 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
             result_cap = 1024;
         VALUE result = rb_binary_str_buf_reserve(result_cap);
         size_t result_len = 0;
-        int use_fiber = has_fiber_scheduler();
-        size_t fiber_counter = 0;
+        VALUE scheduler = current_fiber_scheduler();
 
         while (available_in > 0 || BrotliDecoderHasMoreOutput(inf->ctx.brotli)) {
             size_t available_out = 0;
             uint8_t *next_out = NULL;
-            BrotliDecoderResult res = BrotliDecoderDecompressStream(
-                inf->ctx.brotli, &available_in, &next_in, &available_out, &next_out, NULL);
+            BrotliDecoderResult res;
+
+            if (scheduler != Qnil && available_in >= FIBER_STREAM_THRESHOLD) {
+                brotli_decompress_stream_args_t sargs = {
+                    .dec           = inf->ctx.brotli,
+                    .available_in  = &available_in,
+                    .next_in       = &next_in,
+                    .available_out = &available_out,
+                    .next_out      = &next_out,
+                    .result        = BROTLI_DECODER_RESULT_ERROR,
+                };
+                run_via_fiber_worker(scheduler, brotli_decompress_stream_nogvl, &sargs);
+                res = sargs.result;
+            } else {
+                res = BrotliDecoderDecompressStream(
+                    inf->ctx.brotli, &available_in, &next_in, &available_out, &next_out, NULL);
+            }
             if (res == BROTLI_DECODER_RESULT_ERROR)
                 rb_raise(eDataError, "brotli decompress stream: %s",
                          BrotliDecoderErrorString(BrotliDecoderGetErrorCode(inf->ctx.brotli)));
@@ -1771,11 +2147,6 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
 
                 memcpy(RSTRING_PTR(result) + result_len, out_data, out_size);
                 result_len += out_size;
-                if (use_fiber) {
-                    int did_yield = 0;
-                    fiber_counter = fiber_maybe_yield(fiber_counter, out_size, &did_yield);
-                    (void)did_yield;
-                }
             }
             if (res == BROTLI_DECODER_RESULT_SUCCESS)
                 break;

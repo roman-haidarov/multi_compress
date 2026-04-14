@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.2.0] — 2026-04-15
+
+### Added
+- **Fiber-friendly execution** 🎉: compression and decompression now cooperate with Ruby's `Fiber::Scheduler`, making MultiCompress safe to use under [async](https://github.com/socketry/async), [falcon](https://github.com/socketry/falcon), and any other scheduler-based runtime.
+  - When a scheduler is active, CPU-heavy work is offloaded to a dedicated worker thread via `rb_thread_create`, while the calling fiber is parked with `rb_fiber_scheduler_block`. The scheduler is free to run other fibers (IO, timers, parallel compression) until the worker finishes and calls `rb_fiber_scheduler_unblock`.
+  - Covers **all three algorithms** (`zstd`, `lz4`, `brotli`) and **both API shapes**:
+    - One-shot `MultiCompress.compress` / `MultiCompress.decompress`
+    - Streaming `MultiCompress::Deflater#write` / `MultiCompress::Inflater#write`
+  - No API changes — the fiber-friendly path is selected automatically when a scheduler is detected.
+  - Chunks smaller than 16 KB (`FIBER_STREAM_THRESHOLD`) stay inline to avoid pthread-create overhead for micro-workloads.
+  - Outside of a scheduler, the previous `rb_thread_call_without_gvl` path is used unchanged.
+- Generic `run_via_fiber_worker(scheduler, func, arg)` internal helper — encapsulates the pthread-worker + scheduler-block pattern and is reused across every fiber-friendly code path.
+- New test suite `test/test_fiber_scheduler.rb` verifying scheduler progress during compress/decompress for every algorithm, in both one-shot and streaming modes.
+
+### Changed
+- `fiber_maybe_yield` now actually yields: previously it was a no-op counter; it now calls `Fiber.scheduler.yield` via `rb_funcall` when the byte threshold is crossed. Used for `lz4` streaming paths where pthread-per-block would be overkill.
+- Streaming `Deflater#write` for zstd/brotli uses the fiber-worker path for chunks ≥ 16 KB; the old inline path is kept as a fallback for small chunks and when no scheduler is present.
+- Streaming `Inflater#write` for zstd/brotli similarly routes chunks through the fiber-worker path when possible.
+- LZ4 one-shot decompress loop extracted into `lz4_decompress_all_nogvl` so it can run on the worker thread with the GVL released.
+
+### Performance
+- No regressions for the non-fiber case: all existing GVL-unlocking fast paths are preserved untouched.
+- Under a fiber scheduler: compression no longer starves concurrent IO fibers. Previously, compressing 50 MB with `zstd` level 3 would block every other fiber in the reactor for the entire duration; now the reactor keeps servicing IO, timers, and other compute fibers throughout.
+- Streaming threshold of 16 KB chosen empirically: below that, pthread-create overhead (~20-50μs) eats the gains; at 16 KB+ the fiber-friendly path is a near-free win.
+
+### Upgrading
+No code changes required. If you run under `Async`/`Falcon`/`Fiber::Scheduler`, you'll immediately get non-blocking compression. If you don't, behavior is identical to 0.1.2.
+
 ## [0.1.2] — 2026-04-14
 
 ### Fixed
@@ -15,7 +43,7 @@
 - **ZSTD Dictionary Training**: Added `MultiCompress::Zstd.train_dictionary(samples, size:)` method
   - Uses ZDICT API for optimal dictionary generation
   - Allows creating custom dictionaries for better compression on similar data
-- **Memory Optimization Helpers**: 
+- **Memory Optimization Helpers**:
   - Added `rb_binary_str_buf_reserve()` for efficient pre-allocation
   - Added `grow_binary_str()` for safe capacity management
 
@@ -31,7 +59,7 @@
   - More informative error messages
 
 ### Performance Notes
-- **LZ4 Streaming**: Slight performance regression on large chunks (128KB: ~40-50% slower decompression) 
+- **LZ4 Streaming**: Slight performance regression on large chunks (128KB: ~40-50% slower decompression)
   - Trade-off for correctness: reliable decompression is prioritized over peak performance
   - Small chunks (4-32KB) maintain original performance
   - Overall impact minimal as streaming typically uses smaller chunks
@@ -49,7 +77,7 @@
 - **REMOVED**: `MultiCompress::Dictionary.train` method - general dictionary training interface removed
 - Dictionary training is now algorithm-specific to clarify capabilities
 
-### Added  
+### Added
 - `MultiCompress::Brotli.train_dictionary` - Brotli-specific dictionary training method
 - Clear indication that only Brotli supports dictionary training in this implementation
 

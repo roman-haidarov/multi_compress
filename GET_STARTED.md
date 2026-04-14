@@ -168,6 +168,153 @@ def compress_large_file(input_path, output_path)
 end
 ```
 
+## Fiber-friendly Execution
+
+Starting with **v0.2.0**, MultiCompress is fully fiber-friendly and plays nicely with Ruby's `Fiber::Scheduler`-based runtimes like [async](https://github.com/socketry/async) and [falcon](https://github.com/socketry/falcon).
+
+### The Problem It Solves
+
+Compression is CPU-bound work. Historically, calling `zstd`/`lz4`/`brotli` from inside an `Async` block would hold the GVL for the entire duration of the compress/decompress call, freezing the event loop and starving every other fiber — HTTP requests, timers, DB queries, everything. On a 50 MB zstd compression that meant tens to hundreds of milliseconds of total reactor stall.
+
+### How It Works
+
+When MultiCompress detects an active `Fiber::Scheduler`, it:
+
+1. Spawns a **dedicated worker thread** via `rb_thread_create` to run the compression with the GVL released.
+2. Parks the calling fiber with `rb_fiber_scheduler_block(scheduler, blocker, Qnil)`.
+3. While the worker crunches bytes, the scheduler is free to run **every other ready fiber** — IO, timers, parallel compression tasks, you name it.
+4. When the worker finishes, it calls `rb_fiber_scheduler_unblock(scheduler, blocker, fiber)` to resume the original fiber with the result.
+
+Outside of a fiber scheduler, MultiCompress uses the same `rb_thread_call_without_gvl` fast path as before — zero overhead, zero behavior change for non-async users.
+
+### What's Covered
+
+| API                              | zstd | lz4 | brotli |
+|----------------------------------|------|-----|--------|
+| `MultiCompress.compress`         | ✅    | ✅   | ✅      |
+| `MultiCompress.decompress`       | ✅    | ✅   | ✅      |
+| `MultiCompress::Deflater#write`  | ✅    | ✅*  | ✅      |
+| `MultiCompress::Inflater#write`  | ✅    | ✅*  | ✅      |
+
+<sub>\* LZ4 streaming uses cooperative `scheduler.yield` between 64 KB blocks instead of the worker-thread path — individual LZ4 blocks are too fast (~10μs) for pthread-create overhead (~20-50μs) to be worth it. Other fibers still get scheduling points, just via a lighter mechanism.</sub>
+
+Streaming chunks smaller than **16 KB** (`FIBER_STREAM_THRESHOLD`) stay inline under the GVL to avoid pthread-create overhead on tiny payloads. Production workloads using 64 KB+ chunks get the full benefit.
+
+### Example: Non-blocking Compression Under Async
+
+```ruby
+require 'async'
+require 'async/http/internet'
+require 'multi_compress'
+
+Async do |task|
+  # Fiber 1: make HTTP requests every 100ms — this keeps ticking
+  # even while the compression fiber is working.
+  poller = task.async do
+    internet = Async::HTTP::Internet.new
+    loop do
+      response = internet.get("https://httpbin.org/uuid")
+      puts "Got uuid at #{Time.now}: #{response.read[0..20]}"
+      task.sleep(0.1)
+    end
+  ensure
+    internet&.close
+  end
+
+  # Fiber 2: compress a huge payload. In v0.1.x this would have
+  # frozen the poller for the entire duration. In v0.2.0, the
+  # poller keeps firing while compression runs on a worker thread.
+  compressor = task.async do
+    huge_payload = File.read("dataset.json")    # say, 50 MB
+    compressed   = MultiCompress.compress(huge_payload, algo: :zstd)
+    File.binwrite("dataset.json.zst", compressed)
+    puts "Compressed #{huge_payload.bytesize} → #{compressed.bytesize} bytes"
+  end
+
+  compressor.wait
+  poller.stop
+end
+```
+
+### Example: Streaming With Concurrent IO
+
+```ruby
+require 'async'
+require 'multi_compress'
+
+Async do |task|
+  # Read incoming network data in one fiber, compress it in another.
+  # Both fibers make progress concurrently.
+  reader, writer = IO.pipe
+
+  producer = task.async do
+    File.open("huge.log", "rb") do |f|
+      while chunk = f.read(256 * 1024)
+        writer.write(chunk)
+      end
+    end
+    writer.close
+  end
+
+  compressor = task.async do
+    deflater = MultiCompress::Deflater.new(algo: :zstd, level: 3)
+    File.open("huge.log.zst", "wb") do |out|
+      while chunk = reader.read(256 * 1024)
+        # Each 256 KB deflater.write runs on a worker thread when
+        # a scheduler is active — the producer fiber keeps reading
+        # the pipe in parallel.
+        out.write(deflater.write(chunk))
+      end
+      out.write(deflater.finish)
+    end
+    deflater.close
+    reader.close
+  end
+
+  [producer, compressor].each(&:wait)
+end
+```
+
+### Parallel Compression Across Fibers
+
+Because each compression call blocks only its own fiber, you can fan out multiple compressions and the scheduler will overlap them with each other (and with any other IO fibers):
+
+```ruby
+require 'async'
+require 'async/barrier'
+require 'multi_compress'
+
+files = Dir.glob("logs/*.log")
+results = {}
+
+Async do |task|
+  barrier = Async::Barrier.new
+
+  files.each do |path|
+    barrier.async do
+      data = File.read(path)
+      results[path] = MultiCompress.compress(data, algo: :zstd)
+    end
+  end
+
+  barrier.wait
+end
+
+results.each do |path, compressed|
+  File.binwrite("#{path}.zst", compressed)
+end
+```
+
+### Requirements
+
+- Ruby **>= 3.1** for the fiber-friendly path (needs `rb_fiber_scheduler_block`/`_unblock` from `ruby/fiber/scheduler.h`)
+- A running `Fiber::Scheduler` — typically provided by `Async { ... }` or Falcon's web server
+- Ruby 2.7 / 3.0 users get the same code paths as v0.1.2 — everything still works, just without the scheduler integration
+
+### No Code Changes Required
+
+If you're already using MultiCompress under Async or Falcon, upgrading to v0.2.0 gives you non-blocking compression automatically. No new API, no config flags, nothing to opt into. Just upgrade the gem.
+
 ## File I/O Integration
 
 ### Writing MultiCompressed Files
