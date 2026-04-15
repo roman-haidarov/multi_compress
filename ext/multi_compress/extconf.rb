@@ -163,8 +163,13 @@ else
   vpath_dirs = configure_vendored_libraries(VENDOR_DIR)
 end
 
-$CFLAGS += " -O2"
+$CFLAGS += " -O3"
 $CFLAGS += " -DXXH_NAMESPACE=MULTICOMPRESS_"
+
+case RUBY_PLATFORM
+when /x86_64|amd64|aarch64|arm64/
+  $CFLAGS += " -DBROTLI_BUILD_LITTLE_ENDIAN"
+end
 
 have_header("ruby/fiber/scheduler.h")
 

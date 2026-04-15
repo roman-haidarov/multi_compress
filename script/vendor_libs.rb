@@ -16,7 +16,7 @@ VENDOR_DIR = File.expand_path("../ext/multi_compress/vendor", __dir__)
 
 LIBS = {
   zstd: {
-    version: "1.5.6",
+    version: "1.5.7",
     url:     "https://github.com/facebook/zstd/archive/refs/tags/v%<version>s.tar.gz",
     sha256:  nil,
     strip:   "zstd-%<version>s",

@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.1] — 2026-04-15
+- Change version zstd "1.5.6" -> "1.5.7".
+- Micro optimization.
+
 ## [0.2.0] — 2026-04-15
 
 ### Added
