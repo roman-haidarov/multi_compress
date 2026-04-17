@@ -5,6 +5,10 @@ require "async"
 require "async/barrier"
 
 class TestAsyncFiberScheduler < Minitest::Test
+  def setup
+    skip "Skipped under ASAN: CRuby Thread/Fiber runtime issue" if ENV["MULTI_COMPRESS_SKIP_FIBER_SCHEDULER_TESTS"] == "1"
+  end
+
   CHUNK_SIZE = 128 * 1024
   LARGE_DATA = begin
     rng = Random.new(42)
