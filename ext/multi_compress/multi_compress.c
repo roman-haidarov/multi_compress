@@ -15,14 +15,34 @@
 #include <zstd.h>
 #include <zdict.h>
 
-#define MAX_DECOMPRESS_SIZE   (256ULL * 1024 * 1024)
+#define MAX_DECOMPRESS_SIZE   (512ULL * 1024 * 1024)
 #define DEFAULT_MAX_RATIO     1000ULL
 #define RATIO_MIN_INPUT_BYTES 1024ULL
 #define DICT_FILE_MAX_SIZE    (32ULL * 1024 * 1024)
 
-#define GVL_UNLOCK_THRESHOLD   (64 * 1024)
-#define FIBER_YIELD_CHUNK      (64 * 1024)
-#define FIBER_STREAM_THRESHOLD (16 * 1024)
+typedef struct {
+    size_t gvl_unlock_threshold;
+    size_t fiber_yield_chunk;
+    size_t fiber_stream_threshold;
+} algo_policy_t;
+
+static const algo_policy_t ZSTD_POLICY = {
+    .gvl_unlock_threshold = 64 * 1024,
+    .fiber_yield_chunk = 64 * 1024,
+    .fiber_stream_threshold = 32 * 1024,
+};
+
+static const algo_policy_t LZ4_POLICY = {
+    .gvl_unlock_threshold = 128 * 1024,
+    .fiber_yield_chunk = 128 * 1024,
+    .fiber_stream_threshold = 64 * 1024,
+};
+
+static const algo_policy_t BROTLI_POLICY = {
+    .gvl_unlock_threshold = 16 * 1024,
+    .fiber_yield_chunk = 16 * 1024,
+    .fiber_stream_threshold = 8 * 1024,
+};
 
 static VALUE mMultiCompress;
 static VALUE eError;
@@ -40,128 +60,105 @@ static VALUE mZstd;
 static VALUE mLZ4;
 static VALUE mBrotli;
 static rb_encoding *binary_encoding;
+static struct {
+    ID zstd, lz4, brotli;
+    ID algo, level, dictionary, size;
+    ID max_output_size, max_ratio;
+    ID fastest, default_, best;
+    ID yield_, join;
+    ID ivar_dictionary;
+} id_cache;
+
+static struct {
+    VALUE zstd, lz4, brotli;
+    VALUE algo, level, dictionary, size;
+    VALUE max_output_size, max_ratio;
+} sym_cache;
 
 typedef enum { ALGO_ZSTD = 0, ALGO_LZ4 = 1, ALGO_BROTLI = 2 } compress_algo_t;
 
-static inline ID id_algo(void) {
-    static ID id = 0;
-    if (id == 0)
-        id = rb_intern("algo");
-    return id;
+static void init_id_cache(void) {
+    id_cache.zstd = rb_intern("zstd");
+    id_cache.lz4 = rb_intern("lz4");
+    id_cache.brotli = rb_intern("brotli");
+    id_cache.algo = rb_intern("algo");
+    id_cache.level = rb_intern("level");
+    id_cache.dictionary = rb_intern("dictionary");
+    id_cache.size = rb_intern("size");
+    id_cache.max_output_size = rb_intern("max_output_size");
+    id_cache.max_ratio = rb_intern("max_ratio");
+    id_cache.fastest = rb_intern("fastest");
+    id_cache.default_ = rb_intern("default");
+    id_cache.best = rb_intern("best");
+    id_cache.yield_ = rb_intern("yield");
+    id_cache.join = rb_intern("join");
+    id_cache.ivar_dictionary = rb_intern("@dictionary");
+
+    sym_cache.zstd = ID2SYM(id_cache.zstd);
+    sym_cache.lz4 = ID2SYM(id_cache.lz4);
+    sym_cache.brotli = ID2SYM(id_cache.brotli);
+    sym_cache.algo = ID2SYM(id_cache.algo);
+    sym_cache.level = ID2SYM(id_cache.level);
+    sym_cache.dictionary = ID2SYM(id_cache.dictionary);
+    sym_cache.size = ID2SYM(id_cache.size);
+    sym_cache.max_output_size = ID2SYM(id_cache.max_output_size);
+    sym_cache.max_ratio = ID2SYM(id_cache.max_ratio);
 }
 
-static inline ID id_level(void) {
-    static ID id = 0;
-    if (id == 0)
-        id = rb_intern("level");
-    return id;
+static inline VALUE opt_get(VALUE opts, VALUE sym) {
+    return NIL_P(opts) ? Qnil : rb_hash_aref(opts, sym);
 }
 
-static inline ID id_dictionary(void) {
-    static ID id = 0;
-    if (id == 0)
-        id = rb_intern("dictionary");
-    return id;
+static inline VALUE opt_lookup2(VALUE opts, VALUE sym, VALUE default_value) {
+    return NIL_P(opts) ? default_value : rb_hash_lookup2(opts, sym, default_value);
 }
 
-static inline ID id_size(void) {
-    static ID id = 0;
-    if (id == 0)
-        id = rb_intern("size");
-    return id;
+static inline void join_thread(VALUE thread) {
+    rb_funcall(thread, id_cache.join, 0);
 }
 
-static inline ID id_max_output_size(void) {
-    static ID id = 0;
-    if (id == 0)
-        id = rb_intern("max_output_size");
-    return id;
+static inline void scheduler_yield(VALUE scheduler) {
+    rb_funcall(scheduler, id_cache.yield_, 0);
 }
 
-static inline ID id_max_ratio(void) {
-    static ID id = 0;
-    if (id == 0)
-        id = rb_intern("max_ratio");
-    return id;
+static inline VALUE dictionary_ivar_get(VALUE self) {
+    return rb_ivar_get(self, id_cache.ivar_dictionary);
 }
 
-static inline ID id_join(void) {
-    static ID id = 0;
-    if (id == 0)
-        id = rb_intern("join");
-    return id;
+static inline void dictionary_ivar_set(VALUE self, VALUE dictionary) {
+    rb_ivar_set(self, id_cache.ivar_dictionary, dictionary);
 }
 
-static inline ID id_yield_method(void) {
-    static ID id = 0;
-    if (id == 0)
-        id = rb_intern("yield");
-    return id;
+static inline uint32_t read_le_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static inline ID id_dictionary_ivar(void) {
-    static ID id = 0;
-    if (id == 0)
-        id = rb_intern("@dictionary");
-    return id;
+static inline void write_le_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
 }
 
-static inline ID id_algo_zstd(void) {
-    static ID id = 0;
-    if (id == 0)
-        id = rb_intern("zstd");
-    return id;
-}
-
-static inline ID id_algo_lz4(void) {
-    static ID id = 0;
-    if (id == 0)
-        id = rb_intern("lz4");
-    return id;
-}
-
-static inline ID id_algo_brotli(void) {
-    static ID id = 0;
-    if (id == 0)
-        id = rb_intern("brotli");
-    return id;
-}
-
-static inline VALUE sym_from_id(ID id) {
-    return ID2SYM(id);
-}
-
-static inline VALUE sym_zstd(void) {
-    return sym_from_id(id_algo_zstd());
-}
-
-static inline VALUE sym_lz4(void) {
-    return sym_from_id(id_algo_lz4());
-}
-
-static inline VALUE sym_brotli(void) {
-    return sym_from_id(id_algo_brotli());
-}
-
-static inline VALUE opts_value_by_id(VALUE opts, ID key_id) {
-    if (NIL_P(opts))
-        return Qnil;
-    return rb_hash_aref(opts, sym_from_id(key_id));
-}
-
-static inline VALUE opts_lookup2_by_id(VALUE opts, ID key_id, VALUE default_value) {
-    if (NIL_P(opts))
-        return default_value;
-    return rb_hash_lookup2(opts, sym_from_id(key_id), default_value);
+static inline const algo_policy_t *algo_policy(compress_algo_t algo) {
+    switch (algo) {
+    case ALGO_ZSTD:
+        return &ZSTD_POLICY;
+    case ALGO_LZ4:
+        return &LZ4_POLICY;
+    case ALGO_BROTLI:
+        return &BROTLI_POLICY;
+    }
+    return &ZSTD_POLICY;
 }
 
 static compress_algo_t sym_to_algo(VALUE sym) {
     ID id = SYM2ID(sym);
-    if (id == id_algo_zstd())
+    if (id == id_cache.zstd)
         return ALGO_ZSTD;
-    if (id == id_algo_lz4())
+    if (id == id_cache.lz4)
         return ALGO_LZ4;
-    if (id == id_algo_brotli())
+    if (id == id_cache.brotli)
         return ALGO_BROTLI;
     rb_raise(rb_eArgError, "Unknown algorithm: %s", rb_id2name(id));
     return ALGO_ZSTD;
@@ -170,94 +167,48 @@ static compress_algo_t sym_to_algo(VALUE sym) {
 static inline VALUE algo_to_sym(compress_algo_t algo) {
     switch (algo) {
     case ALGO_ZSTD:
-        return sym_zstd();
+        return sym_cache.zstd;
     case ALGO_LZ4:
-        return sym_lz4();
+        return sym_cache.lz4;
     case ALGO_BROTLI:
-        return sym_brotli();
+        return sym_cache.brotli;
     }
-    return sym_zstd();
+    return Qnil;
 }
 
-static inline compress_algo_t algo_from_opts(VALUE opts, compress_algo_t default_algo) {
-    VALUE algo_sym = opts_value_by_id(opts, id_algo());
-    return NIL_P(algo_sym) ? default_algo : sym_to_algo(algo_sym);
-}
+typedef struct {
+    int min, max, fastest, default_, best;
+    const char *name;
+} level_spec_t;
 
-static inline VALUE level_value_from_opts(VALUE opts) {
-    return opts_value_by_id(opts, id_level());
-}
-
-static inline VALUE dictionary_value_from_opts(VALUE opts) {
-    return opts_value_by_id(opts, id_dictionary());
-}
-
-static inline VALUE size_value_from_opts(VALUE opts) {
-    return opts_value_by_id(opts, id_size());
-}
+static const level_spec_t level_spec[] = {
+    [ALGO_ZSTD] = {.min = 1, .max = 22, .fastest = 1, .default_ = 3, .best = 19, .name = "zstd"},
+    [ALGO_LZ4] = {.min = 1, .max = 16, .fastest = 1, .default_ = 1, .best = 16, .name = "lz4"},
+    [ALGO_BROTLI] =
+        {.min = 0, .max = 11, .fastest = 0, .default_ = 6, .best = 11, .name = "brotli"},
+};
 
 static int resolve_level(compress_algo_t algo, VALUE level_val) {
-    if (NIL_P(level_val)) {
-        switch (algo) {
-        case ALGO_ZSTD:
-            return 3;
-        case ALGO_LZ4:
-            return 1;
-        case ALGO_BROTLI:
-            return 6;
-        }
-    }
+    const level_spec_t *spec = &level_spec[algo];
+
+    if (NIL_P(level_val))
+        return spec->default_;
 
     if (SYMBOL_P(level_val)) {
         ID id = SYM2ID(level_val);
-        if (id == rb_intern("fastest")) {
-            switch (algo) {
-            case ALGO_ZSTD:
-                return 1;
-            case ALGO_LZ4:
-                return 1;
-            case ALGO_BROTLI:
-                return 0;
-            }
-        } else if (id == rb_intern("default")) {
-            switch (algo) {
-            case ALGO_ZSTD:
-                return 3;
-            case ALGO_LZ4:
-                return 1;
-            case ALGO_BROTLI:
-                return 6;
-            }
-        } else if (id == rb_intern("best")) {
-            switch (algo) {
-            case ALGO_ZSTD:
-                return 19;
-            case ALGO_LZ4:
-                return 16;
-            case ALGO_BROTLI:
-                return 11;
-            }
-        }
+        if (id == id_cache.fastest)
+            return spec->fastest;
+        if (id == id_cache.default_)
+            return spec->default_;
+        if (id == id_cache.best)
+            return spec->best;
         rb_raise(eLevelError, "Unknown named level: %s", rb_id2name(id));
     }
 
     int level = NUM2INT(level_val);
-
-    switch (algo) {
-    case ALGO_ZSTD:
-        if (level < 1 || level > 22)
-            rb_raise(eLevelError, "zstd level must be 1..22, got %d", level);
-        break;
-    case ALGO_LZ4:
-        if (level < 1 || level > 16)
-            rb_raise(eLevelError, "lz4 level must be 1..16, got %d", level);
-        break;
-    case ALGO_BROTLI:
-        if (level < 0 || level > 11)
-            rb_raise(eLevelError, "brotli level must be 0..11, got %d", level);
-        break;
-    }
-
+    if (level < spec->min || level > spec->max)
+        rb_raise(eLevelError, "%s level must be %d..%d, got %d", spec->name, spec->min, spec->max,
+                 level);
     return level;
 }
 
@@ -269,10 +220,8 @@ static compress_algo_t detect_algo(const uint8_t *data, size_t len) {
     }
 
     if (len >= 12) {
-        uint32_t orig = (uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) |
-                        ((uint32_t)data[3] << 24);
-        uint32_t comp = (uint32_t)data[4] | ((uint32_t)data[5] << 8) | ((uint32_t)data[6] << 16) |
-                        ((uint32_t)data[7] << 24);
+        uint32_t orig = read_le_u32(data);
+        uint32_t comp = read_le_u32(data + 4);
         if (orig > 0 && orig <= 256U * 1024 * 1024 && comp > 0 && comp <= 256U * 1024 * 1024 &&
             orig <= (uint32_t)INT_MAX && comp <= (uint32_t)LZ4_compressBound((int)orig) &&
             (size_t)8 + (size_t)comp + 4 == len) {
@@ -323,14 +272,17 @@ typedef struct {
     unsigned long long max_ratio;
 } limits_config_t;
 
-static inline void limits_config_init(limits_config_t *limits) {
+static void limits_config_init(limits_config_t *limits) {
     limits->max_output_size = (size_t)MAX_DECOMPRESS_SIZE;
     limits->max_ratio_enabled = 1;
     limits->max_ratio = DEFAULT_MAX_RATIO;
 }
 
-static void limits_config_apply_opts(limits_config_t *limits, VALUE opts) {
-    VALUE val = opts_lookup2_by_id(opts, id_max_output_size(), Qundef);
+static void limits_config_apply_opts(VALUE opts, limits_config_t *limits) {
+    if (NIL_P(opts))
+        return;
+
+    VALUE val = opt_lookup2(opts, sym_cache.max_output_size, Qundef);
     if (val != Qundef && !NIL_P(val)) {
         size_t max_output_size = NUM2SIZET(val);
         if (max_output_size == 0)
@@ -338,7 +290,7 @@ static void limits_config_apply_opts(limits_config_t *limits, VALUE opts) {
         limits->max_output_size = max_output_size;
     }
 
-    val = opts_lookup2_by_id(opts, id_max_ratio(), Qundef);
+    val = opt_lookup2(opts, sym_cache.max_ratio, Qundef);
     if (val == Qundef)
         return;
     if (NIL_P(val)) {
@@ -352,6 +304,11 @@ static void limits_config_apply_opts(limits_config_t *limits, VALUE opts) {
         rb_raise(rb_eArgError, "max_ratio must be greater than 0 or nil");
     limits->max_ratio_enabled = 1;
     limits->max_ratio = max_ratio;
+}
+
+static void parse_limits_from_opts(VALUE opts, limits_config_t *limits) {
+    limits_config_init(limits);
+    limits_config_apply_opts(opts, limits);
 }
 
 static size_t checked_add_size(size_t left, size_t right, const char *message) {
@@ -395,23 +352,6 @@ static VALUE current_fiber_scheduler(void) {
 
 static int has_fiber_scheduler(void) {
     return current_fiber_scheduler() != Qnil;
-}
-
-static inline void join_thread(VALUE thread) {
-    rb_funcall(thread, id_join(), 0);
-}
-
-static inline void scheduler_yield(VALUE scheduler) {
-    rb_funcall(scheduler, id_yield_method(), 0);
-}
-
-static inline VALUE dictionary_ivar_get(VALUE self) {
-    return rb_attr_get(self, id_dictionary_ivar());
-}
-
-static inline void dictionary_ivar_set(VALUE self, VALUE dict_val) {
-    if (!NIL_P(dict_val))
-        rb_ivar_set(self, id_dictionary_ivar(), dict_val);
 }
 
 static void unblock_noop(void *arg) {
@@ -458,10 +398,10 @@ static void run_via_fiber_worker(VALUE scheduler, void *(*func)(void *), void *a
 }
 
 static inline size_t fiber_maybe_yield(size_t bytes_since_yield, size_t just_processed,
-                                       int *did_yield) {
+                                       size_t yield_chunk, int *did_yield) {
     *did_yield = 0;
     bytes_since_yield += just_processed;
-    if (bytes_since_yield >= FIBER_YIELD_CHUNK) {
+    if (bytes_since_yield >= yield_chunk) {
         VALUE scheduler = current_fiber_scheduler();
         if (scheduler != Qnil) {
             scheduler_yield(scheduler);
@@ -523,34 +463,6 @@ static VALUE dict_alloc(VALUE klass) {
     dictionary_t *d = ALLOC(dictionary_t);
     memset(d, 0, sizeof(dictionary_t));
     return TypedData_Wrap_Struct(klass, &dictionary_type, d);
-}
-
-static dictionary_t *dictionary_from_value(VALUE dict_val, compress_algo_t algo) {
-    dictionary_t *dict = NULL;
-
-    if (NIL_P(dict_val))
-        return NULL;
-    if (algo == ALGO_LZ4)
-        rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
-
-    TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
-    return dict;
-}
-
-static dictionary_t *dictionary_from_opts(VALUE opts, compress_algo_t algo, VALUE *dict_val_out) {
-    VALUE dict_val = dictionary_value_from_opts(opts);
-
-    if (dict_val_out)
-        *dict_val_out = dict_val;
-    return dictionary_from_value(dict_val, algo);
-}
-
-static inline void remember_dictionary(VALUE self, VALUE dict_val) {
-    dictionary_ivar_set(self, dict_val);
-}
-
-static dictionary_t *dictionary_from_self(VALUE self, compress_algo_t algo) {
-    return dictionary_from_value(dictionary_ivar_get(self), algo);
 }
 
 static ZSTD_CDict *dict_get_cdict(dictionary_t *dict, int level) {
@@ -668,12 +580,10 @@ static void *lz4_decompress_all_nogvl(void *arg) {
     size_t pos = 0;
 
     while (pos + 4 <= slen) {
-        uint32_t orig_size = (uint32_t)src[pos] | ((uint32_t)src[pos + 1] << 8) |
-                             ((uint32_t)src[pos + 2] << 16) | ((uint32_t)src[pos + 3] << 24);
+        uint32_t orig_size = read_le_u32(src + pos);
         if (orig_size == 0)
             break;
-        uint32_t comp_size = (uint32_t)src[pos + 4] | ((uint32_t)src[pos + 5] << 8) |
-                             ((uint32_t)src[pos + 6] << 16) | ((uint32_t)src[pos + 7] << 24);
+        uint32_t comp_size = read_le_u32(src + pos + 4);
 
         int dsize = LZ4_decompress_safe((const char *)(src + pos + 8), out_ptr + out_offset,
                                         (int)comp_size, (int)orig_size);
@@ -880,12 +790,27 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
     rb_scan_args(argc, argv, "1:", &data, &opts);
     StringValue(data);
 
-    compress_algo_t algo = algo_from_opts(opts, ALGO_ZSTD);
-    int level = resolve_level(algo, level_value_from_opts(opts));
-    dictionary_t *dict = dictionary_from_opts(opts, algo, NULL);
+    VALUE algo_sym = Qnil, level_val = Qnil, dict_val = Qnil;
+    if (!NIL_P(opts)) {
+        algo_sym = opt_get(opts, sym_cache.algo);
+        level_val = opt_get(opts, sym_cache.level);
+        dict_val = opt_get(opts, sym_cache.dictionary);
+    }
+
+    compress_algo_t algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
+    int level = resolve_level(algo, level_val);
+
+    dictionary_t *dict = NULL;
+    if (!NIL_P(dict_val)) {
+        if (algo == ALGO_LZ4) {
+            rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
+        }
+        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+    }
 
     const char *src = RSTRING_PTR(data);
     size_t slen = RSTRING_LEN(data);
+    const algo_policy_t *policy = algo_policy(algo);
 
     switch (algo) {
     case ALGO_ZSTD: {
@@ -898,7 +823,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
                 rb_raise(eMemError, "zstd: failed to create/get cdict");
         }
 
-        if (slen < GVL_UNLOCK_THRESHOLD) {
+        if (slen < policy->gvl_unlock_threshold) {
             VALUE dst = rb_binary_str_buf_reserve(bound);
             size_t csize;
             if (cdict) {
@@ -990,14 +915,11 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
         int bound = LZ4_compressBound((int)slen);
 
         int csize;
-        if (slen >= GVL_UNLOCK_THRESHOLD) {
+        if (slen >= policy->gvl_unlock_threshold) {
             VALUE dst = rb_binary_str_buf_reserve(8 + (size_t)bound + 4);
             char *out = RSTRING_PTR(dst);
 
-            out[0] = (slen >> 0) & 0xFF;
-            out[1] = (slen >> 8) & 0xFF;
-            out[2] = (slen >> 16) & 0xFF;
-            out[3] = (slen >> 24) & 0xFF;
+            write_le_u32((uint8_t *)out, (uint32_t)slen);
 
             lz4_compress_args_t args = {
                 .src = src,
@@ -1018,16 +940,10 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             if (csize <= 0)
                 rb_raise(eError, "lz4 compress failed");
 
-            out[4] = (csize >> 0) & 0xFF;
-            out[5] = (csize >> 8) & 0xFF;
-            out[6] = (csize >> 16) & 0xFF;
-            out[7] = (csize >> 24) & 0xFF;
+            write_le_u32((uint8_t *)out + 4, (uint32_t)csize);
 
             size_t total = 8 + (size_t)csize;
-            out[total] = 0;
-            out[total + 1] = 0;
-            out[total + 2] = 0;
-            out[total + 3] = 0;
+            write_le_u32((uint8_t *)out + total, 0);
 
             rb_str_set_len(dst, (long)(total + 4));
             RB_GC_GUARD(data);
@@ -1036,10 +952,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             VALUE dst = rb_binary_str_buf_reserve(8 + bound + 4);
             char *out = RSTRING_PTR(dst);
 
-            out[0] = (slen >> 0) & 0xFF;
-            out[1] = (slen >> 8) & 0xFF;
-            out[2] = (slen >> 16) & 0xFF;
-            out[3] = (slen >> 24) & 0xFF;
+            write_le_u32((uint8_t *)out, (uint32_t)slen);
 
             if (level > 1) {
                 csize = LZ4_compress_HC(src, out + 8, (int)slen, bound, level);
@@ -1049,16 +962,10 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             if (csize <= 0)
                 rb_raise(eError, "lz4 compress failed");
 
-            out[4] = (csize >> 0) & 0xFF;
-            out[5] = (csize >> 8) & 0xFF;
-            out[6] = (csize >> 16) & 0xFF;
-            out[7] = (csize >> 24) & 0xFF;
+            write_le_u32((uint8_t *)out + 4, (uint32_t)csize);
 
             size_t total = 8 + csize;
-            out[total] = 0;
-            out[total + 1] = 0;
-            out[total + 2] = 0;
-            out[total + 3] = 0;
+            write_le_u32((uint8_t *)out + total, 0);
 
             rb_str_set_len(dst, total + 4);
             RB_GC_GUARD(data);
@@ -1109,7 +1016,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             rb_str_set_len(dst, initial_out - available_out);
             RB_GC_GUARD(data);
             return dst;
-        } else if (slen >= GVL_UNLOCK_THRESHOLD) {
+        } else if (slen >= policy->gvl_unlock_threshold) {
             VALUE dst = rb_binary_str_buf_reserve(out_len);
             size_t actual_out_len = out_len;
 
@@ -1156,16 +1063,33 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
     rb_scan_args(argc, argv, "1:", &data, &opts);
     StringValue(data);
 
+    VALUE algo_sym = Qnil, dict_val = Qnil;
     limits_config_t limits;
-    limits_config_init(&limits);
-    limits_config_apply_opts(&limits, opts);
+    parse_limits_from_opts(opts, &limits);
+    if (!NIL_P(opts)) {
+        algo_sym = opt_get(opts, sym_cache.algo);
+        dict_val = opt_get(opts, sym_cache.dictionary);
+    }
 
     const uint8_t *src = (const uint8_t *)RSTRING_PTR(data);
     size_t slen = RSTRING_LEN(data);
 
-    VALUE algo_sym = opts_value_by_id(opts, id_algo());
-    compress_algo_t algo = NIL_P(algo_sym) ? detect_algo(src, slen) : sym_to_algo(algo_sym);
-    dictionary_t *dict = dictionary_from_opts(opts, algo, NULL);
+    compress_algo_t algo;
+    if (NIL_P(algo_sym)) {
+        algo = detect_algo(src, slen);
+    } else {
+        algo = sym_to_algo(algo_sym);
+    }
+
+    const algo_policy_t *policy = algo_policy(algo);
+
+    dictionary_t *dict = NULL;
+    if (!NIL_P(dict_val)) {
+        if (algo == ALGO_LZ4) {
+            rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
+        }
+        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+    }
 
     switch (algo) {
     case ALGO_ZSTD: {
@@ -1186,7 +1110,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
         if (frame_size != ZSTD_CONTENTSIZE_UNKNOWN && frame_size <= limits.max_output_size) {
             size_t dsize;
 
-            if (frame_size >= GVL_UNLOCK_THRESHOLD) {
+            if (frame_size >= algo_policy(ALGO_ZSTD)->gvl_unlock_threshold) {
                 VALUE dst = rb_binary_str_buf_reserve((size_t)frame_size);
 
                 ZSTD_DDict *ddict = NULL;
@@ -1325,16 +1249,12 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
         size_t total_orig = 0;
         size_t scan_pos = 0;
         while (scan_pos + 4 <= slen) {
-            uint32_t orig_size = (uint32_t)src[scan_pos] | ((uint32_t)src[scan_pos + 1] << 8) |
-                                 ((uint32_t)src[scan_pos + 2] << 16) |
-                                 ((uint32_t)src[scan_pos + 3] << 24);
+            uint32_t orig_size = read_le_u32(src + scan_pos);
             if (orig_size == 0)
                 break;
             if (scan_pos + 8 > slen)
                 rb_raise(eDataError, "lz4: truncated block header");
-            uint32_t comp_size = (uint32_t)src[scan_pos + 4] | ((uint32_t)src[scan_pos + 5] << 8) |
-                                 ((uint32_t)src[scan_pos + 6] << 16) |
-                                 ((uint32_t)src[scan_pos + 7] << 24);
+            uint32_t comp_size = read_le_u32(src + scan_pos + 4);
             if (scan_pos + 8 + comp_size > slen)
                 rb_raise(eDataError, "lz4: truncated block data");
             if (orig_size > 256 * 1024 * 1024)
@@ -1360,7 +1280,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
             .error = 0,
         };
 
-        if (total_orig >= GVL_UNLOCK_THRESHOLD) {
+        if (total_orig >= algo_policy(ALGO_LZ4)->gvl_unlock_threshold) {
             VALUE scheduler = current_fiber_scheduler();
             if (scheduler != Qnil) {
                 run_via_fiber_worker(scheduler, lz4_decompress_all_nogvl, &args);
@@ -1418,7 +1338,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                 available_out = remaining_budget;
             uint8_t *next_out = (uint8_t *)RSTRING_PTR(dst) + total_out;
 
-            if (scheduler != Qnil && available_in >= FIBER_STREAM_THRESHOLD) {
+            if (scheduler != Qnil && available_in >= policy->fiber_stream_threshold) {
                 brotli_decompress_stream_args_t sargs = {
                     .dec = dec,
                     .available_in = &available_in,
@@ -1559,9 +1479,9 @@ static VALUE compress_adler32(int argc, VALUE *argv, VALUE self) {
 
 static VALUE compress_algorithms(VALUE self) {
     VALUE ary = rb_ary_new_capa(3);
-    rb_ary_push(ary, ID2SYM(rb_intern("zstd")));
-    rb_ary_push(ary, ID2SYM(rb_intern("lz4")));
-    rb_ary_push(ary, ID2SYM(rb_intern("brotli")));
+    rb_ary_push(ary, sym_cache.zstd);
+    rb_ary_push(ary, sym_cache.lz4);
+    rb_ary_push(ary, sym_cache.brotli);
     return ary;
 }
 
@@ -1606,33 +1526,24 @@ typedef struct {
     } lz4_ring;
 } deflater_t;
 
-static void deflater_release_resources(deflater_t *d) {
-    switch (d->algo) {
-    case ALGO_ZSTD:
-        if (d->ctx.zstd) {
-            ZSTD_freeCStream(d->ctx.zstd);
-            d->ctx.zstd = NULL;
-        }
-        break;
-    case ALGO_BROTLI:
-        if (d->ctx.brotli) {
-            BrotliEncoderDestroyInstance(d->ctx.brotli);
-            d->ctx.brotli = NULL;
-        }
-        break;
-    case ALGO_LZ4:
-        if (d->ctx.lz4) {
-            LZ4_freeStream(d->ctx.lz4);
-            d->ctx.lz4 = NULL;
-        }
-        break;
-    }
-}
-
 static void deflater_free(void *ptr) {
     deflater_t *d = (deflater_t *)ptr;
-    if (!d->closed)
-        deflater_release_resources(d);
+    if (!d->closed) {
+        switch (d->algo) {
+        case ALGO_ZSTD:
+            if (d->ctx.zstd)
+                ZSTD_freeCStream(d->ctx.zstd);
+            break;
+        case ALGO_BROTLI:
+            if (d->ctx.brotli)
+                BrotliEncoderDestroyInstance(d->ctx.brotli);
+            break;
+        case ALGO_LZ4:
+            if (d->ctx.lz4)
+                LZ4_freeStream(d->ctx.lz4);
+            break;
+        }
+    }
     if (d->lz4_ring.buf)
         xfree(d->lz4_ring.buf);
     xfree(d);
@@ -1665,15 +1576,26 @@ static VALUE deflater_initialize(int argc, VALUE *argv, VALUE self) {
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
 
-    VALUE dict_val = dictionary_value_from_opts(opts);
+    VALUE algo_sym = Qnil, level_val = Qnil, dict_val = Qnil;
+    if (!NIL_P(opts)) {
+        algo_sym = opt_get(opts, sym_cache.algo);
+        level_val = opt_get(opts, sym_cache.level);
+        dict_val = opt_get(opts, sym_cache.dictionary);
+    }
 
-    d->algo = algo_from_opts(opts, ALGO_ZSTD);
-    d->level = resolve_level(d->algo, level_value_from_opts(opts));
+    d->algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
+    d->level = resolve_level(d->algo, level_val);
     d->closed = 0;
     d->finished = 0;
 
-    dictionary_t *dict = dictionary_from_value(dict_val, d->algo);
-    remember_dictionary(self, dict_val);
+    dictionary_t *dict = NULL;
+    if (!NIL_P(dict_val)) {
+        if (d->algo == ALGO_LZ4) {
+            rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
+        }
+        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+        dictionary_ivar_set(self, dict_val);
+    }
 
     switch (d->algo) {
     case ALGO_ZSTD: {
@@ -1748,19 +1670,13 @@ static VALUE lz4_compress_ring_block(deflater_t *d) {
     VALUE output = rb_binary_str_buf_new(8 + bound);
     char *out = RSTRING_PTR(output);
 
-    out[0] = (src_size >> 0) & 0xFF;
-    out[1] = (src_size >> 8) & 0xFF;
-    out[2] = (src_size >> 16) & 0xFF;
-    out[3] = (src_size >> 24) & 0xFF;
+    write_le_u32((uint8_t *)out, (uint32_t)src_size);
 
     int csize = LZ4_compress_fast_continue(d->ctx.lz4, block_start, out + 8, src_size, bound, 1);
     if (csize <= 0)
         rb_raise(eError, "lz4 stream compress block failed");
 
-    out[4] = (csize >> 0) & 0xFF;
-    out[5] = (csize >> 8) & 0xFF;
-    out[6] = (csize >> 16) & 0xFF;
-    out[7] = (csize >> 24) & 0xFF;
+    write_le_u32((uint8_t *)out + 4, (uint32_t)csize);
 
     rb_str_set_len(output, 8 + csize);
     d->lz4_ring.pending = 0;
@@ -1783,6 +1699,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
 
     const char *src = RSTRING_PTR(chunk);
     size_t slen = RSTRING_LEN(chunk);
+    const algo_policy_t *policy = algo_policy(d->algo);
     if (slen == 0)
         return rb_binary_str_new("", 0);
 
@@ -1803,7 +1720,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
 
             ZSTD_outBuffer output = {RSTRING_PTR(result) + result_len, out_cap, 0};
 
-            if (scheduler != Qnil && (input.size - input.pos) >= FIBER_STREAM_THRESHOLD) {
+            if (scheduler != Qnil && (input.size - input.pos) >= policy->fiber_stream_threshold) {
                 zstd_stream_chunk_fiber_t fargs = {
                     .cstream = d->ctx.zstd,
                     .input = &input,
@@ -1819,7 +1736,8 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
 
                 if (ZSTD_isError(fargs.result))
                     rb_raise(eError, "zstd compress stream: %s", ZSTD_getErrorName(fargs.result));
-            } else if (scheduler == Qnil && (input.size - input.pos) >= GVL_UNLOCK_THRESHOLD) {
+            } else if (scheduler == Qnil &&
+                       (input.size - input.pos) >= policy->gvl_unlock_threshold) {
                 zstd_stream_chunk_args_t args = {
                     .cstream = d->ctx.zstd,
                     .output = &output,
@@ -1857,7 +1775,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
             uint8_t *next_out = NULL;
             BROTLI_BOOL ok;
 
-            if (use_fiber && available_in >= FIBER_STREAM_THRESHOLD) {
+            if (use_fiber && available_in >= policy->fiber_stream_threshold) {
                 brotli_stream_chunk_fiber_t fargs = {
                     .enc = d->ctx.brotli,
                     .op = BROTLI_OPERATION_PROCESS,
@@ -1895,7 +1813,8 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
                 result_len += out_size;
                 if (use_fiber) {
                     int did_yield = 0;
-                    fiber_counter = fiber_maybe_yield(fiber_counter, out_size, &did_yield);
+                    fiber_counter = fiber_maybe_yield(fiber_counter, out_size,
+                                                      policy->fiber_yield_chunk, &did_yield);
                     (void)did_yield;
                 }
             }
@@ -1940,8 +1859,8 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
                 }
                 if (use_fiber) {
                     int did_yield = 0;
-                    fiber_counter =
-                        fiber_maybe_yield(fiber_counter, LZ4_RING_BUFFER_SIZE, &did_yield);
+                    fiber_counter = fiber_maybe_yield(fiber_counter, LZ4_RING_BUFFER_SIZE,
+                                                      policy->fiber_yield_chunk, &did_yield);
                     (void)did_yield;
                 }
             }
@@ -2115,7 +2034,7 @@ static VALUE deflater_finish(VALUE self) {
         }
 
         char *out = RSTRING_PTR(result) + result_len;
-        out[0] = out[1] = out[2] = out[3] = 0;
+        write_le_u32((uint8_t *)out, 0);
         result_len += 4;
 
         rb_str_set_len(result, result_len);
@@ -2129,7 +2048,11 @@ static VALUE deflater_reset(VALUE self) {
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
 
-    dictionary_t *dict = dictionary_from_self(self, d->algo);
+    VALUE dict_val = dictionary_ivar_get(self);
+    dictionary_t *dict = NULL;
+    if (!NIL_P(dict_val)) {
+        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+    }
 
     switch (d->algo) {
     case ALGO_ZSTD:
@@ -2183,7 +2106,26 @@ static VALUE deflater_close(VALUE self) {
     if (d->closed)
         return Qnil;
 
-    deflater_release_resources(d);
+    switch (d->algo) {
+    case ALGO_ZSTD:
+        if (d->ctx.zstd) {
+            ZSTD_freeCStream(d->ctx.zstd);
+            d->ctx.zstd = NULL;
+        }
+        break;
+    case ALGO_BROTLI:
+        if (d->ctx.brotli) {
+            BrotliEncoderDestroyInstance(d->ctx.brotli);
+            d->ctx.brotli = NULL;
+        }
+        break;
+    case ALGO_LZ4:
+        if (d->ctx.lz4) {
+            LZ4_freeStream(d->ctx.lz4);
+            d->ctx.lz4 = NULL;
+        }
+        break;
+    }
     d->closed = 1;
     return Qnil;
 }
@@ -2217,29 +2159,22 @@ typedef struct {
     } lz4_buf;
 } inflater_t;
 
-static void inflater_release_resources(inflater_t *inf) {
-    switch (inf->algo) {
-    case ALGO_ZSTD:
-        if (inf->ctx.zstd) {
-            ZSTD_freeDStream(inf->ctx.zstd);
-            inf->ctx.zstd = NULL;
-        }
-        break;
-    case ALGO_BROTLI:
-        if (inf->ctx.brotli) {
-            BrotliDecoderDestroyInstance(inf->ctx.brotli);
-            inf->ctx.brotli = NULL;
-        }
-        break;
-    case ALGO_LZ4:
-        break;
-    }
-}
-
 static void inflater_free(void *ptr) {
     inflater_t *inf = (inflater_t *)ptr;
-    if (!inf->closed)
-        inflater_release_resources(inf);
+    if (!inf->closed) {
+        switch (inf->algo) {
+        case ALGO_ZSTD:
+            if (inf->ctx.zstd)
+                ZSTD_freeDStream(inf->ctx.zstd);
+            break;
+        case ALGO_BROTLI:
+            if (inf->ctx.brotli)
+                BrotliDecoderDestroyInstance(inf->ctx.brotli);
+            break;
+        case ALGO_LZ4:
+            break;
+        }
+    }
     if (inf->lz4_buf.buf)
         xfree(inf->lz4_buf.buf);
     xfree(inf);
@@ -2269,13 +2204,15 @@ static VALUE inflater_initialize(int argc, VALUE *argv, VALUE self) {
     inflater_t *inf;
     TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
 
+    VALUE algo_sym = Qnil, dict_val = Qnil;
     limits_config_t limits;
-    limits_config_init(&limits);
-    limits_config_apply_opts(&limits, opts);
+    parse_limits_from_opts(opts, &limits);
+    if (!NIL_P(opts)) {
+        algo_sym = opt_get(opts, sym_cache.algo);
+        dict_val = opt_get(opts, sym_cache.dictionary);
+    }
 
-    VALUE dict_val = dictionary_value_from_opts(opts);
-
-    inf->algo = algo_from_opts(opts, ALGO_ZSTD);
+    inf->algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
     inf->closed = 0;
     inf->finished = 0;
     inf->max_output_size = limits.max_output_size;
@@ -2284,8 +2221,14 @@ static VALUE inflater_initialize(int argc, VALUE *argv, VALUE self) {
     inf->max_ratio_enabled = limits.max_ratio_enabled;
     inf->max_ratio = limits.max_ratio;
 
-    dictionary_t *dict = dictionary_from_value(dict_val, inf->algo);
-    remember_dictionary(self, dict_val);
+    dictionary_t *dict = NULL;
+    if (!NIL_P(dict_val)) {
+        if (inf->algo == ALGO_LZ4) {
+            rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
+        }
+        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+        dictionary_ivar_set(self, dict_val);
+    }
 
     switch (inf->algo) {
     case ALGO_ZSTD:
@@ -2330,6 +2273,7 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
 
     const char *src = RSTRING_PTR(chunk);
     size_t slen = RSTRING_LEN(chunk);
+    const algo_policy_t *policy = algo_policy(inf->algo);
     if (slen == 0)
         return rb_binary_str_new("", 0);
 
@@ -2373,7 +2317,7 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
             ZSTD_outBuffer output = {RSTRING_PTR(result) + result_len, current_out_cap, 0};
             size_t ret;
 
-            if (scheduler != Qnil && (input.size - input.pos) >= FIBER_STREAM_THRESHOLD) {
+            if (scheduler != Qnil && (input.size - input.pos) >= policy->fiber_stream_threshold) {
                 zstd_decompress_stream_chunk_args_t args = {
                     .dstream = inf->ctx.zstd,
                     .output = &output,
@@ -2425,7 +2369,7 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
             uint8_t *next_out = NULL;
             BrotliDecoderResult res;
 
-            if (scheduler != Qnil && available_in >= FIBER_STREAM_THRESHOLD) {
+            if (scheduler != Qnil && available_in >= policy->fiber_stream_threshold) {
                 brotli_decompress_stream_args_t sargs = {
                     .dec = inf->ctx.brotli,
                     .available_in = &available_in,
@@ -2518,8 +2462,7 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
         size_t pos = inf->lz4_buf.offset;
         while (pos + 4 <= inf->lz4_buf.len) {
             const uint8_t *p = (const uint8_t *)(inf->lz4_buf.buf + pos);
-            uint32_t orig_size = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-                                 ((uint32_t)p[3] << 24);
+            uint32_t orig_size = read_le_u32(p);
             if (orig_size == 0) {
                 inf->finished = 1;
                 pos += 4;
@@ -2527,8 +2470,7 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
             }
             if (pos + 8 > inf->lz4_buf.len)
                 break;
-            uint32_t comp_size = (uint32_t)p[4] | ((uint32_t)p[5] << 8) | ((uint32_t)p[6] << 16) |
-                                 ((uint32_t)p[7] << 24);
+            uint32_t comp_size = read_le_u32(p + 4);
             if (pos + 8 + comp_size > inf->lz4_buf.len)
                 break;
             if (orig_size > 64 * 1024 * 1024)
@@ -2557,7 +2499,8 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
             pos += 8 + comp_size;
             if (use_fiber) {
                 int did_yield = 0;
-                fiber_counter = fiber_maybe_yield(fiber_counter, (size_t)dsize, &did_yield);
+                fiber_counter = fiber_maybe_yield(fiber_counter, (size_t)dsize,
+                                                  policy->fiber_yield_chunk, &did_yield);
                 (void)did_yield;
             }
         }
@@ -2586,7 +2529,11 @@ static VALUE inflater_reset(VALUE self) {
     inflater_t *inf;
     TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
 
-    dictionary_t *dict = dictionary_from_self(self, inf->algo);
+    VALUE dict_val = dictionary_ivar_get(self);
+    dictionary_t *dict = NULL;
+    if (!NIL_P(dict_val)) {
+        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+    }
 
     switch (inf->algo) {
     case ALGO_ZSTD:
@@ -2629,7 +2576,22 @@ static VALUE inflater_close(VALUE self) {
     if (inf->closed)
         return Qnil;
 
-    inflater_release_resources(inf);
+    switch (inf->algo) {
+    case ALGO_ZSTD:
+        if (inf->ctx.zstd) {
+            ZSTD_freeDStream(inf->ctx.zstd);
+            inf->ctx.zstd = NULL;
+        }
+        break;
+    case ALGO_BROTLI:
+        if (inf->ctx.brotli) {
+            BrotliDecoderDestroyInstance(inf->ctx.brotli);
+            inf->ctx.brotli = NULL;
+        }
+        break;
+    case ALGO_LZ4:
+        break;
+    }
     inf->closed = 1;
     return Qnil;
 }
@@ -2648,7 +2610,11 @@ static VALUE dict_initialize(int argc, VALUE *argv, VALUE self) {
     dictionary_t *d;
     TypedData_Get_Struct(self, dictionary_t, &dictionary_type, d);
 
-    d->algo = algo_from_opts(opts, ALGO_ZSTD);
+    VALUE algo_sym = Qnil;
+    if (!NIL_P(opts)) {
+        algo_sym = opt_get(opts, sym_cache.algo);
+    }
+    d->algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
 
     if (d->algo == ALGO_LZ4)
         rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
@@ -2739,14 +2705,16 @@ static VALUE zstd_train_dictionary(int argc, VALUE *argv, VALUE self) {
 
     VALUE samples, opts;
     rb_scan_args(argc, argv, "1:", &samples, &opts);
-    return train_dictionary_internal(samples, size_value_from_opts(opts), ALGO_ZSTD);
+    VALUE size_val = opt_get(opts, sym_cache.size);
+    return train_dictionary_internal(samples, size_val, ALGO_ZSTD);
 }
 
 static VALUE brotli_train_dictionary(int argc, VALUE *argv, VALUE self) {
     VALUE samples, opts;
     rb_scan_args(argc, argv, "1:", &samples, &opts);
+    VALUE size_val = opt_get(opts, sym_cache.size);
 
-    return train_dictionary_internal(samples, size_value_from_opts(opts), ALGO_BROTLI);
+    return train_dictionary_internal(samples, size_val, ALGO_BROTLI);
 }
 
 static VALUE dict_load(int argc, VALUE *argv, VALUE self) {
@@ -2754,34 +2722,25 @@ static VALUE dict_load(int argc, VALUE *argv, VALUE self) {
     rb_scan_args(argc, argv, "1:", &path, &opts);
     StringValue(path);
 
-    compress_algo_t algo = algo_from_opts(opts, ALGO_ZSTD);
+    VALUE algo_sym = Qnil;
+    if (!NIL_P(opts)) {
+        algo_sym = opt_get(opts, sym_cache.algo);
+    }
+    compress_algo_t algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
 
     if (algo == ALGO_LZ4)
         rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
 
     const char *cpath = RSTRING_PTR(path);
     FILE *f = fopen(cpath, "rb");
-    uint8_t *buf = NULL;
-    size_t read_bytes;
-    long file_size;
-
     if (!f)
         rb_sys_fail(cpath);
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        rb_raise(eDataError, "failed to seek dictionary: %s", cpath);
-    }
-    file_size = ftell(f);
-    if (file_size < 0) {
-        fclose(f);
-        rb_raise(eDataError, "failed to stat dictionary: %s", cpath);
-    }
-    if (fseek(f, 0, SEEK_SET) != 0) {
-        fclose(f);
-        rb_raise(eDataError, "failed to seek dictionary: %s", cpath);
-    }
 
-    if (file_size == 0) {
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (file_size <= 0) {
         fclose(f);
         rb_raise(eDataError, "dictionary file is empty: %s", cpath);
     }
@@ -2791,8 +2750,8 @@ static VALUE dict_load(int argc, VALUE *argv, VALUE self) {
                  (int)DICT_FILE_MAX_SIZE);
     }
 
-    buf = ALLOC_N(uint8_t, (size_t)file_size);
-    read_bytes = fread(buf, 1, (size_t)file_size, f);
+    uint8_t *buf = ALLOC_N(uint8_t, file_size);
+    size_t read_bytes = fread(buf, 1, file_size, f);
     fclose(f);
 
     if ((long)read_bytes != file_size) {
@@ -2829,15 +2788,7 @@ static VALUE dict_save(VALUE self, VALUE path) {
 static VALUE dict_algo(VALUE self) {
     dictionary_t *d;
     TypedData_Get_Struct(self, dictionary_t, &dictionary_type, d);
-    switch (d->algo) {
-    case ALGO_ZSTD:
-        return ID2SYM(rb_intern("zstd"));
-    case ALGO_LZ4:
-        return ID2SYM(rb_intern("lz4"));
-    case ALGO_BROTLI:
-        return ID2SYM(rb_intern("brotli"));
-    }
-    return Qnil;
+    return algo_to_sym(d->algo);
 }
 
 static VALUE dict_size(VALUE self) {
@@ -2848,6 +2799,7 @@ static VALUE dict_size(VALUE self) {
 
 void Init_multi_compress(void) {
     binary_encoding = rb_ascii8bit_encoding();
+    init_id_cache();
     crc32_init_tables();
 
     mMultiCompress = rb_define_module("MultiCompress");
