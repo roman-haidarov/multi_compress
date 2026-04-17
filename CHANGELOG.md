@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.2.2]
+
+### Added
+- New decompression safeguards:
+  - `max_output_size:` on `MultiCompress.decompress`, `MultiCompress::Inflater.new`, and `MultiCompress::Reader.open`
+  - `max_ratio:` with default `1000` and trusted-input opt-out via `nil`
+  - Cumulative streaming output budget enforcement
+  - Dictionary file size cap (`32MB`) for `MultiCompress::Dictionary.load`
+- New docs/code parity and limits tests
+- Linux-only ASAN/UBSAN CI job
+- Local `tools/valgrind.sh` helper for developer verification
+
+### Changed
+- Vendored **zstd** is pinned to **1.5.2** in the current release line.
+  - This restores reliable `MultiCompress::Zstd.train_dictionary(...)` behavior on tested platforms, including arm64-darwin.
+  - Newer vendored zstd versions are temporarily avoided until the dictionary training regression is understood and fixed upstream.
+
+### Changed
+- Documentation now matches current runtime behavior:
+  - Ruby requirement is documented as `>= 3.1.0`
+  - Supported named levels are `:fastest`, `:default`, and `:best`
+  - Zstd `:best` is documented with the current runtime mapping (level 19)
+  - LZ4 is documented as using a custom internal format that is not compatible with the standard `lz4` CLI
+
+### Fixed
+- Corrected dictionary training docs:
+  - `MultiCompress::Zstd.train_dictionary` is documented as supported
+  - `MultiCompress::Brotli.train_dictionary` is documented as unsupported in the current implementation
+
+### Notes
+- The default `max_ratio: 1000` is a user-visible behavior change. Workloads that legitimately expand beyond `1000:1` must pass `max_ratio: nil`.
+
 ## [0.2.1] — 2026-04-15
 - Change version zstd "1.5.6" -> "1.5.7".
 - Micro optimization.

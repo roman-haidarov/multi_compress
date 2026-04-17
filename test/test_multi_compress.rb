@@ -1,5 +1,6 @@
 require "minitest/autorun"
 require "multi_compress"
+require "stringio"
 
 class TestMultiCompress < Minitest::Test
   def setup
@@ -178,6 +179,17 @@ class TestMultiCompress < Minitest::Test
     end
   end
 
+  def test_reader_open_accepts_limit_kwargs
+    compressed = MultiCompress.compress(@data, algo: :zstd)
+    io = StringIO.new(compressed)
+
+    result = MultiCompress::Reader.open(io, algo: :zstd, max_output_size: 1 * 1024 * 1024, max_ratio: 1000) do |reader|
+      reader.read
+    end
+
+    assert_equal @data, result
+  end
+
   def test_streaming_closed_operations
     deflater = MultiCompress::Deflater.new(algo: :zstd)
     deflater.close
@@ -243,7 +255,6 @@ class TestMultiCompress < Minitest::Test
     end
   end
 
-  
   def test_dictionary_unsupported_lz4
     sample_dict = "common patterns here"
     assert_raises(MultiCompress::UnsupportedError) do

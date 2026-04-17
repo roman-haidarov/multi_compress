@@ -165,9 +165,9 @@ module MultiCompress
   class Reader
     CHUNK_SIZE = 8192
 
-    def self.open(path_or_io, algo: nil, dictionary: nil, &block)
+    def self.open(path_or_io, algo: nil, dictionary: nil, max_output_size: nil, max_ratio: 1000, &block)
       io, algo, owned = resolve_io(path_or_io, algo, mode: "rb")
-      reader = new(io, algo: algo, dictionary: dictionary)
+      reader = new(io, algo: algo, dictionary: dictionary, max_output_size: max_output_size, max_ratio: max_ratio)
       reader.instance_variable_set(:@owned_io, owned)
 
       return reader unless block
@@ -179,9 +179,9 @@ module MultiCompress
       end
     end
 
-    def initialize(io, algo: nil, dictionary: nil)
+    def initialize(io, algo: nil, dictionary: nil, max_output_size: nil, max_ratio: 1000)
       @io       = io
-      @inflater = Inflater.new(algo: algo, dictionary: dictionary)
+      @inflater = Inflater.new(algo: algo, dictionary: dictionary, max_output_size: max_output_size, max_ratio: max_ratio)
       @closed   = false
       @owned_io = false
       @buffer   = +""
