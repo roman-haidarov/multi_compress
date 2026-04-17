@@ -10,7 +10,9 @@
   - Dictionary file size cap (`32MB`) for `MultiCompress::Dictionary.load`
 - New docs/code parity and limits tests
 - Linux-only ASAN/UBSAN CI job
-- Local `tools/valgrind.sh` helper for developer verification
+- Local `script/valgrind.sh` helper for developer verification (with Ruby VM suppressions)
+- Local `script/sanitize.sh` helper for reproducing the ASAN/UBSAN CI job locally on Linux
+- Optional `./build.sh --test`, `./build.sh --valgrind`, and `./build.sh --sanitize` modes
 
 ### Changed
 - Vendored **zstd** is pinned to **1.5.2** in the current release line.

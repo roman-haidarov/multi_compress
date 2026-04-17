@@ -1,0 +1,99 @@
+# Valgrind suppressions for known Ruby VM noise.
+#
+# These are not bugs in multi_compress — they are well-known patterns in CRuby
+# (GC arenas, conservative stack scanning, intentional "reachable at exit"
+# allocations). Without these suppressions the output is dominated by noise
+# from the interpreter itself.
+#
+# Based on the upstream Ruby valgrind suppressions list
+# (https://github.com/ruby/ruby/blob/master/misc/valgrind-suppressions)
+# trimmed to entries relevant to a C extension test run.
+
+{
+   ruby-gc-conservative-stack-scan
+   Memcheck:Value8
+   fun:gc_mark_children
+   ...
+}
+
+{
+   ruby-gc-conservative-stack-scan-cond
+   Memcheck:Cond
+   fun:gc_mark_children
+   ...
+}
+
+{
+   ruby-gc-mark-locations
+   Memcheck:Value8
+   fun:rb_gc_mark_locations
+   ...
+}
+
+{
+   ruby-gc-mark-locations-cond
+   Memcheck:Cond
+   fun:rb_gc_mark_locations
+   ...
+}
+
+{
+   ruby-objspace-each-objects-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   fun:objspace_malloc0
+   ...
+}
+
+{
+   ruby-vm-init-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:ruby_init
+}
+
+{
+   ruby-thread-create-stack-leak
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   ...
+   fun:pthread_create*
+}
+
+{
+   ruby-setlocale-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:setlocale
+}
+
+{
+   ruby-dlopen-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_dl_init
+}
+
+# Onigmo (regex engine bundled with Ruby) allocates on demand and keeps
+# state alive until interpreter shutdown.
+{
+   ruby-onigmo-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:onig_new
+}
+
+# Fiber scheduler coroutine stacks are mmap'd regions that valgrind
+# sometimes flags as indirectly lost at shutdown.
+{
+   ruby-fiber-stack-indirect
+   Memcheck:Leak
+   match-leak-kinds: indirect
+   ...
+   fun:fiber_pool_stack_alloc
+}
