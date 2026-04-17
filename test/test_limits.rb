@@ -84,8 +84,12 @@ class TestLimits < Minitest::Test
     end
   end
 
-  def test_max_output_size_nil_uses_default_256mb_cap
-    oversized = fake_lz4_blob([128 * 1024 * 1024, 1], [129 * 1024 * 1024, 1])
+  def test_max_output_size_nil_uses_default_512mb_cap
+    oversized = fake_lz4_blob(
+      [200 * 1024 * 1024, 1],
+      [200 * 1024 * 1024, 1],
+      [113 * 1024 * 1024, 1]
+    )
 
     error = assert_raises(MultiCompress::DataError) do
       MultiCompress.decompress(oversized, algo: :lz4, max_output_size: nil, max_ratio: nil)

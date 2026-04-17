@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.3]
+
+### Changed
+ - Constants
+
 ## [0.2.2]
 
 ### Added
