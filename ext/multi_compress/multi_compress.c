@@ -43,16 +43,157 @@ static rb_encoding *binary_encoding;
 
 typedef enum { ALGO_ZSTD = 0, ALGO_LZ4 = 1, ALGO_BROTLI = 2 } compress_algo_t;
 
+static inline ID id_algo(void) {
+    static ID id = 0;
+    if (id == 0)
+        id = rb_intern("algo");
+    return id;
+}
+
+static inline ID id_level(void) {
+    static ID id = 0;
+    if (id == 0)
+        id = rb_intern("level");
+    return id;
+}
+
+static inline ID id_dictionary(void) {
+    static ID id = 0;
+    if (id == 0)
+        id = rb_intern("dictionary");
+    return id;
+}
+
+static inline ID id_size(void) {
+    static ID id = 0;
+    if (id == 0)
+        id = rb_intern("size");
+    return id;
+}
+
+static inline ID id_max_output_size(void) {
+    static ID id = 0;
+    if (id == 0)
+        id = rb_intern("max_output_size");
+    return id;
+}
+
+static inline ID id_max_ratio(void) {
+    static ID id = 0;
+    if (id == 0)
+        id = rb_intern("max_ratio");
+    return id;
+}
+
+static inline ID id_join(void) {
+    static ID id = 0;
+    if (id == 0)
+        id = rb_intern("join");
+    return id;
+}
+
+static inline ID id_yield_method(void) {
+    static ID id = 0;
+    if (id == 0)
+        id = rb_intern("yield");
+    return id;
+}
+
+static inline ID id_dictionary_ivar(void) {
+    static ID id = 0;
+    if (id == 0)
+        id = rb_intern("@dictionary");
+    return id;
+}
+
+static inline ID id_algo_zstd(void) {
+    static ID id = 0;
+    if (id == 0)
+        id = rb_intern("zstd");
+    return id;
+}
+
+static inline ID id_algo_lz4(void) {
+    static ID id = 0;
+    if (id == 0)
+        id = rb_intern("lz4");
+    return id;
+}
+
+static inline ID id_algo_brotli(void) {
+    static ID id = 0;
+    if (id == 0)
+        id = rb_intern("brotli");
+    return id;
+}
+
+static inline VALUE sym_from_id(ID id) {
+    return ID2SYM(id);
+}
+
+static inline VALUE sym_zstd(void) {
+    return sym_from_id(id_algo_zstd());
+}
+
+static inline VALUE sym_lz4(void) {
+    return sym_from_id(id_algo_lz4());
+}
+
+static inline VALUE sym_brotli(void) {
+    return sym_from_id(id_algo_brotli());
+}
+
+static inline VALUE opts_value_by_id(VALUE opts, ID key_id) {
+    if (NIL_P(opts))
+        return Qnil;
+    return rb_hash_aref(opts, sym_from_id(key_id));
+}
+
+static inline VALUE opts_lookup2_by_id(VALUE opts, ID key_id, VALUE default_value) {
+    if (NIL_P(opts))
+        return default_value;
+    return rb_hash_lookup2(opts, sym_from_id(key_id), default_value);
+}
+
 static compress_algo_t sym_to_algo(VALUE sym) {
     ID id = SYM2ID(sym);
-    if (id == rb_intern("zstd"))
+    if (id == id_algo_zstd())
         return ALGO_ZSTD;
-    if (id == rb_intern("lz4"))
+    if (id == id_algo_lz4())
         return ALGO_LZ4;
-    if (id == rb_intern("brotli"))
+    if (id == id_algo_brotli())
         return ALGO_BROTLI;
     rb_raise(rb_eArgError, "Unknown algorithm: %s", rb_id2name(id));
     return ALGO_ZSTD;
+}
+
+static inline VALUE algo_to_sym(compress_algo_t algo) {
+    switch (algo) {
+    case ALGO_ZSTD:
+        return sym_zstd();
+    case ALGO_LZ4:
+        return sym_lz4();
+    case ALGO_BROTLI:
+        return sym_brotli();
+    }
+    return sym_zstd();
+}
+
+static inline compress_algo_t algo_from_opts(VALUE opts, compress_algo_t default_algo) {
+    VALUE algo_sym = opts_value_by_id(opts, id_algo());
+    return NIL_P(algo_sym) ? default_algo : sym_to_algo(algo_sym);
+}
+
+static inline VALUE level_value_from_opts(VALUE opts) {
+    return opts_value_by_id(opts, id_level());
+}
+
+static inline VALUE dictionary_value_from_opts(VALUE opts) {
+    return opts_value_by_id(opts, id_dictionary());
+}
+
+static inline VALUE size_value_from_opts(VALUE opts) {
+    return opts_value_by_id(opts, id_size());
 }
 
 static int resolve_level(compress_algo_t algo, VALUE level_val) {
@@ -182,19 +323,14 @@ typedef struct {
     unsigned long long max_ratio;
 } limits_config_t;
 
-static void limits_config_init(limits_config_t *limits) {
+static inline void limits_config_init(limits_config_t *limits) {
     limits->max_output_size = (size_t)MAX_DECOMPRESS_SIZE;
     limits->max_ratio_enabled = 1;
     limits->max_ratio = DEFAULT_MAX_RATIO;
 }
 
-static void parse_limits_from_opts(VALUE opts, limits_config_t *limits) {
-    limits_config_init(limits);
-    if (NIL_P(opts))
-        return;
-
-    VALUE key = ID2SYM(rb_intern("max_output_size"));
-    VALUE val = rb_hash_lookup2(opts, key, Qundef);
+static void limits_config_apply_opts(limits_config_t *limits, VALUE opts) {
+    VALUE val = opts_lookup2_by_id(opts, id_max_output_size(), Qundef);
     if (val != Qundef && !NIL_P(val)) {
         size_t max_output_size = NUM2SIZET(val);
         if (max_output_size == 0)
@@ -202,8 +338,7 @@ static void parse_limits_from_opts(VALUE opts, limits_config_t *limits) {
         limits->max_output_size = max_output_size;
     }
 
-    key = ID2SYM(rb_intern("max_ratio"));
-    val = rb_hash_lookup2(opts, key, Qundef);
+    val = opts_lookup2_by_id(opts, id_max_ratio(), Qundef);
     if (val == Qundef)
         return;
     if (NIL_P(val)) {
@@ -262,6 +397,23 @@ static int has_fiber_scheduler(void) {
     return current_fiber_scheduler() != Qnil;
 }
 
+static inline void join_thread(VALUE thread) {
+    rb_funcall(thread, id_join(), 0);
+}
+
+static inline void scheduler_yield(VALUE scheduler) {
+    rb_funcall(scheduler, id_yield_method(), 0);
+}
+
+static inline VALUE dictionary_ivar_get(VALUE self) {
+    return rb_attr_get(self, id_dictionary_ivar());
+}
+
+static inline void dictionary_ivar_set(VALUE self, VALUE dict_val) {
+    if (!NIL_P(dict_val))
+        rb_ivar_set(self, id_dictionary_ivar(), dict_val);
+}
+
 static void unblock_noop(void *arg) {
     (void)arg;
 }
@@ -302,7 +454,7 @@ static void run_via_fiber_worker(VALUE scheduler, void *(*func)(void *), void *a
     };
     VALUE th = rb_thread_create(fiber_worker_thread, &ctx);
     rb_fiber_scheduler_block(scheduler, ctx.blocker, Qnil);
-    rb_funcall(th, rb_intern("join"), 0);
+    join_thread(th);
 }
 
 static inline size_t fiber_maybe_yield(size_t bytes_since_yield, size_t just_processed,
@@ -312,7 +464,7 @@ static inline size_t fiber_maybe_yield(size_t bytes_since_yield, size_t just_pro
     if (bytes_since_yield >= FIBER_YIELD_CHUNK) {
         VALUE scheduler = current_fiber_scheduler();
         if (scheduler != Qnil) {
-            rb_funcall(scheduler, rb_intern("yield"), 0);
+            scheduler_yield(scheduler);
             *did_yield = 1;
         }
         return 0;
@@ -371,6 +523,34 @@ static VALUE dict_alloc(VALUE klass) {
     dictionary_t *d = ALLOC(dictionary_t);
     memset(d, 0, sizeof(dictionary_t));
     return TypedData_Wrap_Struct(klass, &dictionary_type, d);
+}
+
+static dictionary_t *dictionary_from_value(VALUE dict_val, compress_algo_t algo) {
+    dictionary_t *dict = NULL;
+
+    if (NIL_P(dict_val))
+        return NULL;
+    if (algo == ALGO_LZ4)
+        rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
+
+    TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+    return dict;
+}
+
+static dictionary_t *dictionary_from_opts(VALUE opts, compress_algo_t algo, VALUE *dict_val_out) {
+    VALUE dict_val = dictionary_value_from_opts(opts);
+
+    if (dict_val_out)
+        *dict_val_out = dict_val;
+    return dictionary_from_value(dict_val, algo);
+}
+
+static inline void remember_dictionary(VALUE self, VALUE dict_val) {
+    dictionary_ivar_set(self, dict_val);
+}
+
+static dictionary_t *dictionary_from_self(VALUE self, compress_algo_t algo) {
+    return dictionary_from_value(dictionary_ivar_get(self), algo);
 }
 
 static ZSTD_CDict *dict_get_cdict(dictionary_t *dict, int level) {
@@ -700,23 +880,9 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
     rb_scan_args(argc, argv, "1:", &data, &opts);
     StringValue(data);
 
-    VALUE algo_sym = Qnil, level_val = Qnil, dict_val = Qnil;
-    if (!NIL_P(opts)) {
-        algo_sym = rb_hash_aref(opts, ID2SYM(rb_intern("algo")));
-        level_val = rb_hash_aref(opts, ID2SYM(rb_intern("level")));
-        dict_val = rb_hash_aref(opts, ID2SYM(rb_intern("dictionary")));
-    }
-
-    compress_algo_t algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
-    int level = resolve_level(algo, level_val);
-
-    dictionary_t *dict = NULL;
-    if (!NIL_P(dict_val)) {
-        if (algo == ALGO_LZ4) {
-            rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
-        }
-        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
-    }
+    compress_algo_t algo = algo_from_opts(opts, ALGO_ZSTD);
+    int level = resolve_level(algo, level_value_from_opts(opts));
+    dictionary_t *dict = dictionary_from_opts(opts, algo, NULL);
 
     const char *src = RSTRING_PTR(data);
     size_t slen = RSTRING_LEN(data);
@@ -776,7 +942,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
 
                 VALUE rb_thread = rb_thread_create(zstd_fiber_compress_thread, &fargs);
                 rb_fiber_scheduler_block(scheduler, blocker, Qnil);
-                rb_funcall(rb_thread, rb_intern("join"), 0);
+                join_thread(rb_thread);
 
                 if (fargs.error) {
                     free(out_buf);
@@ -990,31 +1156,16 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
     rb_scan_args(argc, argv, "1:", &data, &opts);
     StringValue(data);
 
-    VALUE algo_sym = Qnil, dict_val = Qnil;
     limits_config_t limits;
-    parse_limits_from_opts(opts, &limits);
-    if (!NIL_P(opts)) {
-        algo_sym = rb_hash_aref(opts, ID2SYM(rb_intern("algo")));
-        dict_val = rb_hash_aref(opts, ID2SYM(rb_intern("dictionary")));
-    }
+    limits_config_init(&limits);
+    limits_config_apply_opts(&limits, opts);
 
     const uint8_t *src = (const uint8_t *)RSTRING_PTR(data);
     size_t slen = RSTRING_LEN(data);
 
-    compress_algo_t algo;
-    if (NIL_P(algo_sym)) {
-        algo = detect_algo(src, slen);
-    } else {
-        algo = sym_to_algo(algo_sym);
-    }
-
-    dictionary_t *dict = NULL;
-    if (!NIL_P(dict_val)) {
-        if (algo == ALGO_LZ4) {
-            rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
-        }
-        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
-    }
+    VALUE algo_sym = opts_value_by_id(opts, id_algo());
+    compress_algo_t algo = NIL_P(algo_sym) ? detect_algo(src, slen) : sym_to_algo(algo_sym);
+    dictionary_t *dict = dictionary_from_opts(opts, algo, NULL);
 
     switch (algo) {
     case ALGO_ZSTD: {
@@ -1455,24 +1606,33 @@ typedef struct {
     } lz4_ring;
 } deflater_t;
 
+static void deflater_release_resources(deflater_t *d) {
+    switch (d->algo) {
+    case ALGO_ZSTD:
+        if (d->ctx.zstd) {
+            ZSTD_freeCStream(d->ctx.zstd);
+            d->ctx.zstd = NULL;
+        }
+        break;
+    case ALGO_BROTLI:
+        if (d->ctx.brotli) {
+            BrotliEncoderDestroyInstance(d->ctx.brotli);
+            d->ctx.brotli = NULL;
+        }
+        break;
+    case ALGO_LZ4:
+        if (d->ctx.lz4) {
+            LZ4_freeStream(d->ctx.lz4);
+            d->ctx.lz4 = NULL;
+        }
+        break;
+    }
+}
+
 static void deflater_free(void *ptr) {
     deflater_t *d = (deflater_t *)ptr;
-    if (!d->closed) {
-        switch (d->algo) {
-        case ALGO_ZSTD:
-            if (d->ctx.zstd)
-                ZSTD_freeCStream(d->ctx.zstd);
-            break;
-        case ALGO_BROTLI:
-            if (d->ctx.brotli)
-                BrotliEncoderDestroyInstance(d->ctx.brotli);
-            break;
-        case ALGO_LZ4:
-            if (d->ctx.lz4)
-                LZ4_freeStream(d->ctx.lz4);
-            break;
-        }
-    }
+    if (!d->closed)
+        deflater_release_resources(d);
     if (d->lz4_ring.buf)
         xfree(d->lz4_ring.buf);
     xfree(d);
@@ -1505,26 +1665,15 @@ static VALUE deflater_initialize(int argc, VALUE *argv, VALUE self) {
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
 
-    VALUE algo_sym = Qnil, level_val = Qnil, dict_val = Qnil;
-    if (!NIL_P(opts)) {
-        algo_sym = rb_hash_aref(opts, ID2SYM(rb_intern("algo")));
-        level_val = rb_hash_aref(opts, ID2SYM(rb_intern("level")));
-        dict_val = rb_hash_aref(opts, ID2SYM(rb_intern("dictionary")));
-    }
+    VALUE dict_val = dictionary_value_from_opts(opts);
 
-    d->algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
-    d->level = resolve_level(d->algo, level_val);
+    d->algo = algo_from_opts(opts, ALGO_ZSTD);
+    d->level = resolve_level(d->algo, level_value_from_opts(opts));
     d->closed = 0;
     d->finished = 0;
 
-    dictionary_t *dict = NULL;
-    if (!NIL_P(dict_val)) {
-        if (d->algo == ALGO_LZ4) {
-            rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
-        }
-        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
-        rb_ivar_set(self, rb_intern("@dictionary"), dict_val);
-    }
+    dictionary_t *dict = dictionary_from_value(dict_val, d->algo);
+    remember_dictionary(self, dict_val);
 
     switch (d->algo) {
     case ALGO_ZSTD: {
@@ -1666,7 +1815,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
                 };
                 VALUE th = rb_thread_create(zstd_stream_chunk_fiber_thread, &fargs);
                 rb_fiber_scheduler_block(scheduler, fargs.blocker, Qnil);
-                rb_funcall(th, rb_intern("join"), 0);
+                join_thread(th);
 
                 if (ZSTD_isError(fargs.result))
                     rb_raise(eError, "zstd compress stream: %s", ZSTD_getErrorName(fargs.result));
@@ -1723,7 +1872,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
                 };
                 VALUE th = rb_thread_create(brotli_stream_chunk_fiber_thread, &fargs);
                 rb_fiber_scheduler_block(scheduler, fargs.blocker, Qnil);
-                rb_funcall(th, rb_intern("join"), 0);
+                join_thread(th);
                 ok = fargs.result;
             } else {
                 ok = BrotliEncoderCompressStream(d->ctx.brotli, BROTLI_OPERATION_PROCESS,
@@ -1980,11 +2129,7 @@ static VALUE deflater_reset(VALUE self) {
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
 
-    VALUE dict_val = rb_attr_get(self, rb_intern("@dictionary"));
-    dictionary_t *dict = NULL;
-    if (!NIL_P(dict_val)) {
-        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
-    }
+    dictionary_t *dict = dictionary_from_self(self, d->algo);
 
     switch (d->algo) {
     case ALGO_ZSTD:
@@ -2038,26 +2183,7 @@ static VALUE deflater_close(VALUE self) {
     if (d->closed)
         return Qnil;
 
-    switch (d->algo) {
-    case ALGO_ZSTD:
-        if (d->ctx.zstd) {
-            ZSTD_freeCStream(d->ctx.zstd);
-            d->ctx.zstd = NULL;
-        }
-        break;
-    case ALGO_BROTLI:
-        if (d->ctx.brotli) {
-            BrotliEncoderDestroyInstance(d->ctx.brotli);
-            d->ctx.brotli = NULL;
-        }
-        break;
-    case ALGO_LZ4:
-        if (d->ctx.lz4) {
-            LZ4_freeStream(d->ctx.lz4);
-            d->ctx.lz4 = NULL;
-        }
-        break;
-    }
+    deflater_release_resources(d);
     d->closed = 1;
     return Qnil;
 }
@@ -2091,22 +2217,29 @@ typedef struct {
     } lz4_buf;
 } inflater_t;
 
+static void inflater_release_resources(inflater_t *inf) {
+    switch (inf->algo) {
+    case ALGO_ZSTD:
+        if (inf->ctx.zstd) {
+            ZSTD_freeDStream(inf->ctx.zstd);
+            inf->ctx.zstd = NULL;
+        }
+        break;
+    case ALGO_BROTLI:
+        if (inf->ctx.brotli) {
+            BrotliDecoderDestroyInstance(inf->ctx.brotli);
+            inf->ctx.brotli = NULL;
+        }
+        break;
+    case ALGO_LZ4:
+        break;
+    }
+}
+
 static void inflater_free(void *ptr) {
     inflater_t *inf = (inflater_t *)ptr;
-    if (!inf->closed) {
-        switch (inf->algo) {
-        case ALGO_ZSTD:
-            if (inf->ctx.zstd)
-                ZSTD_freeDStream(inf->ctx.zstd);
-            break;
-        case ALGO_BROTLI:
-            if (inf->ctx.brotli)
-                BrotliDecoderDestroyInstance(inf->ctx.brotli);
-            break;
-        case ALGO_LZ4:
-            break;
-        }
-    }
+    if (!inf->closed)
+        inflater_release_resources(inf);
     if (inf->lz4_buf.buf)
         xfree(inf->lz4_buf.buf);
     xfree(inf);
@@ -2136,15 +2269,13 @@ static VALUE inflater_initialize(int argc, VALUE *argv, VALUE self) {
     inflater_t *inf;
     TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
 
-    VALUE algo_sym = Qnil, dict_val = Qnil;
     limits_config_t limits;
-    parse_limits_from_opts(opts, &limits);
-    if (!NIL_P(opts)) {
-        algo_sym = rb_hash_aref(opts, ID2SYM(rb_intern("algo")));
-        dict_val = rb_hash_aref(opts, ID2SYM(rb_intern("dictionary")));
-    }
+    limits_config_init(&limits);
+    limits_config_apply_opts(&limits, opts);
 
-    inf->algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
+    VALUE dict_val = dictionary_value_from_opts(opts);
+
+    inf->algo = algo_from_opts(opts, ALGO_ZSTD);
     inf->closed = 0;
     inf->finished = 0;
     inf->max_output_size = limits.max_output_size;
@@ -2153,14 +2284,8 @@ static VALUE inflater_initialize(int argc, VALUE *argv, VALUE self) {
     inf->max_ratio_enabled = limits.max_ratio_enabled;
     inf->max_ratio = limits.max_ratio;
 
-    dictionary_t *dict = NULL;
-    if (!NIL_P(dict_val)) {
-        if (inf->algo == ALGO_LZ4) {
-            rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
-        }
-        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
-        rb_ivar_set(self, rb_intern("@dictionary"), dict_val);
-    }
+    dictionary_t *dict = dictionary_from_value(dict_val, inf->algo);
+    remember_dictionary(self, dict_val);
 
     switch (inf->algo) {
     case ALGO_ZSTD:
@@ -2461,11 +2586,7 @@ static VALUE inflater_reset(VALUE self) {
     inflater_t *inf;
     TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
 
-    VALUE dict_val = rb_attr_get(self, rb_intern("@dictionary"));
-    dictionary_t *dict = NULL;
-    if (!NIL_P(dict_val)) {
-        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
-    }
+    dictionary_t *dict = dictionary_from_self(self, inf->algo);
 
     switch (inf->algo) {
     case ALGO_ZSTD:
@@ -2508,22 +2629,7 @@ static VALUE inflater_close(VALUE self) {
     if (inf->closed)
         return Qnil;
 
-    switch (inf->algo) {
-    case ALGO_ZSTD:
-        if (inf->ctx.zstd) {
-            ZSTD_freeDStream(inf->ctx.zstd);
-            inf->ctx.zstd = NULL;
-        }
-        break;
-    case ALGO_BROTLI:
-        if (inf->ctx.brotli) {
-            BrotliDecoderDestroyInstance(inf->ctx.brotli);
-            inf->ctx.brotli = NULL;
-        }
-        break;
-    case ALGO_LZ4:
-        break;
-    }
+    inflater_release_resources(inf);
     inf->closed = 1;
     return Qnil;
 }
@@ -2542,11 +2648,7 @@ static VALUE dict_initialize(int argc, VALUE *argv, VALUE self) {
     dictionary_t *d;
     TypedData_Get_Struct(self, dictionary_t, &dictionary_type, d);
 
-    VALUE algo_sym = Qnil;
-    if (!NIL_P(opts)) {
-        algo_sym = rb_hash_aref(opts, ID2SYM(rb_intern("algo")));
-    }
-    d->algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
+    d->algo = algo_from_opts(opts, ALGO_ZSTD);
 
     if (d->algo == ALGO_LZ4)
         rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
@@ -2629,24 +2731,22 @@ static VALUE train_dictionary_internal(VALUE samples, VALUE size_val, compress_a
 }
 
 static VALUE zstd_train_dictionary(int argc, VALUE *argv, VALUE self) {
-// #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
-//     rb_raise(eUnsupportedError,
-//              "Zstd dictionary training is temporarily disabled on arm64-darwin "
-//              "because the current vendored trainer path crashes on this platform");
-// #endif
+    // #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+    //     rb_raise(eUnsupportedError,
+    //              "Zstd dictionary training is temporarily disabled on arm64-darwin "
+    //              "because the current vendored trainer path crashes on this platform");
+    // #endif
 
     VALUE samples, opts;
     rb_scan_args(argc, argv, "1:", &samples, &opts);
-    VALUE size_val = NIL_P(opts) ? Qnil : rb_hash_aref(opts, ID2SYM(rb_intern("size")));
-    return train_dictionary_internal(samples, size_val, ALGO_ZSTD);
+    return train_dictionary_internal(samples, size_value_from_opts(opts), ALGO_ZSTD);
 }
 
 static VALUE brotli_train_dictionary(int argc, VALUE *argv, VALUE self) {
     VALUE samples, opts;
     rb_scan_args(argc, argv, "1:", &samples, &opts);
-    VALUE size_val = NIL_P(opts) ? Qnil : rb_hash_aref(opts, ID2SYM(rb_intern("size")));
 
-    return train_dictionary_internal(samples, size_val, ALGO_BROTLI);
+    return train_dictionary_internal(samples, size_value_from_opts(opts), ALGO_BROTLI);
 }
 
 static VALUE dict_load(int argc, VALUE *argv, VALUE self) {
@@ -2654,25 +2754,34 @@ static VALUE dict_load(int argc, VALUE *argv, VALUE self) {
     rb_scan_args(argc, argv, "1:", &path, &opts);
     StringValue(path);
 
-    VALUE algo_sym = Qnil;
-    if (!NIL_P(opts)) {
-        algo_sym = rb_hash_aref(opts, ID2SYM(rb_intern("algo")));
-    }
-    compress_algo_t algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
+    compress_algo_t algo = algo_from_opts(opts, ALGO_ZSTD);
 
     if (algo == ALGO_LZ4)
         rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
 
     const char *cpath = RSTRING_PTR(path);
     FILE *f = fopen(cpath, "rb");
+    uint8_t *buf = NULL;
+    size_t read_bytes;
+    long file_size;
+
     if (!f)
         rb_sys_fail(cpath);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        rb_raise(eDataError, "failed to seek dictionary: %s", cpath);
+    }
+    file_size = ftell(f);
+    if (file_size < 0) {
+        fclose(f);
+        rb_raise(eDataError, "failed to stat dictionary: %s", cpath);
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        rb_raise(eDataError, "failed to seek dictionary: %s", cpath);
+    }
 
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (file_size <= 0) {
+    if (file_size == 0) {
         fclose(f);
         rb_raise(eDataError, "dictionary file is empty: %s", cpath);
     }
@@ -2682,8 +2791,8 @@ static VALUE dict_load(int argc, VALUE *argv, VALUE self) {
                  (int)DICT_FILE_MAX_SIZE);
     }
 
-    uint8_t *buf = ALLOC_N(uint8_t, file_size);
-    size_t read_bytes = fread(buf, 1, file_size, f);
+    buf = ALLOC_N(uint8_t, (size_t)file_size);
+    read_bytes = fread(buf, 1, (size_t)file_size, f);
     fclose(f);
 
     if ((long)read_bytes != file_size) {
