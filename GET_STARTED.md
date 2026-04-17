@@ -45,7 +45,7 @@ This gem uses a **custom internal LZ4 format** that is **NOT compatible** with t
 - N bytes: LZ4 compressed data
 - 4 bytes: end marker (`00 00 00 00`)
 
-This format is optimized for streaming and provides better error detection, but files compressed with this gem cannot be decompressed with standard `lz4` CLI tools and vice versa.
+This format is optimized for streaming and provides better error detection, but files compressed with this gem cannot be decompressed with standard `lz4` CLI tools and vice versa. Optional standard frame support may be added in a future release.
 
 **❌ WRONG - This will NOT work:**
 ```bash
@@ -75,8 +75,19 @@ original = MultiCompress.decompress(compressed)  # Works perfectly!
 ```
 
 **Security Features:**
-- All decompression operations have a built-in **256MB size limit** to prevent decompression bomb attacks
-- Invalid or corrupted data will raise `MultiCompress::DataError` with descriptive messages
+- Default decompression output cap: **256MB**
+- Default decompression ratio guard: **1000:1**
+- Streaming readers/inflaters enforce cumulative output limits across writes
+- `MultiCompress::Dictionary.load` rejects dictionary files larger than **32MB**
+- Invalid or corrupted data raises `MultiCompress::DataError` with descriptive messages
+
+```ruby
+# Tighten the output cap for untrusted input
+MultiCompress.decompress(zstd_data, algo: :zstd, max_output_size: 8 * 1024 * 1024)
+
+# Disable the ratio guard only for trusted input
+MultiCompress.decompress(zstd_data, algo: :zstd, max_ratio: nil)
+```
 
 ### Algorithm-specific Shortcuts
 
@@ -95,15 +106,17 @@ compressed = MultiCompress.brotli(data, level: 11)  # maximum compression
 
 ```ruby
 # Use semantic names instead of numbers
+# Supported names today: :fastest, :default, :best
 MultiCompress.compress(data, algo: :zstd, level: :fastest)    # zstd level 1
-MultiCompress.compress(data, algo: :zstd, level: :balanced)   # zstd level 3
-MultiCompress.compress(data, algo: :zstd, level: :best)       # zstd level 22
+MultiCompress.compress(data, algo: :zstd, level: :default)    # zstd level 3
+MultiCompress.compress(data, algo: :zstd, level: :best)       # zstd level 19
 
 MultiCompress.compress(data, algo: :lz4, level: :fastest)     # lz4 level 1
+MultiCompress.compress(data, algo: :lz4, level: :default)     # lz4 level 1
 MultiCompress.compress(data, algo: :lz4, level: :best)        # lz4 level 16
 
 MultiCompress.compress(data, algo: :brotli, level: :fastest)  # brotli level 0
-MultiCompress.compress(data, algo: :brotli, level: :balanced) # brotli level 6
+MultiCompress.compress(data, algo: :brotli, level: :default)  # brotli level 6
 MultiCompress.compress(data, algo: :brotli, level: :best)     # brotli level 11
 ```
 
@@ -132,7 +145,7 @@ compressed_data = compressed_chunks.join
 ### Stream Decompression
 
 ```ruby
-inflater = MultiCompress::Inflater.new  # auto-detects algorithm
+inflater = MultiCompress::Inflater.new(max_output_size: 32 * 1024 * 1024, max_ratio: 500)  # auto-detects algorithm
 
 decompressed_chunks = []
 compressed_chunks.each do |chunk|
@@ -307,9 +320,8 @@ end
 
 ### Requirements
 
-- Ruby **>= 3.1** for the fiber-friendly path (needs `rb_fiber_scheduler_block`/`_unblock` from `ruby/fiber/scheduler.h`)
+- Ruby **>= 3.1.0**
 - A running `Fiber::Scheduler` — typically provided by `Async { ... }` or Falcon's web server
-- Ruby 2.7 / 3.0 users get the same code paths as v0.1.2 — everything still works, just without the scheduler integration
 
 ### No Code Changes Required
 
@@ -342,7 +354,7 @@ MultiCompress::Writer.open("cache.lz4")         # LZ4 (.lz4)
 
 ```ruby
 # Read entire file
-content = MultiCompress::Reader.open("data.zst") { |r| r.read }
+content = MultiCompress::Reader.open("data.zst", max_output_size: 64 * 1024 * 1024) { |r| r.read }
 
 # Read line by line (memory efficient)
 MultiCompress::Reader.open("large_log.zst") do |reader|
@@ -383,9 +395,9 @@ end
 
 Dramatically improves compression on small, similar data (JSON APIs, configs, logs).
 
-**Important**: Dictionary training is only available for **Brotli** algorithm in this implementation.
+**Important**: Dictionary training is available for **Zstd** in the current release (vendored zstd **1.5.2**). Brotli dictionaries can be used, but this gem does not expose Brotli training through `train_dictionary`.
 
-### Training Dictionary (Brotli only)
+### Training Dictionary (Zstd)
 
 ```ruby
 # Collect training samples (similar structure)
@@ -396,27 +408,29 @@ api_responses = [
   # ... more samples
 ]
 
-# Train dictionary - only available for Brotli
-dict = MultiCompress::Brotli.train_dictionary(api_responses, size: 16384)
+# Train dictionary for Zstd
+zstd_dict = MultiCompress::Zstd.train_dictionary(api_responses, size: 16384)
 
 # Save for reuse
-dict.save("api_v1.dict")
+zstd_dict.save("api_v1_zstd.dict")
 ```
 
-**Note**: While ZSTD supports using pre-trained dictionaries, dictionary training is not available in this implementation. Only Brotli can both train and use dictionaries.
+**Brotli note**: `MultiCompress::Brotli.train_dictionary(...)` raises `MultiCompress::UnsupportedError` in the current implementation. To use Brotli dictionaries, create a raw dictionary explicitly with `MultiCompress::Dictionary.new(data, algo: :brotli)`.
 
 ### Using Dictionary
 
 ```ruby
-# Load dictionary (created with Brotli training)
-dict = MultiCompress::Dictionary.load("api_v1.dict", algo: :brotli)
+# Load dictionary (created with Zstd training)
+zstd_dict = MultiCompress::Dictionary.load("api_v1_zstd.dict", algo: :zstd)
 
-# MultiCompress with dictionary - use Brotli
 response = '{"status":"ok","users":[{"id":4,"name":"David"}]}'
-compressed = MultiCompress.compress(response, algo: :brotli, dictionary: dict)
+compressed = MultiCompress.compress(response, algo: :zstd, dictionary: zstd_dict)
+original = MultiCompress.decompress(compressed, algo: :zstd, dictionary: zstd_dict)
 
-# Decompress with same dictionary
-original = MultiCompress.decompress(compressed, algo: :brotli, dictionary: dict)
+# Brotli can also use raw dictionaries
+brotli_dict = MultiCompress::Dictionary.new("shared-prefix-data", algo: :brotli)
+brotli_compressed = MultiCompress.compress(response, algo: :brotli, dictionary: brotli_dict)
+brotli_original = MultiCompress.decompress(brotli_compressed, algo: :brotli, dictionary: brotli_dict)
 
 puts original == response  # => true
 ```
@@ -424,11 +438,11 @@ puts original == response  # => true
 ### Dictionary with Streaming
 
 ```ruby
-# Load Brotli-trained dictionary 
-dict = MultiCompress::Dictionary.load("api_v1.dict", algo: :brotli)
+# Load Zstd-trained dictionary
+dict = MultiCompress::Dictionary.load("api_v1_zstd.dict", algo: :zstd)
 
-# MultiCompress multiple API responses using Brotli
-deflater = MultiCompress::Deflater.new(algo: :brotli, level: 6, dictionary: dict)
+# Compress multiple API responses using Zstd
+deflater = MultiCompress::Deflater.new(algo: :zstd, level: 3, dictionary: dict)
 
 api_responses.each do |response|
   compressed = deflater.write(response)

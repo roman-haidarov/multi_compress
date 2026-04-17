@@ -16,7 +16,7 @@ VENDOR_DIR = File.expand_path("../ext/multi_compress/vendor", __dir__)
 
 LIBS = {
   zstd: {
-    version: "1.5.7",
+    version: "1.5.2", # Pin vendored zstd to 1.5.2 because dictionary training regresses on newer versions (arm64-darwin)
     url:     "https://github.com/facebook/zstd/archive/refs/tags/v%<version>s.tar.gz",
     sha256:  nil,
     strip:   "zstd-%<version>s",

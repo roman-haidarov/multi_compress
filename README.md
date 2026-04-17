@@ -2,9 +2,14 @@
 
 [![Gem Version](https://badge.fury.io/rb/multi_compress.svg)](https://badge.fury.io/rb/multi_compress)
 
-> **⚠️ PROOF OF CONCEPT** — This is a proof-of-concept implementation. While functional and well-tested, additional features and optimizations are planned before the production-ready release.
+> **Status:** functional, well-tested, and actively evolving. The current release is suitable for real workloads, but the API and implementation details are still being refined in upcoming releases.
 
 Modern compression technology: **zstd**, **lz4**, **brotli** — unified compression platform with native C performance, **fiber-friendly** for modern async Ruby stacks.
+
+Bundled library versions in the current release:
+- **zstd 1.5.2**
+- **lz4 1.10.0**
+- **brotli 1.1.0**
 
 📖 **[Get Started →](GET_STARTED.md)** — Complete technology overview, algorithms, and implementation details
 
@@ -24,24 +29,49 @@ Modern compression technology: **zstd**, **lz4**, **brotli** — unified compres
 
 ### Key Design Principles
 
+- **Dictionary support**: Runtime dictionary use is supported for zstd and brotli; Zstd dictionary training is available in the current release line
 - **Zero external dependencies**: All C libraries are vendored and compiled
 - **Unified API**: Same interface for all algorithms — just change the `algo:` parameter
 - **Performance first**: Direct bindings to C libraries, minimal overhead
 - **Fiber-friendly**: Compression and decompression cooperate with Ruby's fiber scheduler — safe to use under `async`, `falcon`, or any `Fiber::Scheduler`-based runtime without blocking the event loop. See [GET_STARTED.md](GET_STARTED.md) for details and examples.
 - **Memory efficient**: Streaming support for large datasets, proper resource cleanup
-- **Production ready**: Battle-tested error handling, comprehensive test coverage
+- **Operationally focused**: Clear errors, comprehensive tests, and streaming support for practical workloads
 
 ### Algorithm Auto-Detection
 
 The system can automatically detect compression algorithms when decompressing data:
 
 - **zstd**: Detected by magic bytes `28 B5 2F FD` (little-endian)
-- **lz4**: Detected by internal format header validation (custom format, NOT compatible with lz4 CLI)
+- **lz4**: Detected by internal format header validation (custom internal format, NOT compatible with the standard `lz4` CLI; optional standard frame support may be added in a future release)
 - **brotli**: Requires explicit `algo: :brotli` parameter - no auto-detection
 
 **Important**: Auto-detection only works for ZSTD and LZ4. Brotli data must be decompressed with explicit algorithm specification.
 
-**Security**: All decompression operations have a built-in 256MB size limit to prevent decompression bomb attacks.
+**Security**: Decompression now enforces a default 256MB output cap, cumulative streaming limits, a default ratio guard of 1000:1, and a 32MB dictionary file size cap.
+
+
+## Security limits
+
+Decompression-facing APIs support conservative defaults intended to protect against decompression bombs and accidental resource spikes:
+
+- **Default output cap:** `256MB`
+- **Streaming cumulative cap:** enforced across the lifetime of an `Inflater`/`Reader`
+- **Default ratio guard:** `1000:1`
+- **Trusted-input opt-out:** pass `max_ratio: nil`
+- **Dictionary file size cap:** `32MB` for `MultiCompress::Dictionary.load`
+
+Examples:
+
+```ruby
+MultiCompress.decompress(blob, algo: :zstd, max_output_size: 64 * 1024 * 1024)
+MultiCompress.decompress(blob, algo: :brotli, max_ratio: nil)
+
+MultiCompress::Reader.open("archive.zst", max_output_size: 128 * 1024 * 1024, max_ratio: 500) do |reader|
+  puts reader.read
+end
+```
+
+`max_output_size: nil` keeps the native default cap of `256MB`. `max_ratio: nil` disables the ratio guard for trusted input.
 
 ## Algorithm Comparison
 
@@ -131,7 +161,7 @@ Or use the build script:
 
 ## Requirements
 
-- Ruby >= 2.7.0 (Ruby >= 3.1 required for fiber-friendly execution — earlier versions fall back to regular GVL-unlocking paths)
+- Ruby >= 3.1.0
 - C compiler (gcc, clang)
 
 ## Contributing
