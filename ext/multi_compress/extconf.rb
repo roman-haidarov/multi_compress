@@ -56,7 +56,9 @@ def configure_system_libraries
 
   have_header("zdict.h")
   have_header("lz4hc.h")
+  have_header("lz4frame.h")
   have_library("lz4", "LZ4_compress_HC")
+  have_library("lz4", "LZ4F_compressFrame")
   have_header("brotli/decode.h")
   have_library("brotlidec", "BrotliDecoderCreateInstance")
 end

@@ -45,7 +45,7 @@ This gem uses a **custom internal LZ4 format** that is **NOT compatible** with t
 - N bytes: LZ4 compressed data
 - 4 bytes: end marker (`00 00 00 00`)
 
-This format is optimized for streaming and provides better error detection, but files compressed with this gem cannot be decompressed with standard `lz4` CLI tools and vice versa. Optional standard frame support may be added in a future release.
+This format is optimized for streaming and provides better error detection, but files compressed with this gem cannot be decompressed with standard `lz4` CLI tools and vice versa.
 
 **❌ WRONG - This will NOT work:**
 ```bash
@@ -75,18 +75,21 @@ original = MultiCompress.decompress(compressed)  # Works perfectly!
 ```
 
 **Security Features:**
-- Default decompression output cap: **256MB**
-- Default decompression ratio guard: **1000:1**
-- Streaming readers/inflaters enforce cumulative output limits across writes
+- Default one-shot decompression output cap: **512MB**
+- Default streaming cumulative output cap: **2GB**
+- `MultiCompress.configure` lets applications set global defaults
+- Per-call `max_output_size:` overrides keep local business logic explicit
 - `MultiCompress::Dictionary.load` rejects dictionary files larger than **32MB**
 - Invalid or corrupted data raises `MultiCompress::DataError` with descriptive messages
 
 ```ruby
+MultiCompress.configure do |config|
+  config.max_output_size = 512 * 1024 * 1024
+  config.streaming_max_output_size = 2 * 1024 * 1024 * 1024
+end
+
 # Tighten the output cap for untrusted input
 MultiCompress.decompress(zstd_data, algo: :zstd, max_output_size: 8 * 1024 * 1024)
-
-# Disable the ratio guard only for trusted input
-MultiCompress.decompress(zstd_data, algo: :zstd, max_ratio: nil)
 ```
 
 ### Algorithm-specific Shortcuts
@@ -144,8 +147,10 @@ compressed_data = compressed_chunks.join
 
 ### Stream Decompression
 
+`MultiCompress.decompress(...)` can auto-detect ZSTD and LZ4 in one-shot mode. `MultiCompress::Inflater` is a streaming API and should be created with an explicit `algo:`.
+
 ```ruby
-inflater = MultiCompress::Inflater.new(max_output_size: 32 * 1024 * 1024, max_ratio: 500)  # auto-detects algorithm
+inflater = MultiCompress::Inflater.new(algo: :zstd, max_output_size: 32 * 1024 * 1024)
 
 decompressed_chunks = []
 compressed_chunks.each do |chunk|
@@ -672,7 +677,7 @@ MultiCompress.available?(:zstd)    # => true
 MultiCompress.available?(:fake)    # => false
 
 # Get library versions
-MultiCompress.version(:zstd)       # => "1.5.6"
+MultiCompress.version(:zstd)       # => "1.5.2"
 MultiCompress.version(:lz4)        # => "1.10.0"
 MultiCompress.version(:brotli)     # => "1.1.0"
 ```

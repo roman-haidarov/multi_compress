@@ -15,7 +15,7 @@ Bundled library versions in the current release:
 
 ## Technology Overview
 
-**MultiCompress** is a comprehensive compression system that unites three cutting-edge algorithms in a single platform. Modern algorithms are 3–10x faster than traditional zlib while providing superior compression ratios.
+**MultiCompress** is a comprehensive compression system that unites three modern algorithms in a single platform. Compared with zlib, results depend on the dataset and algorithm choice: LZ4 is usually chosen for speed, Zstd for balance, and Brotli for ratio.
 
 | Algorithm | Strength | Best for |
 |-----------|----------|----------|
@@ -42,36 +42,40 @@ Bundled library versions in the current release:
 The system can automatically detect compression algorithms when decompressing data:
 
 - **zstd**: Detected by magic bytes `28 B5 2F FD` (little-endian)
-- **lz4**: Detected by internal format header validation (custom internal format, NOT compatible with the standard `lz4` CLI; optional standard frame support may be added in a future release)
+- **lz4**: Detected by internal format header validation (custom internal format, NOT compatible with the standard `lz4` CLI)
 - **brotli**: Requires explicit `algo: :brotli` parameter - no auto-detection
 
 **Important**: Auto-detection only works for ZSTD and LZ4. Brotli data must be decompressed with explicit algorithm specification.
 
-**Security**: Decompression now enforces a default 256MB output cap, cumulative streaming limits, a default ratio guard of 1000:1, and a 32MB dictionary file size cap.
+**Security**: Decompression now enforces a default 512MB one-shot output cap, a default 2GB cumulative streaming cap, and a 32MB dictionary file size cap.
 
 
 ## Security limits
 
-Decompression-facing APIs support conservative defaults intended to protect against decompression bombs and accidental resource spikes:
+Decompression-facing APIs now use separate size defaults for one-shot and streaming paths:
 
-- **Default output cap:** `256MB`
-- **Streaming cumulative cap:** enforced across the lifetime of an `Inflater`/`Reader`
-- **Default ratio guard:** `1000:1`
-- **Trusted-input opt-out:** pass `max_ratio: nil`
+- **One-shot default output cap:** `512MB`
+- **Streaming cumulative cap:** `2GB` across the lifetime of an `Inflater`/`Reader`
+- **Global configuration:** `MultiCompress.configure`
+- **Per-call override:** `max_output_size:`
 - **Dictionary file size cap:** `32MB` for `MultiCompress::Dictionary.load`
 
 Examples:
 
 ```ruby
-MultiCompress.decompress(blob, algo: :zstd, max_output_size: 64 * 1024 * 1024)
-MultiCompress.decompress(blob, algo: :brotli, max_ratio: nil)
+MultiCompress.configure do |config|
+  config.max_output_size = 512 * 1024 * 1024
+  config.streaming_max_output_size = 2 * 1024 * 1024 * 1024
+end
 
-MultiCompress::Reader.open("archive.zst", max_output_size: 128 * 1024 * 1024, max_ratio: 500) do |reader|
+MultiCompress.decompress(blob, algo: :zstd, max_output_size: 64 * 1024 * 1024)
+
+MultiCompress::Reader.open("archive.zst", max_output_size: 128 * 1024 * 1024) do |reader|
   puts reader.read
 end
 ```
 
-`max_output_size: nil` keeps the native default cap of `256MB`. `max_ratio: nil` disables the ratio guard for trusted input.
+If `max_output_size:` is omitted, one-shot calls use `MultiCompress.config.max_output_size` and streaming calls use `MultiCompress.config.streaming_max_output_size`.
 
 ## Algorithm Comparison
 
@@ -163,14 +167,6 @@ Or use the build script:
 
 - Ruby >= 3.1.0
 - C compiler (gcc, clang)
-
-## Contributing
-
-1. Fork it
-2. Create your feature branch (`git checkout -b feature/my-feature`)
-3. Commit your changes (`git commit -am 'Add feature'`)
-4. Push to the branch (`git push origin feature/my-feature`)
-5. Create a Pull Request
 
 ## License
 

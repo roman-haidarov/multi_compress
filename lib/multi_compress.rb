@@ -21,6 +21,9 @@ module MultiCompress
   DEFAULT = :default
   BEST    = :best
 
+  DEFAULT_MAX_OUTPUT_SIZE = 512 * 1024 * 1024
+  DEFAULT_STREAMING_MAX_OUTPUT_SIZE = 2 * 1024 * 1024 * 1024
+
   EXTENSION_MAP = {
     ".zst"  => :zstd,
     ".zstd" => :zstd,
@@ -30,24 +33,95 @@ module MultiCompress
 
   private_constant :EXTENSION_MAP
 
+  class Config
+    attr_reader :max_output_size, :streaming_max_output_size
+
+    def initialize
+      reset!
+    end
+
+    def max_output_size=(value)
+      @max_output_size = normalize_limit(value, :max_output_size, DEFAULT_MAX_OUTPUT_SIZE)
+    end
+
+    def streaming_max_output_size=(value)
+      @streaming_max_output_size = normalize_limit(
+        value,
+        :streaming_max_output_size,
+        DEFAULT_STREAMING_MAX_OUTPUT_SIZE
+      )
+    end
+
+    def reset!
+      @max_output_size = DEFAULT_MAX_OUTPUT_SIZE
+      @streaming_max_output_size = DEFAULT_STREAMING_MAX_OUTPUT_SIZE
+      self
+    end
+
+    def dup
+      copy = self.class.new
+      copy.max_output_size = max_output_size
+      copy.streaming_max_output_size = streaming_max_output_size
+      copy
+    end
+
+    private
+
+    def normalize_limit(value, name, default)
+      return default if value.nil?
+      raise TypeError, "#{name} must be an Integer" unless value.respond_to?(:to_int)
+
+      limit = value.to_int
+      raise ArgumentError, "#{name} must be greater than 0" if limit <= 0
+
+      limit
+    end
+  end
+
+  class << self
+    def config
+      @config ||= Config.new
+    end
+
+    def configure
+      return config unless block_given?
+
+      yield(config)
+      config
+    end
+
+    unless private_method_defined?(:_c_decompress)
+      alias_method :_c_decompress, :decompress
+      private :_c_decompress
+    end
+  end
+
   def self.zstd(data, level: nil)
     compress(data, algo: :zstd, **level_opts(level))
   end
 
-  def self.lz4(data, level: nil)
-    compress(data, algo: :lz4, **level_opts(level))
+  def self.lz4(data, level: nil, format: nil)
+    opts = level_opts(level)
+    opts[:format] = format if format
+    compress(data, algo: :lz4, **opts)
   end
 
   def self.brotli(data, level: nil)
     compress(data, algo: :brotli, **level_opts(level))
   end
 
+  def self.decompress(data, **opts)
+    _c_decompress(data, **resolved_one_shot_options(opts))
+  end
+
   def self.zstd_decompress(data)
     decompress(data, algo: :zstd)
   end
 
-  def self.lz4_decompress(data)
-    decompress(data, algo: :lz4)
+  def self.lz4_decompress(data, format: nil)
+    opts = { algo: :lz4 }
+    opts[:format] = format if format
+    decompress(data, **opts)
   end
 
   def self.brotli_decompress(data)
@@ -62,11 +136,24 @@ module MultiCompress
     level ? { level: level } : {}
   end
 
-  private_class_method :level_opts
+  def self.resolved_one_shot_options(opts)
+    resolved = opts.dup
+    resolved[:max_output_size] = config.max_output_size unless resolved.key?(:max_output_size)
+    resolved
+  end
 
-  # Streaming compressed writer.
-  #
-  # Supports block form via +Writer.open+ or manual lifecycle management.
+  private_class_method :level_opts, :resolved_one_shot_options
+
+  module InflaterDefaults
+    def initialize(*args, **opts)
+      resolved = opts.dup
+      resolved[:max_output_size] = MultiCompress.config.streaming_max_output_size unless resolved.key?(:max_output_size)
+      super(*args, **resolved)
+    end
+  end
+
+  Inflater.prepend(InflaterDefaults)
+
   class Writer
     CHUNK_BUFFER_SIZE = 8192
 
@@ -125,7 +212,7 @@ module MultiCompress
     end
 
     def puts(*args)
-      args.each do |arg|
+      args.flatten.each do |arg|
         str = arg.to_s
         write(str)
         write("\n") unless str.end_with?("\n")
@@ -159,15 +246,12 @@ module MultiCompress
     private_class_method :resolve_io
   end
 
-  # Streaming compressed reader.
-  #
-  # Supports block form via +Reader.open+ or manual lifecycle management.
   class Reader
     CHUNK_SIZE = 8192
 
-    def self.open(path_or_io, algo: nil, dictionary: nil, max_output_size: nil, max_ratio: 1000, &block)
+    def self.open(path_or_io, algo: nil, dictionary: nil, **opts, &block)
       io, algo, owned = resolve_io(path_or_io, algo, mode: "rb")
-      reader = new(io, algo: algo, dictionary: dictionary, max_output_size: max_output_size, max_ratio: max_ratio)
+      reader = new(io, algo: algo, dictionary: dictionary, **opts)
       reader.instance_variable_set(:@owned_io, owned)
 
       return reader unless block
@@ -179,9 +263,9 @@ module MultiCompress
       end
     end
 
-    def initialize(io, algo: nil, dictionary: nil, max_output_size: nil, max_ratio: 1000)
+    def initialize(io, algo: nil, dictionary: nil, **opts)
       @io       = io
-      @inflater = Inflater.new(algo: algo, dictionary: dictionary, max_output_size: max_output_size, max_ratio: max_ratio)
+      @inflater = Inflater.new(algo: algo, dictionary: dictionary, **opts)
       @closed   = false
       @owned_io = false
       @buffer   = +""
@@ -237,7 +321,6 @@ module MultiCompress
 
       while (chunk = read(size))
         yield chunk
-        break if chunk.bytesize < size
       end
     end
 
@@ -272,7 +355,7 @@ module MultiCompress
     end
 
     def read_exactly(length)
-      return +("") if @eof && @buffer.empty?
+      return nil if @eof && @buffer.empty?
 
       fill_buffer_until { @buffer.bytesize >= length }
 
@@ -298,9 +381,9 @@ module MultiCompress
     end
 
     def extract_line(separator)
-      idx    = @buffer.index(separator)
-      result = @buffer[0..idx]
-      @buffer = @buffer[(idx + 1)..]
+      idx = @buffer.index(separator)
+      result = @buffer[0, idx + separator.bytesize]
+      @buffer = @buffer[(idx + separator.bytesize)..] || +""
       result
     end
 

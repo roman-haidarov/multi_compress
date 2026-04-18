@@ -26,6 +26,7 @@ Gem::Specification.new do |spec|
     "ext/multi_compress/vendor/**/*",
     "ext/multi_compress/vendor/.vendored",
     "README.md",
+    "GET_STARTED.md",
     "LICENSE.txt",
     "CHANGELOG.md"
   ]
