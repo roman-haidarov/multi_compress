@@ -15,7 +15,7 @@ Bundled library versions in the current release:
 
 ## Technology Overview
 
-**MultiCompress** is a comprehensive compression system that unites three cutting-edge algorithms in a single platform. Modern algorithms are 3–10x faster than traditional zlib while providing superior compression ratios.
+**MultiCompress** provides a single Ruby-facing interface over three different compression families with different trade-offs. It is better to think of it as a unified toolkit than as one algorithm with one performance profile.
 
 | Algorithm | Strength | Best for |
 |-----------|----------|----------|
@@ -47,31 +47,44 @@ The system can automatically detect compression algorithms when decompressing da
 
 **Important**: Auto-detection only works for ZSTD and LZ4. Brotli data must be decompressed with explicit algorithm specification.
 
-**Security**: Decompression now enforces a default 256MB output cap, cumulative streaming limits, a default ratio guard of 1000:1, and a 32MB dictionary file size cap.
+**Security**: Decompression now enforces a default 512MB one-shot output cap, a default 2GB cumulative streaming cap, and a 32MB dictionary file size cap.
 
 
 ## Security limits
 
-Decompression-facing APIs support conservative defaults intended to protect against decompression bombs and accidental resource spikes:
+Decompression-facing APIs now use separate size defaults for one-shot and streaming paths:
 
-- **Default output cap:** `256MB`
-- **Streaming cumulative cap:** enforced across the lifetime of an `Inflater`/`Reader`
-- **Default ratio guard:** `1000:1`
-- **Trusted-input opt-out:** pass `max_ratio: nil`
+- **One-shot default output cap:** `512MB`
+- **Streaming cumulative cap:** `2GB` across the lifetime of an `Inflater`/`Reader`
+- **Global configuration:** `MultiCompress.configure`
+- **Per-call override:** `max_output_size:`
 - **Dictionary file size cap:** `32MB` for `MultiCompress::Dictionary.load`
 
 Examples:
 
 ```ruby
-MultiCompress.decompress(blob, algo: :zstd, max_output_size: 64 * 1024 * 1024)
-MultiCompress.decompress(blob, algo: :brotli, max_ratio: nil)
+MultiCompress.configure do |config|
+  config.max_output_size = 512 * 1024 * 1024
+  config.streaming_max_output_size = 2 * 1024 * 1024 * 1024
+end
 
-MultiCompress::Reader.open("archive.zst", max_output_size: 128 * 1024 * 1024, max_ratio: 500) do |reader|
+MultiCompress.decompress(blob, algo: :zstd, max_output_size: 64 * 1024 * 1024)
+
+MultiCompress::Reader.open("archive.zst", max_output_size: 128 * 1024 * 1024) do |reader|
   puts reader.read
 end
 ```
 
-`max_output_size: nil` keeps the native default cap of `256MB`. `max_ratio: nil` disables the ratio guard for trusted input.
+If `max_output_size:` is omitted, one-shot calls use `MultiCompress.config.max_output_size` and streaming calls use `MultiCompress.config.streaming_max_output_size`.
+
+## Vendored dependency policy
+
+For contributor workflow and CI policy, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+- Vendored **zstd stays pinned to 1.5.2** in this release line.
+- `script/vendor_libs.rb` verifies pinned SHA-256 checksums for zstd, lz4, and brotli source archives before vendoring them.
+- CI now exercises the gem install path without system compression libraries and also forces vendored compilation in a separate job.
+- Any intentional zstd bump must be explicitly reviewed and use the pull request label `allow-zstd-bump`.
 
 ## Algorithm Comparison
 
@@ -81,12 +94,30 @@ end
 | **zstd** | Fast | Excellent | General purpose, logs, backups, web APIs |
 | **brotli** | Slower | Best | Static assets, CDN, long-term storage |
 
+### Practical guidance
+
+- **Choose zstd** when you want the best default trade-off and the fewest surprises.
+- **Choose lz4** when low latency and very fast decompression matter more than final ratio.
+- **Choose brotli** when you are optimizing for wire size and can afford slower compression.
+
+### Known limitations
+
+- Default `algo: :lz4` uses the project's **custom block-stream format**, not the standard `lz4` CLI frame format.
+- LZ4 auto-detection is designed around that internal block format and should not be treated as generic frame detection.
+- Brotli auto-detection is intentionally not supported; pass `algo: :brotli` explicitly.
+- Vendored **zstd stays pinned to 1.5.2** in this release line unless an explicitly reviewed change is made.
 
 ## Benchmark Results
 
 > **📝 Note on v0.2.0**: Performance numbers below are from the v0.2.0 build with fiber-friendly paths enabled. There is no throughput regression compared to v0.1.2 — the fiber-friendly path is only taken when a `Fiber::Scheduler` is active, and even then the worker-thread overhead is negligible for payloads large enough to benefit.
 
-Performance comparison against Ruby's built-in zlib compression (200 iterations per test):
+Performance comparison against Ruby's built-in zlib compression (200 iterations per test). Treat the results as workload-specific examples, not universal guarantees.
+
+Methodology notes for the published numbers:
+
+- benchmark scripts live in `benchmark_comparison.rb` and `benchmark_performance.rb`
+- results depend on dataset shape, CPU, Ruby version, compiler, and whether a fiber scheduler is active
+- any future benchmark claim should document dataset source, hardware, Ruby version, and compiler/flags
 
 ### 🗜️  COMPRESSION RATIO (%, lower is better)
 ```

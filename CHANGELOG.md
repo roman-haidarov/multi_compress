@@ -1,5 +1,42 @@
 # Changelog
 
+## [....]
+
+### Added
+- Dedicated vendored CI coverage:
+  - `guard-zstd-pin` protects the zstd 1.5.2 pin unless a PR carries the `allow-zstd-bump` label
+  - `smoke-install` builds the gem, installs it into an isolated gem home, and validates a vendored roundtrip using the built artifact
+  - `forced-vendored-tests` compiles with `COMPRESS_FORCE_VENDORED=1`, runs the full test suite, and rejects linkage against system `zstd` / `lz4` / `brotli`
+- Separate `Sanitizers` workflow for ASAN/UBSAN and valgrind so memory tooling stays available without becoming the normal per-commit gate
+- `CONTRIBUTING.md` with vendored dependency policy, CI expectations, benchmark guidance, and sanitizer notes
+- `test/test_lz4_streaming_audit.rb` fact-finding coverage for one-shot vs streaming vs independent-block LZ4 baselines, including multi-block autodetect coverage
+
+### Changed
+- README now documents algorithm trade-offs more explicitly instead of using a single blanket speed claim
+- README and contributor docs now call out the custom default LZ4 block format, brotli autodetect requirement, and pinned zstd policy more directly
+- LZ4 streaming encoder now emits independent blocks in the internal block-stream format, restoring correct multi-block roundtrip and autodetect behavior without depending on cross-block history state
+
+- CI coverage for vendored publish/install paths:
+  - `smoke-install` builds the gem, installs it into an isolated gem home, and runs a vendored roundtrip smoke test without system compression libraries
+  - `forced-vendored-tests` compiles with `COMPRESS_FORCE_VENDORED=1`, runs the full test suite, and verifies linkage does not escape to system `zstd` / `lz4` / `brotli`
+- `MultiCompress.configure` with global decompression defaults:
+  - `config.max_output_size` for one-shot `MultiCompress.decompress`
+  - `config.streaming_max_output_size` for `MultiCompress::Inflater` / `MultiCompress::Reader`
+- Per-call `max_output_size:` overrides continue to work and now take precedence over global defaults
+
+### Changed
+- Vendored source downloads in `script/vendor_libs.rb` now use pinned SHA-256 checksums for zstd, lz4, and brotli
+- CI now guards the vendored zstd pin and requires an explicit `allow-zstd-bump` label for intentional changes away from `1.5.2`
+- One-shot and streaming decompression now use separate defaults out of the box:
+  - one-shot `max_output_size`: `512MB`
+  - streaming cumulative `max_output_size`: `2GB`
+- Size limits are now the primary default UX for decompression while the existing ratio guard behavior remains unchanged.
+- Reader/Writer IO parity was tightened for stream wrappers:
+  - `Reader#read(n)` now returns `nil` at EOF
+  - `Reader#gets` correctly preserves multi-byte separators
+  - `Reader#each_chunk` no longer yields an empty trailing chunk at EOF
+  - `Writer#puts` now flattens nested arrays like `IO#puts`
+
 ## [0.2.4]
 
 ### Added

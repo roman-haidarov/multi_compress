@@ -18,21 +18,21 @@ LIBS = {
   zstd: {
     version: "1.5.2", # Pin vendored zstd to 1.5.2 because dictionary training regresses on newer versions (arm64-darwin)
     url:     "https://github.com/facebook/zstd/archive/refs/tags/v%<version>s.tar.gz",
-    sha256:  nil,
+    sha256:  "f7de13462f7a82c29ab865820149e778cbfe01087b3a55b5332707abf9db4a6e",
     strip:   "zstd-%<version>s",
     keep:    %w[lib],
   },
   lz4: {
     version: "1.10.0",
     url:     "https://github.com/lz4/lz4/archive/refs/tags/v%<version>s.tar.gz",
-    sha256:  nil,
+    sha256:  "537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b",
     strip:   "lz4-%<version>s",
     keep:    %w[lib],
   },
   brotli: {
     version: "1.1.0",
     url:     "https://github.com/google/brotli/archive/refs/tags/v%<version>s.tar.gz",
-    sha256:  nil,
+    sha256:  "e720a6ca29428b803f4ad165371771f5398faba397edf6778837a18599ea13ff",
     strip:   "brotli-%<version>s",
     keep:    %w[c/common c/enc c/dec c/include],
   },

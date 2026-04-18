@@ -1,11 +1,20 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
-require "async"
-require "async/barrier"
+
+unless defined?(ASYNC_AVAILABLE)
+  begin
+    require "async"
+    require "async/barrier"
+    ASYNC_AVAILABLE = true
+  rescue LoadError
+    ASYNC_AVAILABLE = false
+  end
+end
 
 class TestAsyncFiberScheduler < Minitest::Test
   def setup
+    skip "async gem is not installed" unless ASYNC_AVAILABLE
     skip "Skipped under ASAN: CRuby Thread/Fiber runtime issue" if ENV["MULTI_COMPRESS_SKIP_FIBER_SCHEDULER_TESTS"] == "1"
   end
 
@@ -71,9 +80,7 @@ class TestAsyncFiberScheduler < Minitest::Test
     duration_ms = (duration * 1000).round(2)
 
     assert progress >= MIN_PROGRESS,
-      "[#{algo}] scheduler made no progress during one-shot compress " \
-      "(duration: #{duration_ms}ms, ticker progress: #{progress}, " \
-      "before: #{before_count}, after: #{after_count})"
+      "[#{algo}] scheduler made no progress during one-shot compress "       "(duration: #{duration_ms}ms, ticker progress: #{progress}, "       "before: #{before_count}, after: #{after_count})"
   end
 
   def run_streaming_test(algo)
@@ -117,23 +124,19 @@ class TestAsyncFiberScheduler < Minitest::Test
     duration_ms = (duration * 1000).round(2)
 
     assert progress >= MIN_PROGRESS,
-      "[#{algo}] scheduler made no progress during streaming " \
-      "(duration: #{duration_ms}ms, ticker progress: #{progress}, " \
-      "before: #{before_count}, after: #{after_count})"
+      "[#{algo}] scheduler made no progress during streaming "       "(duration: #{duration_ms}ms, ticker progress: #{progress}, "       "before: #{before_count}, after: #{after_count})"
   end
 
   def test_correctness_under_async
-    results = []
+    results = nil
 
-    Async do |task|
-      barrier = Async::Barrier.new
-
-      [:zstd, :lz4, :brotli].each do |algo|
-        barrier.async do
+    Async do
+      tasks = [:zstd, :lz4, :brotli].map do |algo|
+        Async do
           data         = "#{algo} test: #{"B" * 50_000}"
           compressed   = MultiCompress.compress(data, algo: algo)
           decompressed = MultiCompress.decompress(compressed, algo: algo)
-          results << {
+          {
             algo:      algo,
             ok:        data == decompressed,
             comp_size: compressed.bytesize,
@@ -141,8 +144,7 @@ class TestAsyncFiberScheduler < Minitest::Test
           }
         end
       end
-
-      barrier.wait
+      results = tasks.map(&:wait)
     end
 
     assert_equal 3, results.size

@@ -75,18 +75,21 @@ original = MultiCompress.decompress(compressed)  # Works perfectly!
 ```
 
 **Security Features:**
-- Default decompression output cap: **256MB**
-- Default decompression ratio guard: **1000:1**
-- Streaming readers/inflaters enforce cumulative output limits across writes
+- Default one-shot decompression output cap: **512MB**
+- Default streaming cumulative output cap: **2GB**
+- `MultiCompress.configure` lets applications set global defaults
+- Per-call `max_output_size:` overrides keep local business logic explicit
 - `MultiCompress::Dictionary.load` rejects dictionary files larger than **32MB**
 - Invalid or corrupted data raises `MultiCompress::DataError` with descriptive messages
 
 ```ruby
+MultiCompress.configure do |config|
+  config.max_output_size = 512 * 1024 * 1024
+  config.streaming_max_output_size = 2 * 1024 * 1024 * 1024
+end
+
 # Tighten the output cap for untrusted input
 MultiCompress.decompress(zstd_data, algo: :zstd, max_output_size: 8 * 1024 * 1024)
-
-# Disable the ratio guard only for trusted input
-MultiCompress.decompress(zstd_data, algo: :zstd, max_ratio: nil)
 ```
 
 ### Algorithm-specific Shortcuts
@@ -145,7 +148,7 @@ compressed_data = compressed_chunks.join
 ### Stream Decompression
 
 ```ruby
-inflater = MultiCompress::Inflater.new(max_output_size: 32 * 1024 * 1024, max_ratio: 500)  # auto-detects algorithm
+inflater = MultiCompress::Inflater.new(max_output_size: 32 * 1024 * 1024)  # auto-detects algorithm
 
 decompressed_chunks = []
 compressed_chunks.each do |chunk|

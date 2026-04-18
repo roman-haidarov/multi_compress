@@ -6,6 +6,7 @@
 #include <brotli/encode.h>
 #include <lz4.h>
 #include <lz4hc.h>
+#include <lz4frame.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -19,6 +20,20 @@
 #define DEFAULT_MAX_RATIO     1000ULL
 #define RATIO_MIN_INPUT_BYTES 1024ULL
 #define DICT_FILE_MAX_SIZE    (32ULL * 1024 * 1024)
+
+#if defined(__GNUC__) || defined(__clang__)
+#define MC_ALWAYS_INLINE static inline __attribute__((always_inline))
+#else
+#define MC_ALWAYS_INLINE static inline
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define MC_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define MC_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define MC_LIKELY(x)   (x)
+#define MC_UNLIKELY(x) (x)
+#endif
 
 typedef struct {
     size_t gvl_unlock_threshold;
@@ -62,7 +77,7 @@ static VALUE mBrotli;
 static rb_encoding *binary_encoding;
 static struct {
     ID zstd, lz4, brotli;
-    ID algo, algorithm, level, dictionary, size;
+    ID algo, algorithm, level, dictionary, size, format, block, frame;
     ID max_output_size, max_ratio;
     ID fastest, default_, best;
     ID yield_, join;
@@ -71,11 +86,17 @@ static struct {
 
 static struct {
     VALUE zstd, lz4, brotli;
-    VALUE algo, algorithm, level, dictionary, size;
+    VALUE algo, algorithm, level, dictionary, size, format, block, frame;
     VALUE max_output_size, max_ratio;
 } sym_cache;
 
 typedef enum { ALGO_ZSTD = 0, ALGO_LZ4 = 1, ALGO_BROTLI = 2 } compress_algo_t;
+typedef enum { LZ4_FORMAT_BLOCK = 0, LZ4_FORMAT_FRAME = 1 } lz4_format_t;
+
+#define MC_NUM_ALGOS 3
+
+_Static_assert(ALGO_BROTLI == MC_NUM_ALGOS - 1,
+               "compress_algo_t must be contiguous [0..MC_NUM_ALGOS-1]");
 
 typedef struct dictionary_s dictionary_t;
 static const rb_data_type_t dictionary_type;
@@ -89,6 +110,9 @@ static void init_id_cache(void) {
     id_cache.level = rb_intern("level");
     id_cache.dictionary = rb_intern("dictionary");
     id_cache.size = rb_intern("size");
+    id_cache.format = rb_intern("format");
+    id_cache.block = rb_intern("block");
+    id_cache.frame = rb_intern("frame");
     id_cache.max_output_size = rb_intern("max_output_size");
     id_cache.max_ratio = rb_intern("max_ratio");
     id_cache.fastest = rb_intern("fastest");
@@ -106,6 +130,9 @@ static void init_id_cache(void) {
     sym_cache.level = ID2SYM(id_cache.level);
     sym_cache.dictionary = ID2SYM(id_cache.dictionary);
     sym_cache.size = ID2SYM(id_cache.size);
+    sym_cache.format = ID2SYM(id_cache.format);
+    sym_cache.block = ID2SYM(id_cache.block);
+    sym_cache.frame = ID2SYM(id_cache.frame);
     sym_cache.max_output_size = ID2SYM(id_cache.max_output_size);
     sym_cache.max_ratio = ID2SYM(id_cache.max_ratio);
 }
@@ -116,6 +143,30 @@ static inline VALUE opt_get(VALUE opts, VALUE sym) {
 
 static inline VALUE opt_lookup2(VALUE opts, VALUE sym, VALUE default_value) {
     return NIL_P(opts) ? default_value : rb_hash_lookup2(opts, sym, default_value);
+}
+
+enum { LZ4_FRAME_MAGIC_LEN = 4 };
+static const uint8_t LZ4_FRAME_MAGIC[LZ4_FRAME_MAGIC_LEN] = {0x04, 0x22, 0x4D, 0x18};
+
+static inline int is_lz4_frame_magic(const uint8_t *data, size_t len) {
+    return len >= LZ4_FRAME_MAGIC_LEN && memcmp(data, LZ4_FRAME_MAGIC, LZ4_FRAME_MAGIC_LEN) == 0;
+}
+
+static lz4_format_t parse_lz4_format(VALUE opts, compress_algo_t algo, int explicit_algo) {
+    VALUE format_val = opt_lookup2(opts, sym_cache.format, Qundef);
+    if (format_val == Qundef || NIL_P(format_val))
+        return LZ4_FORMAT_BLOCK;
+    if (explicit_algo && algo != ALGO_LZ4)
+        rb_raise(eUnsupportedError, "format is only supported for algo: :lz4");
+    if (!SYMBOL_P(format_val))
+        rb_raise(rb_eTypeError, "format must be a Symbol (:block or :frame)");
+    ID id = SYM2ID(format_val);
+    if (id == id_cache.block)
+        return LZ4_FORMAT_BLOCK;
+    if (id == id_cache.frame)
+        return LZ4_FORMAT_FRAME;
+    rb_raise(rb_eArgError, "Unknown LZ4 format: %s", rb_id2name(id));
+    return LZ4_FORMAT_BLOCK;
 }
 
 static inline void reject_algorithm_keyword(VALUE opts) {
@@ -161,11 +212,11 @@ static inline void dictionary_ivar_set(VALUE self, VALUE dictionary) {
     rb_ivar_set(self, id_cache.ivar_dictionary, dictionary);
 }
 
-static inline uint32_t read_le_u32(const uint8_t *p) {
+MC_ALWAYS_INLINE uint32_t read_le_u32(const uint8_t *restrict p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static inline void write_le_u32(uint8_t *p, uint32_t v) {
+MC_ALWAYS_INLINE void write_le_u32(uint8_t *restrict p, uint32_t v) {
     p[0] = (uint8_t)(v & 0xFF);
     p[1] = (uint8_t)((v >> 8) & 0xFF);
     p[2] = (uint8_t)((v >> 16) & 0xFF);
@@ -223,6 +274,8 @@ static const level_spec_t level_spec[] = {
     [ALGO_BROTLI] =
         {.min = 0, .max = 11, .fastest = 0, .default_ = 6, .best = 11, .name = "brotli"},
 };
+_Static_assert(sizeof(level_spec) / sizeof(level_spec[0]) == MC_NUM_ALGOS,
+               "level_spec must cover every compress_algo_t value");
 
 static int resolve_level(compress_algo_t algo, VALUE level_val) {
     const level_spec_t *spec = &level_spec[algo];
@@ -241,7 +294,7 @@ static int resolve_level(compress_algo_t algo, VALUE level_val) {
         rb_raise(eLevelError, "Unknown named level: %s", rb_id2name(id));
     }
 
-    int level = NUM2INT(level_val);
+    const int level = NUM2INT(level_val);
     if (level < spec->min || level > spec->max)
         rb_raise(eLevelError, "%s level must be %d..%d, got %d", spec->name, spec->min, spec->max,
                  level);
@@ -249,23 +302,39 @@ static int resolve_level(compress_algo_t algo, VALUE level_val) {
 }
 
 static compress_algo_t detect_algo(const uint8_t *data, size_t len) {
-    if (len >= 4) {
-        if (data[0] == 0x28 && data[1] == 0xB5 && data[2] == 0x2F && data[3] == 0xFD) {
-            return ALGO_ZSTD;
-        }
+    enum { ZSTD_MAGIC_LEN = 4 };
+    static const uint8_t ZSTD_MAGIC[ZSTD_MAGIC_LEN] = {0x28, 0xB5, 0x2F, 0xFD};
+    enum { LZ4_BLOCK_SANITY_MAX = 256U * 1024 * 1024 };
+
+    if (is_lz4_frame_magic(data, len)) {
+        return ALGO_LZ4;
+    }
+
+    if (len >= ZSTD_MAGIC_LEN && memcmp(data, ZSTD_MAGIC, ZSTD_MAGIC_LEN) == 0) {
+        return ALGO_ZSTD;
     }
 
     if (len >= 12) {
-        uint32_t orig = read_le_u32(data);
-        uint32_t comp = read_le_u32(data + 4);
-        if (orig > 0 && orig <= 256U * 1024 * 1024 && comp > 0 && comp <= 256U * 1024 * 1024 &&
-            orig <= (uint32_t)INT_MAX && comp <= (uint32_t)LZ4_compressBound((int)orig) &&
-            (size_t)8 + (size_t)comp + 4 == len) {
-            size_t tail = 8 + (size_t)comp;
-            if (data[tail] == 0 && data[tail + 1] == 0 && data[tail + 2] == 0 &&
-                data[tail + 3] == 0) {
-                return ALGO_LZ4;
+        size_t pos = 0;
+        int saw_block = 0;
+        while (pos + 4 <= len) {
+            uint32_t orig = read_le_u32(data + pos);
+            if (orig == 0) {
+                if (saw_block && pos + 4 == len)
+                    return ALGO_LZ4;
+                break;
             }
+            if (pos + 8 > len)
+                break;
+            uint32_t comp = read_le_u32(data + pos + 4);
+            if (comp == 0 || orig > LZ4_BLOCK_SANITY_MAX || orig > (uint32_t)INT_MAX)
+                break;
+            if (comp > LZ4_BLOCK_SANITY_MAX || comp > (uint32_t)LZ4_compressBound((int)orig))
+                break;
+            if (pos + 8 + (size_t)comp > len)
+                break;
+            saw_block = 1;
+            pos += 8 + (size_t)comp;
         }
     }
 
@@ -347,8 +416,8 @@ static void parse_limits_from_opts(VALUE opts, limits_config_t *limits) {
     limits_config_apply_opts(opts, limits);
 }
 
-static size_t checked_add_size(size_t left, size_t right, const char *message) {
-    if (SIZE_MAX - left < right)
+static inline size_t checked_add_size(size_t left, size_t right, const char *message) {
+    if (MC_UNLIKELY(SIZE_MAX - left < right))
         rb_raise(eDataError, "%s", message);
     return left + right;
 }
@@ -361,10 +430,10 @@ static size_t ratio_limit_bytes(size_t total_input, unsigned long long max_ratio
     return total_input * (size_t)max_ratio;
 }
 
-static void enforce_output_and_ratio_limits(size_t total_output, size_t total_input,
-                                            size_t max_output_size, int max_ratio_enabled,
-                                            unsigned long long max_ratio) {
-    if (total_output > max_output_size) {
+static inline void enforce_output_and_ratio_limits(size_t total_output, size_t total_input,
+                                                   size_t max_output_size, int max_ratio_enabled,
+                                                   unsigned long long max_ratio) {
+    if (MC_UNLIKELY(total_output > max_output_size)) {
         rb_raise(eDataError, "decompressed output exceeds limit (%zu bytes)", max_output_size);
     }
 
@@ -372,7 +441,7 @@ static void enforce_output_and_ratio_limits(size_t total_output, size_t total_in
         return;
 
     size_t ratio_limit = ratio_limit_bytes(total_input, max_ratio);
-    if (total_output > ratio_limit) {
+    if (MC_UNLIKELY(total_output > ratio_limit)) {
         size_t ratio = total_input == 0 ? 0 : (total_output / total_input);
         rb_raise(eDataError, "decompression ratio exceeds limit (ratio=%zu, max=%llu)", ratio,
                  max_ratio);
@@ -401,11 +470,74 @@ static inline void run_without_gvl(void *(*func)(void *), void *arg) {
 typedef struct {
     void *(*func)(void *);
     void *arg;
-
-    VALUE scheduler;
-    VALUE blocker;
-    VALUE fiber;
+    size_t arg_size;
+    VALUE thread;
 } fiber_worker_ctx_t;
+
+typedef enum {
+    WORK_EXEC_DIRECT = 0,
+    WORK_EXEC_NOGVL = 1,
+    WORK_EXEC_FIBER = 2,
+} work_exec_mode_t;
+
+static void fiber_worker_mark(void *ptr) {
+    fiber_worker_ctx_t *c = (fiber_worker_ctx_t *)ptr;
+    if (!c)
+        return;
+    rb_gc_mark(c->thread);
+}
+
+static void fiber_worker_free(void *ptr) {
+    fiber_worker_ctx_t *c = (fiber_worker_ctx_t *)ptr;
+    if (!c)
+        return;
+    if (c->arg)
+        xfree(c->arg);
+    xfree(c);
+}
+
+static size_t fiber_worker_memsize(const void *ptr) {
+    const fiber_worker_ctx_t *c = (const fiber_worker_ctx_t *)ptr;
+    return sizeof(fiber_worker_ctx_t) + (c ? c->arg_size : 0);
+}
+
+static const rb_data_type_t fiber_worker_type = {
+    "MultiCompress/FiberWorker",
+    {fiber_worker_mark, fiber_worker_free, fiber_worker_memsize},
+    0,
+    0,
+    RUBY_TYPED_FREE_IMMEDIATELY};
+
+static inline work_exec_mode_t select_fiber_or_direct_mode(VALUE scheduler, size_t work_size,
+                                                           size_t fiber_threshold) {
+    if (scheduler != Qnil && work_size >= fiber_threshold)
+        return WORK_EXEC_FIBER;
+    return WORK_EXEC_DIRECT;
+}
+
+static inline work_exec_mode_t select_fiber_nogvl_or_direct_mode(VALUE scheduler, size_t work_size,
+                                                                 size_t fiber_threshold,
+                                                                 size_t nogvl_threshold) {
+    if (scheduler != Qnil && work_size >= fiber_threshold)
+        return WORK_EXEC_FIBER;
+    if (scheduler == Qnil && work_size >= nogvl_threshold)
+        return WORK_EXEC_NOGVL;
+    return WORK_EXEC_DIRECT;
+}
+
+static VALUE fiber_worker_new(void *(*func)(void *), const void *arg, size_t arg_size) {
+    fiber_worker_ctx_t *c;
+    VALUE worker = TypedData_Make_Struct(rb_cObject, fiber_worker_ctx_t, &fiber_worker_type, c);
+    memset(c, 0, sizeof(*c));
+    c->func = func;
+    c->arg_size = arg_size;
+    if (arg_size > 0) {
+        c->arg = xmalloc(arg_size);
+        memcpy(c->arg, arg, arg_size);
+    }
+    c->thread = Qnil;
+    return worker;
+}
 
 static void *fiber_worker_nogvl(void *arg) {
     fiber_worker_ctx_t *c = (fiber_worker_ctx_t *)arg;
@@ -415,23 +547,54 @@ static void *fiber_worker_nogvl(void *arg) {
 
 static VALUE fiber_worker_thread(void *arg) {
     fiber_worker_ctx_t *c = (fiber_worker_ctx_t *)arg;
-    rb_thread_call_without_gvl(fiber_worker_nogvl, c, RUBY_UBF_PROCESS, NULL);
-    rb_fiber_scheduler_unblock(c->scheduler, c->blocker, c->fiber);
+    rb_thread_call_without_gvl(fiber_worker_nogvl, c, unblock_noop, NULL);
     return Qnil;
 }
 
-static void run_via_fiber_worker(VALUE scheduler, void *(*func)(void *), void *arg) {
-    fiber_worker_ctx_t ctx = {
-        .func = func,
-        .arg = arg,
-        .scheduler = scheduler,
-        .blocker = rb_obj_alloc(rb_cObject),
-        .fiber = rb_fiber_current(),
-    };
-    VALUE th = rb_thread_create(fiber_worker_thread, &ctx);
-    rb_fiber_scheduler_block(scheduler, ctx.blocker, Qnil);
-    join_thread(th);
+static VALUE fiber_worker_wait(VALUE worker) {
+    fiber_worker_ctx_t *c;
+    TypedData_Get_Struct(worker, fiber_worker_ctx_t, &fiber_worker_type, c);
+    c->thread = rb_thread_create(fiber_worker_thread, c);
+    join_thread(c->thread);
+    return Qnil;
 }
+
+static VALUE fiber_worker_join_ensure(VALUE worker) {
+    fiber_worker_ctx_t *c;
+    TypedData_Get_Struct(worker, fiber_worker_ctx_t, &fiber_worker_type, c);
+    if (!NIL_P(c->thread))
+        join_thread(c->thread);
+    return Qnil;
+}
+
+static void run_via_fiber_worker(void *(*func)(void *), void *arg, size_t arg_size) {
+    VALUE worker = fiber_worker_new(func, arg, arg_size);
+    rb_ensure(fiber_worker_wait, worker, fiber_worker_join_ensure, worker);
+    fiber_worker_ctx_t *c;
+    TypedData_Get_Struct(worker, fiber_worker_ctx_t, &fiber_worker_type, c);
+    if (arg_size > 0)
+        memcpy(arg, c->arg, arg_size);
+    RB_GC_GUARD(worker);
+}
+
+static inline void run_with_exec_mode(work_exec_mode_t mode, void *(*func)(void *), void *arg,
+                                      size_t arg_size) {
+    switch (mode) {
+    case WORK_EXEC_FIBER:
+        run_via_fiber_worker(func, arg, arg_size);
+        break;
+    case WORK_EXEC_NOGVL:
+        run_without_gvl(func, arg);
+        break;
+    case WORK_EXEC_DIRECT:
+    default:
+        func(arg);
+        break;
+    }
+}
+
+#define RUN_VIA_FIBER_WORKER(func, arg)     run_via_fiber_worker((func), &(arg), sizeof(arg))
+#define RUN_WITH_EXEC_MODE(mode, func, arg) run_with_exec_mode((mode), (func), &(arg), sizeof(arg))
 
 static inline size_t fiber_maybe_yield(size_t bytes_since_yield, size_t just_processed,
                                        size_t yield_chunk, int *did_yield) {
@@ -449,6 +612,7 @@ static inline size_t fiber_maybe_yield(size_t bytes_since_yield, size_t just_pro
 }
 
 #define DICT_CDICT_CACHE_SIZE 4
+_Static_assert(DICT_CDICT_CACHE_SIZE > 0, "CDict cache needs at least one slot");
 
 typedef struct {
     int level;
@@ -481,14 +645,18 @@ static void dict_free(void *ptr) {
 
 static size_t dict_memsize(const void *ptr) {
     const dictionary_t *d = (const dictionary_t *)ptr;
-    size_t total = sizeof(dictionary_t) + d->size;
+    if (!d)
+        return 0;
 
-    for (int i = 0; i < d->cdict_cache_count; i++) {
-        if (d->cdict_cache[i].cdict)
-            total += d->size + 4096;
+    size_t total = sizeof(dictionary_t) + d->size;
+    if (d->algo == ALGO_ZSTD) {
+        for (int i = 0; i < d->cdict_cache_count; i++) {
+            if (d->cdict_cache[i].cdict)
+                total += ZSTD_sizeof_CDict(d->cdict_cache[i].cdict);
+        }
+        if (d->ddict)
+            total += ZSTD_sizeof_DDict(d->ddict);
     }
-    if (d->ddict)
-        total += d->size + 4096;
     return total;
 }
 
@@ -609,9 +777,9 @@ typedef struct {
 
 static void *lz4_decompress_all_nogvl(void *arg) {
     lz4_decompress_all_args_t *a = (lz4_decompress_all_args_t *)arg;
-    const uint8_t *src = a->src;
+    const uint8_t *restrict src = a->src;
     size_t slen = a->src_len;
-    char *out_ptr = a->dst;
+    char *restrict out_ptr = a->dst;
     size_t out_offset = 0;
     size_t pos = 0;
 
@@ -623,13 +791,14 @@ static void *lz4_decompress_all_nogvl(void *arg) {
 
         int dsize = LZ4_decompress_safe((const char *)(src + pos + 8), out_ptr + out_offset,
                                         (int)comp_size, (int)orig_size);
-        if (dsize < 0) {
+        if (MC_UNLIKELY(dsize < 0)) {
             a->error = 1;
-            snprintf(a->err_msg, sizeof(a->err_msg), "lz4 decompress failed");
+            static const char kLz4FailMsg[] = "lz4 decompress failed";
+            memcpy(a->err_msg, kLz4FailMsg, sizeof(kLz4FailMsg));
             return NULL;
         }
 
-        out_offset += dsize;
+        out_offset += (size_t)dsize;
         pos += 8 + comp_size;
     }
 
@@ -646,6 +815,24 @@ typedef struct {
     int level;
     int result;
 } lz4_compress_args_t;
+
+typedef struct {
+    const void *src;
+    size_t src_len;
+    void *dst;
+    size_t dst_cap;
+    size_t result;
+    size_t error_code;
+} lz4frame_compress_args_t;
+
+typedef struct {
+    const void *src;
+    size_t src_len;
+    void *dst;
+    size_t dst_cap;
+    size_t result;
+    size_t error_code;
+} lz4frame_decompress_args_t;
 
 static void *lz4_compress_nogvl(void *arg) {
     lz4_compress_args_t *a = (lz4_compress_args_t *)arg;
@@ -665,6 +852,72 @@ typedef struct {
     uint8_t *dst;
     BROTLI_BOOL result;
 } brotli_compress_args_t;
+
+static void *lz4frame_compress_nogvl(void *arg) {
+    lz4frame_compress_args_t *a = (lz4frame_compress_args_t *)arg;
+    LZ4F_preferences_t prefs;
+    memset(&prefs, 0, sizeof(prefs));
+    prefs.frameInfo.blockChecksumFlag = LZ4F_blockChecksumEnabled;
+    prefs.frameInfo.contentChecksumFlag = LZ4F_contentChecksumEnabled;
+    a->result = LZ4F_compressFrame(a->dst, a->dst_cap, a->src, a->src_len, &prefs);
+    a->error_code = LZ4F_isError(a->result) ? a->result : 0;
+    return NULL;
+}
+
+static void *lz4frame_decompress_nogvl(void *arg) {
+    lz4frame_decompress_args_t *a = (lz4frame_decompress_args_t *)arg;
+    LZ4F_dctx *dctx = NULL;
+    size_t rc = LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION);
+    if (LZ4F_isError(rc)) {
+        a->result = 0;
+        a->error_code = rc;
+        return NULL;
+    }
+
+    const uint8_t *src = (const uint8_t *)a->src;
+    uint8_t *dst = (uint8_t *)a->dst;
+    size_t src_pos = 0;
+    size_t dst_pos = 0;
+    size_t hint = 1;
+
+    while (src_pos < a->src_len && hint != 0) {
+        size_t src_size = a->src_len - src_pos;
+        size_t dst_size = a->dst_cap - dst_pos;
+        rc = LZ4F_decompress(dctx, dst + dst_pos, &dst_size, src + src_pos, &src_size, NULL);
+        if (LZ4F_isError(rc)) {
+            a->result = 0;
+            a->error_code = rc;
+            LZ4F_freeDecompressionContext(dctx);
+            return NULL;
+        }
+        src_pos += src_size;
+        dst_pos += dst_size;
+        if (dst_pos > a->dst_cap) {
+            a->result = 0;
+            a->error_code = (size_t)-1;
+            LZ4F_freeDecompressionContext(dctx);
+            return NULL;
+        }
+        hint = rc;
+        if (src_size == 0 && dst_size == 0 && hint != 0)
+            break;
+    }
+
+    LZ4F_freeDecompressionContext(dctx);
+    if (hint != 0) {
+        if (dst_pos == a->dst_cap) {
+            a->result = 0;
+            a->error_code = (size_t)-1;
+            return NULL;
+        }
+        a->result = 0;
+        a->error_code = (size_t)-2;
+        return NULL;
+    }
+    a->result = dst_pos;
+    a->error_code = 0;
+    return NULL;
+}
 
 static void *brotli_compress_nogvl(void *arg) {
     brotli_compress_args_t *a = (brotli_compress_args_t *)arg;
@@ -695,62 +948,36 @@ typedef struct {
     size_t dst_cap;
     size_t result;
     int error;
-
-    VALUE scheduler;
-    VALUE blocker;
-    VALUE fiber;
 } zstd_fiber_compress_t;
 
 typedef struct {
     ZSTD_CStream *cstream;
-    ZSTD_inBuffer *input;
-    ZSTD_outBuffer *output;
+    ZSTD_inBuffer input;
+    ZSTD_outBuffer output;
     size_t result;
-
-    VALUE scheduler;
-    VALUE blocker;
-    VALUE fiber;
 } zstd_stream_chunk_fiber_t;
 
 static void *zstd_stream_chunk_fiber_nogvl(void *arg) {
     zstd_stream_chunk_fiber_t *a = (zstd_stream_chunk_fiber_t *)arg;
-    a->result = ZSTD_compressStream(a->cstream, a->output, a->input);
+    a->result = ZSTD_compressStream(a->cstream, &a->output, &a->input);
     return NULL;
-}
-
-static VALUE zstd_stream_chunk_fiber_thread(void *arg) {
-    zstd_stream_chunk_fiber_t *a = (zstd_stream_chunk_fiber_t *)arg;
-    rb_thread_call_without_gvl(zstd_stream_chunk_fiber_nogvl, a, RUBY_UBF_PROCESS, NULL);
-    rb_fiber_scheduler_unblock(a->scheduler, a->blocker, a->fiber);
-    return Qnil;
 }
 
 typedef struct {
     BrotliEncoderState *enc;
     BrotliEncoderOperation op;
-    size_t *available_in;
-    const uint8_t **next_in;
-    size_t *available_out;
-    uint8_t **next_out;
+    size_t available_in;
+    const uint8_t *next_in;
+    size_t available_out;
+    uint8_t *next_out;
     BROTLI_BOOL result;
-
-    VALUE scheduler;
-    VALUE blocker;
-    VALUE fiber;
 } brotli_stream_chunk_fiber_t;
 
 static void *brotli_stream_chunk_fiber_nogvl(void *arg) {
     brotli_stream_chunk_fiber_t *a = (brotli_stream_chunk_fiber_t *)arg;
-    a->result = BrotliEncoderCompressStream(a->enc, a->op, a->available_in, a->next_in,
-                                            a->available_out, a->next_out, NULL);
+    a->result = BrotliEncoderCompressStream(a->enc, a->op, &a->available_in, &a->next_in,
+                                            &a->available_out, &a->next_out, NULL);
     return NULL;
-}
-
-static VALUE brotli_stream_chunk_fiber_thread(void *arg) {
-    brotli_stream_chunk_fiber_t *a = (brotli_stream_chunk_fiber_t *)arg;
-    rb_thread_call_without_gvl(brotli_stream_chunk_fiber_nogvl, a, RUBY_UBF_PROCESS, NULL);
-    rb_fiber_scheduler_unblock(a->scheduler, a->blocker, a->fiber);
-    return Qnil;
 }
 
 typedef struct {
@@ -782,6 +1009,19 @@ static void *zstd_decompress_stream_chunk_nogvl(void *arg) {
 }
 
 typedef struct {
+    ZSTD_DStream *dstream;
+    ZSTD_outBuffer output;
+    ZSTD_inBuffer input;
+    size_t result;
+} zstd_decompress_stream_chunk_fiber_t;
+
+static void *zstd_decompress_stream_chunk_fiber_nogvl(void *arg) {
+    zstd_decompress_stream_chunk_fiber_t *a = (zstd_decompress_stream_chunk_fiber_t *)arg;
+    a->result = ZSTD_decompressStream(a->dstream, &a->output, &a->input);
+    return NULL;
+}
+
+typedef struct {
     BrotliDecoderState *dec;
     size_t *available_in;
     const uint8_t **next_in;
@@ -794,6 +1034,22 @@ static void *brotli_decompress_stream_nogvl(void *arg) {
     brotli_decompress_stream_args_t *a = (brotli_decompress_stream_args_t *)arg;
     a->result = BrotliDecoderDecompressStream(a->dec, a->available_in, a->next_in, a->available_out,
                                               a->next_out, NULL);
+    return NULL;
+}
+
+typedef struct {
+    BrotliDecoderState *dec;
+    size_t available_in;
+    const uint8_t *next_in;
+    size_t available_out;
+    uint8_t *next_out;
+    BrotliDecoderResult result;
+} brotli_decompress_stream_fiber_t;
+
+static void *brotli_decompress_stream_fiber_nogvl(void *arg) {
+    brotli_decompress_stream_fiber_t *a = (brotli_decompress_stream_fiber_t *)arg;
+    a->result = BrotliDecoderDecompressStream(a->dec, &a->available_in, &a->next_in,
+                                              &a->available_out, &a->next_out, NULL);
     return NULL;
 }
 
@@ -814,13 +1070,6 @@ static void *zstd_fiber_compress_nogvl(void *arg) {
     return NULL;
 }
 
-static VALUE zstd_fiber_compress_thread(void *arg) {
-    zstd_fiber_compress_t *a = (zstd_fiber_compress_t *)arg;
-    rb_thread_call_without_gvl(zstd_fiber_compress_nogvl, a, RUBY_UBF_PROCESS, NULL);
-    rb_fiber_scheduler_unblock(a->scheduler, a->blocker, a->fiber);
-    return Qnil;
-}
-
 static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
     VALUE data, opts;
     rb_scan_args(argc, argv, "1:", &data, &opts);
@@ -834,7 +1083,9 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
         dict_val = opt_get(opts, sym_cache.dictionary);
     }
 
-    compress_algo_t algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
+    int explicit_algo = !NIL_P(algo_sym);
+    compress_algo_t algo = explicit_algo ? sym_to_algo(algo_sym) : ALGO_ZSTD;
+    lz4_format_t lz4_format = parse_lz4_format(opts, algo, explicit_algo);
     int level = resolve_level(algo, level_val);
 
     dictionary_t *dict = NULL;
@@ -876,18 +1127,19 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
                 rb_raise(eError, "zstd compress: %s", ZSTD_getErrorName(csize));
             rb_str_set_len(dst, (long)csize);
             RB_GC_GUARD(data);
+            RB_GC_GUARD(dict_val);
             return dst;
         }
 
         {
             VALUE scheduler = current_fiber_scheduler();
-            if (scheduler != Qnil) {
+            work_exec_mode_t mode = select_fiber_nogvl_or_direct_mode(
+                scheduler, slen, policy->gvl_unlock_threshold, policy->gvl_unlock_threshold);
+
+            if (mode == WORK_EXEC_FIBER) {
                 char *out_buf = (char *)malloc(bound);
                 if (!out_buf)
                     rb_raise(eMemError, "zstd: malloc failed");
-
-                VALUE blocker = rb_obj_alloc(rb_cObject);
-
                 zstd_fiber_compress_t fargs = {
                     .src = src,
                     .src_len = slen,
@@ -897,14 +1149,9 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
                     .dst_cap = bound,
                     .result = 0,
                     .error = 0,
-                    .scheduler = scheduler,
-                    .blocker = blocker,
-                    .fiber = rb_fiber_current(),
                 };
 
-                VALUE rb_thread = rb_thread_create(zstd_fiber_compress_thread, &fargs);
-                rb_fiber_scheduler_block(scheduler, blocker, Qnil);
-                join_thread(rb_thread);
+                RUN_WITH_EXEC_MODE(mode, zstd_fiber_compress_nogvl, fargs);
 
                 if (fargs.error) {
                     free(out_buf);
@@ -918,6 +1165,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
                 VALUE result = rb_binary_str_new(out_buf, (long)fargs.result);
                 free(out_buf);
                 RB_GC_GUARD(data);
+                RB_GC_GUARD(dict_val);
                 return result;
             }
         }
@@ -934,7 +1182,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
                 .result = 0,
                 .error = 0,
             };
-            run_without_gvl(zstd_compress_nogvl, &args);
+            RUN_WITH_EXEC_MODE(WORK_EXEC_NOGVL, zstd_compress_nogvl, args);
 
             if (args.error)
                 rb_raise(eMemError, "zstd: failed to create context");
@@ -943,10 +1191,39 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
 
             rb_str_set_len(dst, (long)args.result);
             RB_GC_GUARD(data);
+            RB_GC_GUARD(dict_val);
             return dst;
         }
     }
     case ALGO_LZ4: {
+        if (lz4_format == LZ4_FORMAT_FRAME) {
+            LZ4F_preferences_t prefs;
+            memset(&prefs, 0, sizeof(prefs));
+            prefs.frameInfo.blockChecksumFlag = LZ4F_blockChecksumEnabled;
+            prefs.frameInfo.contentChecksumFlag = LZ4F_contentChecksumEnabled;
+            size_t bound = LZ4F_compressFrameBound(slen, &prefs);
+            VALUE dst = rb_binary_str_buf_reserve((long)bound);
+            lz4frame_compress_args_t args = {
+                .src = src,
+                .src_len = slen,
+                .dst = RSTRING_PTR(dst),
+                .dst_cap = bound,
+                .result = 0,
+                .error_code = 0,
+            };
+            {
+                VALUE scheduler = current_fiber_scheduler();
+                work_exec_mode_t mode = select_fiber_nogvl_or_direct_mode(
+                    scheduler, slen, policy->gvl_unlock_threshold, policy->gvl_unlock_threshold);
+                RUN_WITH_EXEC_MODE(mode, lz4frame_compress_nogvl, args);
+            }
+            if (args.error_code)
+                rb_raise(eError, "lz4 frame compress failed: %s",
+                         LZ4F_getErrorName(args.error_code));
+            rb_str_set_len(dst, (long)args.result);
+            RB_GC_GUARD(data);
+            return dst;
+        }
         if (slen > (size_t)INT_MAX)
             rb_raise(eError, "lz4: input too large (max 2GB)");
         int bound = LZ4_compressBound((int)slen);
@@ -967,11 +1244,9 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             };
 
             VALUE scheduler = current_fiber_scheduler();
-            if (scheduler != Qnil) {
-                run_via_fiber_worker(scheduler, lz4_compress_nogvl, &args);
-            } else {
-                run_without_gvl(lz4_compress_nogvl, &args);
-            }
+            work_exec_mode_t mode = select_fiber_nogvl_or_direct_mode(
+                scheduler, slen, policy->gvl_unlock_threshold, policy->gvl_unlock_threshold);
+            RUN_WITH_EXEC_MODE(mode, lz4_compress_nogvl, args);
             csize = args.result;
 
             if (csize <= 0)
@@ -1052,6 +1327,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
 
             rb_str_set_len(dst, initial_out - available_out);
             RB_GC_GUARD(data);
+            RB_GC_GUARD(dict_val);
             return dst;
         } else if (slen >= policy->gvl_unlock_threshold) {
             VALUE dst = rb_binary_str_buf_reserve(out_len);
@@ -1066,11 +1342,9 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             };
 
             VALUE scheduler = current_fiber_scheduler();
-            if (scheduler != Qnil) {
-                run_via_fiber_worker(scheduler, brotli_compress_nogvl, &args);
-            } else {
-                run_without_gvl(brotli_compress_nogvl, &args);
-            }
+            work_exec_mode_t mode = select_fiber_nogvl_or_direct_mode(
+                scheduler, slen, policy->gvl_unlock_threshold, policy->gvl_unlock_threshold);
+            RUN_WITH_EXEC_MODE(mode, brotli_compress_nogvl, args);
 
             if (!args.result)
                 rb_raise(eError, "brotli compress failed");
@@ -1112,12 +1386,14 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
     const uint8_t *src = (const uint8_t *)RSTRING_PTR(data);
     size_t slen = RSTRING_LEN(data);
 
+    int explicit_algo = !NIL_P(algo_sym);
     compress_algo_t algo;
-    if (NIL_P(algo_sym)) {
+    if (!explicit_algo) {
         algo = detect_algo(src, slen);
     } else {
         algo = sym_to_algo(algo_sym);
     }
+    lz4_format_t lz4_format = parse_lz4_format(opts, algo, explicit_algo);
 
     const algo_policy_t *policy = algo_policy(algo);
 
@@ -1167,11 +1443,10 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                 };
 
                 VALUE scheduler = current_fiber_scheduler();
-                if (scheduler != Qnil) {
-                    run_via_fiber_worker(scheduler, zstd_decompress_nogvl, &args);
-                } else {
-                    run_without_gvl(zstd_decompress_nogvl, &args);
-                }
+                work_exec_mode_t mode = select_fiber_nogvl_or_direct_mode(
+                    scheduler, frame_size, policy->gvl_unlock_threshold,
+                    policy->gvl_unlock_threshold);
+                RUN_WITH_EXEC_MODE(mode, zstd_decompress_nogvl, args);
 
                 if (args.error)
                     rb_raise(eMemError, "zstd: failed to create dctx");
@@ -1183,6 +1458,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                                                 limits.max_ratio_enabled, limits.max_ratio);
                 rb_str_set_len(dst, (long)dsize);
                 RB_GC_GUARD(data);
+                RB_GC_GUARD(dict_val);
                 return dst;
             } else {
                 VALUE dst = rb_binary_str_buf_reserve((size_t)frame_size);
@@ -1207,6 +1483,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                                                 limits.max_ratio_enabled, limits.max_ratio);
                 rb_str_set_len(dst, dsize);
                 RB_GC_GUARD(data);
+                RB_GC_GUARD(dict_val);
                 return dst;
             }
         }
@@ -1278,9 +1555,57 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
         ZSTD_freeDCtx(dctx);
         rb_str_set_len(dst, total_out);
         RB_GC_GUARD(data);
+        RB_GC_GUARD(dict_val);
         return dst;
     }
     case ALGO_LZ4: {
+        if (lz4_format == LZ4_FORMAT_FRAME || is_lz4_frame_magic(src, slen)) {
+            size_t alloc_size =
+                (slen > limits.max_output_size / 4) ? limits.max_output_size : slen * 4;
+            if (alloc_size < 4096)
+                alloc_size = limits.max_output_size < 4096 ? limits.max_output_size : 4096;
+            if (alloc_size == 0)
+                alloc_size = limits.max_output_size;
+            VALUE dst = rb_binary_str_buf_reserve((long)alloc_size);
+            while (1) {
+                lz4frame_decompress_args_t args = {
+                    .src = src,
+                    .src_len = slen,
+                    .dst = RSTRING_PTR(dst),
+                    .dst_cap = alloc_size,
+                    .result = 0,
+                    .error_code = 0,
+                };
+                {
+                    VALUE scheduler = current_fiber_scheduler();
+                    work_exec_mode_t mode = select_fiber_nogvl_or_direct_mode(
+                        scheduler, slen, policy->gvl_unlock_threshold,
+                        policy->gvl_unlock_threshold);
+                    RUN_WITH_EXEC_MODE(mode, lz4frame_decompress_nogvl, args);
+                }
+                if (args.error_code == (size_t)-1) {
+                    if (alloc_size >= limits.max_output_size)
+                        rb_raise(eDataError, "decompressed output exceeds limit (%zu bytes)",
+                                 limits.max_output_size);
+                    size_t next_cap = alloc_size * 2;
+                    if (next_cap > limits.max_output_size)
+                        next_cap = limits.max_output_size;
+                    alloc_size = next_cap;
+                    grow_binary_str(dst, 0, alloc_size);
+                    continue;
+                }
+                if (args.error_code == (size_t)-2)
+                    rb_raise(eDataError, "lz4 frame decompress failed: truncated frame");
+                if (args.error_code)
+                    rb_raise(eDataError, "lz4 frame decompress failed: %s",
+                             LZ4F_getErrorName(args.error_code));
+                enforce_output_and_ratio_limits(args.result, slen, limits.max_output_size,
+                                                limits.max_ratio_enabled, limits.max_ratio);
+                rb_str_set_len(dst, (long)args.result);
+                RB_GC_GUARD(data);
+                return dst;
+            }
+        }
         if (slen < 4)
             rb_raise(eDataError, "lz4: data too short");
 
@@ -1318,15 +1643,12 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
             .error = 0,
         };
 
-        if (total_orig >= algo_policy(ALGO_LZ4)->gvl_unlock_threshold) {
+        {
             VALUE scheduler = current_fiber_scheduler();
-            if (scheduler != Qnil) {
-                run_via_fiber_worker(scheduler, lz4_decompress_all_nogvl, &args);
-            } else {
-                run_without_gvl(lz4_decompress_all_nogvl, &args);
-            }
-        } else {
-            lz4_decompress_all_nogvl(&args);
+            work_exec_mode_t mode = select_fiber_nogvl_or_direct_mode(
+                scheduler, total_orig, algo_policy(ALGO_LZ4)->gvl_unlock_threshold,
+                algo_policy(ALGO_LZ4)->gvl_unlock_threshold);
+            RUN_WITH_EXEC_MODE(mode, lz4_decompress_all_nogvl, args);
         }
 
         if (args.error)
@@ -1376,16 +1698,21 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                 available_out = remaining_budget;
             uint8_t *next_out = (uint8_t *)RSTRING_PTR(dst) + total_out;
 
-            if (scheduler != Qnil && available_in >= policy->fiber_stream_threshold) {
-                brotli_decompress_stream_args_t sargs = {
+            if (select_fiber_or_direct_mode(scheduler, available_in,
+                                            policy->fiber_stream_threshold) == WORK_EXEC_FIBER) {
+                brotli_decompress_stream_fiber_t sargs = {
                     .dec = dec,
-                    .available_in = &available_in,
-                    .next_in = &next_in,
-                    .available_out = &available_out,
-                    .next_out = &next_out,
+                    .available_in = available_in,
+                    .next_in = next_in,
+                    .available_out = available_out,
+                    .next_out = next_out,
                     .result = BROTLI_DECODER_RESULT_ERROR,
                 };
-                run_via_fiber_worker(scheduler, brotli_decompress_stream_nogvl, &sargs);
+                RUN_VIA_FIBER_WORKER(brotli_decompress_stream_fiber_nogvl, sargs);
+                available_in = sargs.available_in;
+                next_in = sargs.next_in;
+                available_out = sargs.available_out;
+                next_out = sargs.next_out;
                 res = sargs.result;
             } else {
                 res = BrotliDecoderDecompressStream(dec, &available_in, &next_in, &available_out,
@@ -1417,6 +1744,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
         }
         rb_str_set_len(dst, total_out);
         RB_GC_GUARD(data);
+        RB_GC_GUARD(dict_val);
         return dst;
     }
     }
@@ -1450,14 +1778,14 @@ static void crc32_init_tables(void) {
     crc32_tables_initialized = 1;
 }
 
-static uint32_t crc32_compute(const uint8_t *data, size_t len, uint32_t crc) {
+static uint32_t crc32_compute(const uint8_t *restrict data, size_t len, uint32_t crc) {
     crc = ~crc;
 
     while (len >= 8) {
-        uint32_t val0 = crc ^ ((uint32_t)data[0] | ((uint32_t)data[1] << 8) |
-                               ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24));
-        uint32_t val1 = (uint32_t)data[4] | ((uint32_t)data[5] << 8) | ((uint32_t)data[6] << 16) |
-                        ((uint32_t)data[7] << 24);
+        const uint32_t val0 = crc ^ ((uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+                                     ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24));
+        const uint32_t val1 = (uint32_t)data[4] | ((uint32_t)data[5] << 8) |
+                              ((uint32_t)data[6] << 16) | ((uint32_t)data[7] << 24);
 
         crc = crc32_tables[7][(val0) & 0xFF] ^ crc32_tables[6][(val0 >> 8) & 0xFF] ^
               crc32_tables[5][(val0 >> 16) & 0xFF] ^ crc32_tables[4][(val0 >> 24) & 0xFF] ^
@@ -1488,28 +1816,49 @@ static VALUE compress_crc32(int argc, VALUE *argv, VALUE self) {
 }
 
 static VALUE compress_adler32(int argc, VALUE *argv, VALUE self) {
+    (void)self;
     VALUE data, prev;
     rb_scan_args(argc, argv, "11", &data, &prev);
     StringValue(data);
 
-    const uint8_t *src = (const uint8_t *)RSTRING_PTR(data);
-    size_t len = RSTRING_LEN(data);
-    uint32_t adler = NIL_P(prev) ? 1 : NUM2UINT(prev);
+    const uint8_t *restrict src = (const uint8_t *)RSTRING_PTR(data);
+    size_t len = (size_t)RSTRING_LEN(data);
+    const uint32_t adler = NIL_P(prev) ? 1u : NUM2UINT(prev);
 
-    uint32_t s1 = adler & 0xFFFF;
-    uint32_t s2 = (adler >> 16) & 0xFFFF;
-    const uint32_t BASE = 65521;
+    uint32_t s1 = adler & 0xFFFFu;
+    uint32_t s2 = (adler >> 16) & 0xFFFFu;
+    enum { ADLER_BASE = 65521, ADLER_NMAX = 5552 };
 
     while (len > 0) {
-        size_t chunk = len > 5552 ? 5552 : len;
+        size_t chunk = len > ADLER_NMAX ? (size_t)ADLER_NMAX : len;
         len -= chunk;
-        for (size_t i = 0; i < chunk; i++) {
-            s1 += src[i];
+
+        while (chunk >= 8) {
+            s1 += src[0];
+            s2 += s1;
+            s1 += src[1];
+            s2 += s1;
+            s1 += src[2];
+            s2 += s1;
+            s1 += src[3];
+            s2 += s1;
+            s1 += src[4];
+            s2 += s1;
+            s1 += src[5];
+            s2 += s1;
+            s1 += src[6];
+            s2 += s1;
+            s1 += src[7];
+            s2 += s1;
+            src += 8;
+            chunk -= 8;
+        }
+        while (chunk--) {
+            s1 += *src++;
             s2 += s1;
         }
-        s1 %= BASE;
-        s2 %= BASE;
-        src += chunk;
+        s1 %= ADLER_BASE;
+        s2 %= ADLER_BASE;
     }
 
     return UINT2NUM((s2 << 16) | s1);
@@ -1544,6 +1893,9 @@ static VALUE compress_version(VALUE self, VALUE algo_sym) {
 
 #define LZ4_RING_BUFFER_SIZE  (64 * 1024)
 #define LZ4_RING_BUFFER_TOTAL (LZ4_RING_BUFFER_SIZE * 2)
+
+_Static_assert(LZ4_RING_BUFFER_TOTAL == 2 * LZ4_RING_BUFFER_SIZE,
+               "ring buffer total must be exactly twice the window size");
 
 typedef struct {
     compress_algo_t algo;
@@ -1589,9 +1941,22 @@ static void deflater_free(void *ptr) {
 
 static size_t deflater_memsize(const void *ptr) {
     const deflater_t *d = (const deflater_t *)ptr;
+    if (!d)
+        return 0;
+
     size_t s = sizeof(deflater_t);
-    if (d->lz4_ring.buf)
-        s += LZ4_RING_BUFFER_TOTAL;
+    switch (d->algo) {
+    case ALGO_ZSTD:
+        if (d->ctx.zstd)
+            s += ZSTD_sizeof_CStream(d->ctx.zstd);
+        break;
+    case ALGO_BROTLI:
+        break;
+    case ALGO_LZ4:
+        if (d->lz4_ring.buf)
+            s += LZ4_RING_BUFFER_TOTAL;
+        break;
+    }
     return s;
 }
 
@@ -1711,7 +2076,12 @@ static VALUE lz4_compress_ring_block(deflater_t *d) {
 
     write_le_u32((uint8_t *)out, (uint32_t)src_size);
 
-    int csize = LZ4_compress_fast_continue(d->ctx.lz4, block_start, out + 8, src_size, bound, 1);
+    int csize;
+    if (d->level > 1) {
+        csize = LZ4_compress_HC(block_start, out + 8, src_size, bound, d->level);
+    } else {
+        csize = LZ4_compress_default(block_start, out + 8, src_size, bound);
+    }
     if (csize <= 0)
         rb_raise(eError, "lz4 stream compress block failed");
 
@@ -1759,37 +2129,41 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
 
             ZSTD_outBuffer output = {RSTRING_PTR(result) + result_len, out_cap, 0};
 
-            if (scheduler != Qnil && (input.size - input.pos) >= policy->fiber_stream_threshold) {
-                zstd_stream_chunk_fiber_t fargs = {
-                    .cstream = d->ctx.zstd,
-                    .input = &input,
-                    .output = &output,
-                    .result = 0,
-                    .scheduler = scheduler,
-                    .blocker = rb_obj_alloc(rb_cObject),
-                    .fiber = rb_fiber_current(),
-                };
-                VALUE th = rb_thread_create(zstd_stream_chunk_fiber_thread, &fargs);
-                rb_fiber_scheduler_block(scheduler, fargs.blocker, Qnil);
-                join_thread(th);
+            {
+                work_exec_mode_t mode = select_fiber_nogvl_or_direct_mode(
+                    scheduler, input.size - input.pos, policy->fiber_stream_threshold,
+                    policy->gvl_unlock_threshold);
 
-                if (ZSTD_isError(fargs.result))
-                    rb_raise(eError, "zstd compress stream: %s", ZSTD_getErrorName(fargs.result));
-            } else if (scheduler == Qnil &&
-                       (input.size - input.pos) >= policy->gvl_unlock_threshold) {
-                zstd_stream_chunk_args_t args = {
-                    .cstream = d->ctx.zstd,
-                    .output = &output,
-                    .input = &input,
-                    .result = 0,
-                };
-                run_without_gvl(zstd_compress_stream_chunk_nogvl, &args);
-                if (ZSTD_isError(args.result))
-                    rb_raise(eError, "zstd compress stream: %s", ZSTD_getErrorName(args.result));
-            } else {
-                size_t ret = ZSTD_compressStream(d->ctx.zstd, &output, &input);
-                if (ZSTD_isError(ret))
-                    rb_raise(eError, "zstd compress stream: %s", ZSTD_getErrorName(ret));
+                if (mode == WORK_EXEC_FIBER) {
+                    zstd_stream_chunk_fiber_t fargs = {
+                        .cstream = d->ctx.zstd,
+                        .input = input,
+                        .output = output,
+                        .result = 0,
+                    };
+                    RUN_WITH_EXEC_MODE(mode, zstd_stream_chunk_fiber_nogvl, fargs);
+                    input.pos = fargs.input.pos;
+                    output.pos = fargs.output.pos;
+
+                    if (ZSTD_isError(fargs.result))
+                        rb_raise(eError, "zstd compress stream: %s",
+                                 ZSTD_getErrorName(fargs.result));
+                } else if (mode == WORK_EXEC_NOGVL) {
+                    zstd_stream_chunk_args_t args = {
+                        .cstream = d->ctx.zstd,
+                        .output = &output,
+                        .input = &input,
+                        .result = 0,
+                    };
+                    RUN_WITH_EXEC_MODE(mode, zstd_compress_stream_chunk_nogvl, args);
+                    if (ZSTD_isError(args.result))
+                        rb_raise(eError, "zstd compress stream: %s",
+                                 ZSTD_getErrorName(args.result));
+                } else {
+                    size_t ret = ZSTD_compressStream(d->ctx.zstd, &output, &input);
+                    if (ZSTD_isError(ret))
+                        rb_raise(eError, "zstd compress stream: %s", ZSTD_getErrorName(ret));
+                }
             }
             result_len += output.pos;
         }
@@ -1814,22 +2188,23 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
             uint8_t *next_out = NULL;
             BROTLI_BOOL ok;
 
-            if (use_fiber && available_in >= policy->fiber_stream_threshold) {
+            if (use_fiber &&
+                select_fiber_or_direct_mode(scheduler, available_in,
+                                            policy->fiber_stream_threshold) == WORK_EXEC_FIBER) {
                 brotli_stream_chunk_fiber_t fargs = {
                     .enc = d->ctx.brotli,
                     .op = BROTLI_OPERATION_PROCESS,
-                    .available_in = &available_in,
-                    .next_in = &next_in,
-                    .available_out = &available_out,
-                    .next_out = &next_out,
+                    .available_in = available_in,
+                    .next_in = next_in,
+                    .available_out = available_out,
+                    .next_out = next_out,
                     .result = BROTLI_FALSE,
-                    .scheduler = scheduler,
-                    .blocker = rb_obj_alloc(rb_cObject),
-                    .fiber = rb_fiber_current(),
                 };
-                VALUE th = rb_thread_create(brotli_stream_chunk_fiber_thread, &fargs);
-                rb_fiber_scheduler_block(scheduler, fargs.blocker, Qnil);
-                join_thread(th);
+                RUN_VIA_FIBER_WORKER(brotli_stream_chunk_fiber_nogvl, fargs);
+                available_in = fargs.available_in;
+                next_in = fargs.next_in;
+                available_out = fargs.available_out;
+                next_out = fargs.next_out;
                 ok = fargs.result;
             } else {
                 ok = BrotliEncoderCompressStream(d->ctx.brotli, BROTLI_OPERATION_PROCESS,
@@ -2221,7 +2596,22 @@ static void inflater_free(void *ptr) {
 
 static size_t inflater_memsize(const void *ptr) {
     const inflater_t *inf = (const inflater_t *)ptr;
-    return sizeof(inflater_t) + inf->lz4_buf.cap;
+    if (!inf)
+        return 0;
+
+    size_t s = sizeof(inflater_t);
+    switch (inf->algo) {
+    case ALGO_ZSTD:
+        if (inf->ctx.zstd)
+            s += ZSTD_sizeof_DStream(inf->ctx.zstd);
+        break;
+    case ALGO_BROTLI:
+        break;
+    case ALGO_LZ4:
+        s += inf->lz4_buf.cap;
+        break;
+    }
+    return s;
 }
 
 static const rb_data_type_t inflater_type = {"Compress::Inflater",
@@ -2317,8 +2707,7 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
     if (slen == 0)
         return rb_binary_str_new("", 0);
 
-    inf->total_input =
-        checked_add_size(inf->total_input, slen, "compressed input exceeds representable size");
+    size_t input_accounted_before = inf->total_input;
 
     switch (inf->algo) {
     case ALGO_ZSTD: {
@@ -2357,14 +2746,17 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
             ZSTD_outBuffer output = {RSTRING_PTR(result) + result_len, current_out_cap, 0};
             size_t ret;
 
-            if (scheduler != Qnil && (input.size - input.pos) >= policy->fiber_stream_threshold) {
-                zstd_decompress_stream_chunk_args_t args = {
+            if (select_fiber_or_direct_mode(scheduler, input.size - input.pos,
+                                            policy->fiber_stream_threshold) == WORK_EXEC_FIBER) {
+                zstd_decompress_stream_chunk_fiber_t args = {
                     .dstream = inf->ctx.zstd,
-                    .output = &output,
-                    .input = &input,
+                    .output = output,
+                    .input = input,
                     .result = 0,
                 };
-                run_via_fiber_worker(scheduler, zstd_decompress_stream_chunk_nogvl, &args);
+                RUN_VIA_FIBER_WORKER(zstd_decompress_stream_chunk_fiber_nogvl, args);
+                output.pos = args.output.pos;
+                input.pos = args.input.pos;
                 ret = args.result;
             } else {
                 ret = ZSTD_decompressStream(inf->ctx.zstd, &output, &input);
@@ -2376,11 +2768,15 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
                                           "decompressed output exceeds representable size");
             size_t total_output = checked_add_size(
                 inf->total_output, result_len, "decompressed output exceeds representable size");
-            enforce_output_and_ratio_limits(total_output, inf->total_input, inf->max_output_size,
+            size_t total_input = checked_add_size(input_accounted_before, input.pos,
+                                                  "compressed input exceeds representable size");
+            enforce_output_and_ratio_limits(total_output, total_input, inf->max_output_size,
                                             inf->max_ratio_enabled, inf->max_ratio);
             if (ret == 0)
                 break;
         }
+        inf->total_input = checked_add_size(input_accounted_before, input.pos,
+                                            "compressed input exceeds representable size");
         inf->total_output = checked_add_size(inf->total_output, result_len,
                                              "decompressed output exceeds representable size");
         rb_str_set_len(result, result_len);
@@ -2409,16 +2805,21 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
             uint8_t *next_out = NULL;
             BrotliDecoderResult res;
 
-            if (scheduler != Qnil && available_in >= policy->fiber_stream_threshold) {
-                brotli_decompress_stream_args_t sargs = {
+            if (select_fiber_or_direct_mode(scheduler, available_in,
+                                            policy->fiber_stream_threshold) == WORK_EXEC_FIBER) {
+                brotli_decompress_stream_fiber_t sargs = {
                     .dec = inf->ctx.brotli,
-                    .available_in = &available_in,
-                    .next_in = &next_in,
-                    .available_out = &available_out,
-                    .next_out = &next_out,
+                    .available_in = available_in,
+                    .next_in = next_in,
+                    .available_out = available_out,
+                    .next_out = next_out,
                     .result = BROTLI_DECODER_RESULT_ERROR,
                 };
-                run_via_fiber_worker(scheduler, brotli_decompress_stream_nogvl, &sargs);
+                RUN_VIA_FIBER_WORKER(brotli_decompress_stream_fiber_nogvl, sargs);
+                available_in = sargs.available_in;
+                next_in = sargs.next_in;
+                available_out = sargs.available_out;
+                next_out = sargs.next_out;
                 res = sargs.result;
             } else {
                 res = BrotliDecoderDecompressStream(inf->ctx.brotli, &available_in, &next_in,
@@ -2436,9 +2837,11 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
                     checked_add_size(result_len, out_size,
                                      "decompressed output exceeds representable size"),
                     "decompressed output exceeds representable size");
-                enforce_output_and_ratio_limits(total_output, inf->total_input,
-                                                inf->max_output_size, inf->max_ratio_enabled,
-                                                inf->max_ratio);
+                size_t total_input =
+                    checked_add_size(input_accounted_before, slen - available_in,
+                                     "compressed input exceeds representable size");
+                enforce_output_and_ratio_limits(total_output, total_input, inf->max_output_size,
+                                                inf->max_ratio_enabled, inf->max_ratio);
 
                 if (result_len + out_size > result_cap) {
                     result_cap = result_len + out_size;
@@ -2453,6 +2856,8 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
             if (res == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT && available_in == 0)
                 break;
         }
+        inf->total_input = checked_add_size(input_accounted_before, slen - available_in,
+                                            "compressed input exceeds representable size");
         inf->total_output = checked_add_size(inf->total_output, result_len,
                                              "decompressed output exceeds representable size");
         rb_str_set_len(result, result_len);
@@ -2521,7 +2926,10 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
                                  checked_add_size(result_len, orig_size,
                                                   "decompressed output exceeds representable size"),
                                  "decompressed output exceeds representable size");
-            enforce_output_and_ratio_limits(total_output, inf->total_input, inf->max_output_size,
+            size_t total_input = checked_add_size(
+                input_accounted_before, (pos + 8 + (size_t)comp_size) - inf->lz4_buf.offset,
+                "compressed input exceeds representable size");
+            enforce_output_and_ratio_limits(total_output, total_input, inf->max_output_size,
                                             inf->max_ratio_enabled, inf->max_ratio);
 
             if (result_len + orig_size > result_cap) {
@@ -2545,6 +2953,8 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
             }
         }
 
+        inf->total_input = checked_add_size(input_accounted_before, pos - inf->lz4_buf.offset,
+                                            "compressed input exceeds representable size");
         inf->lz4_buf.offset = pos;
         inf->total_output = checked_add_size(inf->total_output, result_len,
                                              "decompressed output exceeds representable size");
