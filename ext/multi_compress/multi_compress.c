@@ -611,7 +611,7 @@ static inline size_t fiber_maybe_yield(size_t bytes_since_yield, size_t just_pro
     return bytes_since_yield;
 }
 
-#define DICT_CDICT_CACHE_SIZE 4
+#define DICT_CDICT_CACHE_SIZE 22
 _Static_assert(DICT_CDICT_CACHE_SIZE > 0, "CDict cache needs at least one slot");
 
 typedef struct {
@@ -623,6 +623,7 @@ struct dictionary_s {
     compress_algo_t algo;
     uint8_t *data;
     size_t size;
+    pthread_mutex_t cache_mutex;
 
     cdict_cache_entry_t cdict_cache[DICT_CDICT_CACHE_SIZE];
     int cdict_cache_count;
@@ -632,12 +633,15 @@ struct dictionary_s {
 
 static void dict_free(void *ptr) {
     dictionary_t *dict = (dictionary_t *)ptr;
+    if (!dict)
+        return;
     for (int i = 0; i < dict->cdict_cache_count; i++) {
         if (dict->cdict_cache[i].cdict)
             ZSTD_freeCDict(dict->cdict_cache[i].cdict);
     }
     if (dict->ddict)
         ZSTD_freeDDict(dict->ddict);
+    pthread_mutex_destroy(&dict->cache_mutex);
     if (dict->data)
         xfree(dict->data);
     xfree(dict);
@@ -666,47 +670,78 @@ static const rb_data_type_t dictionary_type = {
 static VALUE dict_alloc(VALUE klass) {
     dictionary_t *d = ALLOC(dictionary_t);
     memset(d, 0, sizeof(dictionary_t));
+    if (pthread_mutex_init(&d->cache_mutex, NULL) != 0) {
+        xfree(d);
+        rb_raise(eMemError, "failed to initialize dictionary cache mutex");
+    }
     return TypedData_Wrap_Struct(klass, &dictionary_type, d);
 }
 
 static ZSTD_CDict *dict_get_cdict(dictionary_t *dict, int level) {
+    ZSTD_CDict *existing = NULL;
+
+    pthread_mutex_lock(&dict->cache_mutex);
     for (int i = 0; i < dict->cdict_cache_count; i++) {
-        if (dict->cdict_cache[i].level == level)
-            return dict->cdict_cache[i].cdict;
+        if (dict->cdict_cache[i].level == level) {
+            existing = dict->cdict_cache[i].cdict;
+            break;
+        }
     }
+    pthread_mutex_unlock(&dict->cache_mutex);
+
+    if (existing)
+        return existing;
 
     ZSTD_CDict *cdict = ZSTD_createCDict(dict->data, dict->size, level);
     if (!cdict)
         return NULL;
 
+    pthread_mutex_lock(&dict->cache_mutex);
     for (int i = 0; i < dict->cdict_cache_count; i++) {
         if (dict->cdict_cache[i].level == level) {
+            existing = dict->cdict_cache[i].cdict;
+            pthread_mutex_unlock(&dict->cache_mutex);
             ZSTD_freeCDict(cdict);
-            return dict->cdict_cache[i].cdict;
+            return existing;
         }
     }
 
-    if (dict->cdict_cache_count < DICT_CDICT_CACHE_SIZE) {
-        dict->cdict_cache[dict->cdict_cache_count].level = level;
-        dict->cdict_cache[dict->cdict_cache_count].cdict = cdict;
-        dict->cdict_cache_count++;
-    } else {
-        ZSTD_CDict *old_cdict = dict->cdict_cache[0].cdict;
-        memmove(&dict->cdict_cache[0], &dict->cdict_cache[1],
-                sizeof(cdict_cache_entry_t) * (DICT_CDICT_CACHE_SIZE - 1));
-        dict->cdict_cache[DICT_CDICT_CACHE_SIZE - 1].level = level;
-        dict->cdict_cache[DICT_CDICT_CACHE_SIZE - 1].cdict = cdict;
-        if (old_cdict)
-            ZSTD_freeCDict(old_cdict);
+    if (dict->cdict_cache_count >= DICT_CDICT_CACHE_SIZE) {
+        pthread_mutex_unlock(&dict->cache_mutex);
+        ZSTD_freeCDict(cdict);
+        rb_raise(eError, "zstd dictionary cdict cache exhausted");
     }
+
+    dict->cdict_cache[dict->cdict_cache_count].level = level;
+    dict->cdict_cache[dict->cdict_cache_count].cdict = cdict;
+    dict->cdict_cache_count++;
+    pthread_mutex_unlock(&dict->cache_mutex);
     return cdict;
 }
 
 static ZSTD_DDict *dict_get_ddict(dictionary_t *dict) {
+    ZSTD_DDict *existing;
+
+    pthread_mutex_lock(&dict->cache_mutex);
+    existing = dict->ddict;
+    pthread_mutex_unlock(&dict->cache_mutex);
+    if (existing)
+        return existing;
+
+    ZSTD_DDict *created = ZSTD_createDDict(dict->data, dict->size);
+    if (!created)
+        return NULL;
+
+    pthread_mutex_lock(&dict->cache_mutex);
     if (!dict->ddict) {
-        dict->ddict = ZSTD_createDDict(dict->data, dict->size);
+        dict->ddict = created;
+        pthread_mutex_unlock(&dict->cache_mutex);
+        return created;
     }
-    return dict->ddict;
+    existing = dict->ddict;
+    pthread_mutex_unlock(&dict->cache_mutex);
+    ZSTD_freeDDict(created);
+    return existing;
 }
 
 typedef struct {
@@ -2867,7 +2902,6 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
     case ALGO_LZ4: {
         size_t data_len = inf->lz4_buf.len - inf->lz4_buf.offset;
         size_t needed = data_len + slen;
-        // TODO(v0.4): optional standard LZ4 frame format support via lz4frame.h
 
         if (inf->lz4_buf.offset > 0 && needed > inf->lz4_buf.cap) {
             if (data_len > 0)
@@ -3148,12 +3182,6 @@ static VALUE train_dictionary_internal(VALUE samples, VALUE size_val, compress_a
 }
 
 static VALUE zstd_train_dictionary(int argc, VALUE *argv, VALUE self) {
-    // #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
-    //     rb_raise(eUnsupportedError,
-    //              "Zstd dictionary training is temporarily disabled on arm64-darwin "
-    //              "because the current vendored trainer path crashes on this platform");
-    // #endif
-
     VALUE samples, opts;
     rb_scan_args(argc, argv, "1:", &samples, &opts);
     reject_algorithm_keyword(opts);
