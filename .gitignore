@@ -23,7 +23,11 @@ ext/**/*.bundle
 ext/**/*.dylib
 ext/**/Makefile
 ext/**/mkmf.log
-ext/multi_compress/vendor/
+ext/multi_compress/vendor/*
+!ext/multi_compress/vendor/.vendored
+!ext/multi_compress/vendor/brotli/
+!ext/multi_compress/vendor/lz4/
+!ext/multi_compress/vendor/zstd/
 
 # Compiled gem files
 *.gem
