@@ -47,6 +47,36 @@ class TestConcurrentOperations < Minitest::Test
     end
   end
 
+  def test_concurrent_dictionary_usage_zstd_multiple_levels
+    dict_data = (("common patterns for zstd compression dictionary test data " * 32) +
+                 ("threaded dictionary cache warmup " * 32)).b
+    dict = MultiCompress::Dictionary.new(dict_data, algo: :zstd)
+
+    levels = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+    iterations = 3
+    results = Queue.new
+
+    threads = levels.map do |level|
+      Thread.new do
+        iterations.times do |i|
+          payload = (("level=#{level} iteration=#{i} " * 512) + @compression_data).b
+          compressed = MultiCompress.compress(payload, algo: :zstd, level: level, dictionary: dict)
+          decompressed = MultiCompress.decompress(compressed, algo: :zstd, dictionary: dict)
+          results << [level, i, payload == decompressed]
+        end
+      end
+    end
+
+    Timeout.timeout(20) { threads.each(&:join) }
+
+    expected = levels.size * iterations
+    actual = []
+    expected.times { actual << results.pop }
+
+    assert_equal expected, actual.size, "all zstd dictionary cache threads should complete"
+    refute actual.any? { |(_, _, ok)| !ok }, "all zstd dictionary cache operations should roundtrip"
+  end
+
   def test_concurrent_dictionary_usage_brotli
     dict_data = "common patterns for brotli compression dictionary test data"
     dict = MultiCompress::Dictionary.new(dict_data, algo: :brotli)
