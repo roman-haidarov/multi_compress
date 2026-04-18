@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.4]
+
+### Added
+ - Keyword validation
+
+### Fixed
+- Fixed gem packaging so vendored builds work correctly after installation.
+  Previously, installed gems could incorrectly fall back to system libraries because
+  `ext/multi_compress/vendor/.vendored` was not included in the packaged gem.
+- Fixed vendored zstd build path in `extconf.rb`.
+
 ## [0.2.3]
 
 ### Changed

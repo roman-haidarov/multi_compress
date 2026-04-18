@@ -24,6 +24,7 @@ Gem::Specification.new do |spec|
     "lib/**/*.rb",
     "ext/**/*.{c,h,rb}",
     "ext/multi_compress/vendor/**/*",
+    "ext/multi_compress/vendor/.vendored",
     "README.md",
     "LICENSE.txt",
     "CHANGELOG.md"

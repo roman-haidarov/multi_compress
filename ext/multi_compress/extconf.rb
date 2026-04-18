@@ -4,8 +4,10 @@ require "mkmf"
 
 USE_SYSTEM = arg_config("--use-system-libraries") ||
              ENV["COMPRESS_USE_SYSTEM_LIBRARIES"]
+FORCE_VENDORED = arg_config("--force-vendored") ||
+                 ENV["COMPRESS_FORCE_VENDORED"]
 
-ZSTD_SUBDIRS   = %w[lib/common lib/multi_compress lib/decompress lib/dictBuilder].freeze
+ZSTD_SUBDIRS   = %w[lib/common lib/compress lib/decompress lib/dictBuilder].freeze
 BROTLI_SUBDIRS = %w[c/common c/enc c/dec].freeze
 LZ4_SOURCES    = %w[lz4.c lz4hc.c lz4frame.c].freeze
 
@@ -74,6 +76,7 @@ end
 def configure_vendored_libraries(vendor_dir)
   versions = File.read(File.join(vendor_dir, ".vendored"))
   puts "Building with VENDORED libraries from #{vendor_dir}"
+  puts "  forced vendored mode enabled" if FORCE_VENDORED
   puts "  #{versions.tr("\n", ", ")}"
 
   zstd_dir   = File.join(vendor_dir, "zstd")
@@ -85,6 +88,7 @@ def configure_vendored_libraries(vendor_dir)
   puts "  #{all_vendor_srcs.length} vendored C files"
 
   add_include_dirs(zstd_dir, lz4_dir, brotli_dir)
+  $CPPFLAGS += " -DZSTD_DISABLE_ASM"
 
   vpath_dirs = build_vpath_dirs(zstd_dir, lz4_dir, brotli_dir)
 
@@ -156,7 +160,13 @@ end
 VENDOR_DIR = find_vendor_dir
 VENDORED   = !VENDOR_DIR.nil?
 
-if USE_SYSTEM || !VENDORED
+if FORCE_VENDORED && !VENDORED
+  abort "COMPRESS_FORCE_VENDORED is set, but ext/multi_compress/vendor/.vendored was not found"
+end
+
+if FORCE_VENDORED
+  vpath_dirs = configure_vendored_libraries(VENDOR_DIR)
+elsif USE_SYSTEM || !VENDORED
   configure_system_libraries
   vpath_dirs = nil
 else

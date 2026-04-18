@@ -62,7 +62,7 @@ static VALUE mBrotli;
 static rb_encoding *binary_encoding;
 static struct {
     ID zstd, lz4, brotli;
-    ID algo, level, dictionary, size;
+    ID algo, algorithm, level, dictionary, size;
     ID max_output_size, max_ratio;
     ID fastest, default_, best;
     ID yield_, join;
@@ -71,17 +71,21 @@ static struct {
 
 static struct {
     VALUE zstd, lz4, brotli;
-    VALUE algo, level, dictionary, size;
+    VALUE algo, algorithm, level, dictionary, size;
     VALUE max_output_size, max_ratio;
 } sym_cache;
 
 typedef enum { ALGO_ZSTD = 0, ALGO_LZ4 = 1, ALGO_BROTLI = 2 } compress_algo_t;
+
+typedef struct dictionary_s dictionary_t;
+static const rb_data_type_t dictionary_type;
 
 static void init_id_cache(void) {
     id_cache.zstd = rb_intern("zstd");
     id_cache.lz4 = rb_intern("lz4");
     id_cache.brotli = rb_intern("brotli");
     id_cache.algo = rb_intern("algo");
+    id_cache.algorithm = rb_intern("algorithm");
     id_cache.level = rb_intern("level");
     id_cache.dictionary = rb_intern("dictionary");
     id_cache.size = rb_intern("size");
@@ -98,6 +102,7 @@ static void init_id_cache(void) {
     sym_cache.lz4 = ID2SYM(id_cache.lz4);
     sym_cache.brotli = ID2SYM(id_cache.brotli);
     sym_cache.algo = ID2SYM(id_cache.algo);
+    sym_cache.algorithm = ID2SYM(id_cache.algorithm);
     sym_cache.level = ID2SYM(id_cache.level);
     sym_cache.dictionary = ID2SYM(id_cache.dictionary);
     sym_cache.size = ID2SYM(id_cache.size);
@@ -111,6 +116,33 @@ static inline VALUE opt_get(VALUE opts, VALUE sym) {
 
 static inline VALUE opt_lookup2(VALUE opts, VALUE sym, VALUE default_value) {
     return NIL_P(opts) ? default_value : rb_hash_lookup2(opts, sym, default_value);
+}
+
+static inline void reject_algorithm_keyword(VALUE opts) {
+    if (NIL_P(opts))
+        return;
+    if (rb_hash_lookup2(opts, sym_cache.algorithm, Qundef) != Qundef) {
+        rb_raise(rb_eArgError, "unknown keyword: :algorithm (use :algo)");
+    }
+}
+
+static inline dictionary_t *opt_dictionary(VALUE dict_val) {
+    dictionary_t *dict;
+
+    if (NIL_P(dict_val))
+        return NULL;
+    if (!rb_obj_is_kind_of(dict_val, cDictionary)) {
+        rb_raise(rb_eTypeError, "dictionary must be a MultiCompress::Dictionary");
+    }
+
+    TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+    return dict;
+}
+
+static inline void raise_if_path_has_null_byte(VALUE path) {
+    if (memchr(RSTRING_PTR(path), '\0', (size_t)RSTRING_LEN(path)) != NULL) {
+        rb_raise(rb_eArgError, "path contains null byte");
+    }
 }
 
 static inline void join_thread(VALUE thread) {
@@ -153,6 +185,10 @@ static inline const algo_policy_t *algo_policy(compress_algo_t algo) {
 }
 
 static compress_algo_t sym_to_algo(VALUE sym) {
+    if (!SYMBOL_P(sym)) {
+        rb_raise(rb_eTypeError, "algo must be a Symbol (:zstd, :lz4, :brotli)");
+    }
+
     ID id = SYM2ID(sym);
     if (id == id_cache.zstd)
         return ALGO_ZSTD;
@@ -419,7 +455,7 @@ typedef struct {
     ZSTD_CDict *cdict;
 } cdict_cache_entry_t;
 
-typedef struct {
+struct dictionary_s {
     compress_algo_t algo;
     uint8_t *data;
     size_t size;
@@ -428,7 +464,7 @@ typedef struct {
     int cdict_cache_count;
 
     ZSTD_DDict *ddict;
-} dictionary_t;
+};
 
 static void dict_free(void *ptr) {
     dictionary_t *dict = (dictionary_t *)ptr;
@@ -789,6 +825,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
     VALUE data, opts;
     rb_scan_args(argc, argv, "1:", &data, &opts);
     StringValue(data);
+    reject_algorithm_keyword(opts);
 
     VALUE algo_sym = Qnil, level_val = Qnil, dict_val = Qnil;
     if (!NIL_P(opts)) {
@@ -805,7 +842,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
         if (algo == ALGO_LZ4) {
             rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
         }
-        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+        dict = opt_dictionary(dict_val);
     }
 
     const char *src = RSTRING_PTR(data);
@@ -1062,6 +1099,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
     VALUE data, opts;
     rb_scan_args(argc, argv, "1:", &data, &opts);
     StringValue(data);
+    reject_algorithm_keyword(opts);
 
     VALUE algo_sym = Qnil, dict_val = Qnil;
     limits_config_t limits;
@@ -1088,7 +1126,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
         if (algo == ALGO_LZ4) {
             rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
         }
-        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+        dict = opt_dictionary(dict_val);
     }
 
     switch (algo) {
@@ -1572,6 +1610,7 @@ static VALUE deflater_alloc(VALUE klass) {
 static VALUE deflater_initialize(int argc, VALUE *argv, VALUE self) {
     VALUE opts;
     rb_scan_args(argc, argv, "0:", &opts);
+    reject_algorithm_keyword(opts);
 
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
@@ -1593,7 +1632,7 @@ static VALUE deflater_initialize(int argc, VALUE *argv, VALUE self) {
         if (d->algo == ALGO_LZ4) {
             rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
         }
-        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+        dict = opt_dictionary(dict_val);
         dictionary_ivar_set(self, dict_val);
     }
 
@@ -2200,6 +2239,7 @@ static VALUE inflater_alloc(VALUE klass) {
 static VALUE inflater_initialize(int argc, VALUE *argv, VALUE self) {
     VALUE opts;
     rb_scan_args(argc, argv, "0:", &opts);
+    reject_algorithm_keyword(opts);
 
     inflater_t *inf;
     TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
@@ -2226,7 +2266,7 @@ static VALUE inflater_initialize(int argc, VALUE *argv, VALUE self) {
         if (inf->algo == ALGO_LZ4) {
             rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
         }
-        TypedData_Get_Struct(dict_val, dictionary_t, &dictionary_type, dict);
+        dict = opt_dictionary(dict_val);
         dictionary_ivar_set(self, dict_val);
     }
 
@@ -2606,6 +2646,7 @@ static VALUE dict_initialize(int argc, VALUE *argv, VALUE self) {
     VALUE raw, opts;
     rb_scan_args(argc, argv, "1:", &raw, &opts);
     StringValue(raw);
+    reject_algorithm_keyword(opts);
 
     dictionary_t *d;
     TypedData_Get_Struct(self, dictionary_t, &dictionary_type, d);
@@ -2705,6 +2746,7 @@ static VALUE zstd_train_dictionary(int argc, VALUE *argv, VALUE self) {
 
     VALUE samples, opts;
     rb_scan_args(argc, argv, "1:", &samples, &opts);
+    reject_algorithm_keyword(opts);
     VALUE size_val = opt_get(opts, sym_cache.size);
     return train_dictionary_internal(samples, size_val, ALGO_ZSTD);
 }
@@ -2712,6 +2754,7 @@ static VALUE zstd_train_dictionary(int argc, VALUE *argv, VALUE self) {
 static VALUE brotli_train_dictionary(int argc, VALUE *argv, VALUE self) {
     VALUE samples, opts;
     rb_scan_args(argc, argv, "1:", &samples, &opts);
+    reject_algorithm_keyword(opts);
     VALUE size_val = opt_get(opts, sym_cache.size);
 
     return train_dictionary_internal(samples, size_val, ALGO_BROTLI);
@@ -2721,6 +2764,8 @@ static VALUE dict_load(int argc, VALUE *argv, VALUE self) {
     VALUE path, opts;
     rb_scan_args(argc, argv, "1:", &path, &opts);
     StringValue(path);
+    reject_algorithm_keyword(opts);
+    raise_if_path_has_null_byte(path);
 
     VALUE algo_sym = Qnil;
     if (!NIL_P(opts)) {
