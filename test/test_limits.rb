@@ -98,6 +98,29 @@ class TestLimits < Minitest::Test
     assert_match(/exceeds limit/i, error.message)
   end
 
+
+  def test_streaming_ratio_guard_uses_consumed_input_for_mid_chunk_trigger
+    compressible = ("A" * (512 * 1024)).b
+    noisy = Random.new(7).bytes(900 * 1024)
+
+    deflater = MultiCompress::Deflater.new(algo: :lz4)
+    stream = +""
+    stream << deflater.write(compressible)
+    stream << deflater.write(noisy)
+    stream << deflater.finish
+    deflater.close
+
+    inflater = MultiCompress::Inflater.new(algo: :lz4, max_output_size: 2 * 1024 * 1024, max_ratio: 50)
+
+    error = assert_raises(MultiCompress::DataError) do
+      inflater.write(stream)
+    end
+
+    assert_match(/ratio exceeds limit/i, error.message)
+  ensure
+    inflater&.close
+  end
+
   def test_dict_load_rejects_files_larger_than_32mb
     Tempfile.create("multi_compress_dict") do |file|
       file.binmode

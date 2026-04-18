@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0]
+
+### Added
+- `MultiCompress.configure` with global decompression defaults:
+  - `config.max_output_size` for one-shot `MultiCompress.decompress`
+  - `config.streaming_max_output_size` for `MultiCompress::Inflater` / `MultiCompress::Reader`
+- Per-call `max_output_size:` overrides continue to work and now take precedence over global defaults
+
+### Changed
+- One-shot and streaming decompression now use separate defaults out of the box:
+  - one-shot `max_output_size`: `512MB`
+  - streaming cumulative `max_output_size`: `2GB`
+- Size limits are now the primary default UX for decompression while the existing ratio guard behavior remains unchanged.
+- Reader/Writer IO parity was tightened for stream wrappers:
+  - `Reader#read(n)` now returns `nil` at EOF
+  - `Reader#gets` correctly preserves multi-byte separators
+  - `Reader#each_chunk` no longer yields an empty trailing chunk at EOF
+  - `Writer#puts` now flattens nested arrays like `IO#puts`
+
 ## [0.2.4]
 
 ### Added
@@ -25,9 +44,8 @@
   - Cumulative streaming output budget enforcement
   - Dictionary file size cap (`32MB`) for `MultiCompress::Dictionary.load`
 - New docs/code parity and limits tests
-- Linux-only ASAN/UBSAN CI job
 - Local `script/valgrind.sh` helper for developer verification (with Ruby VM suppressions)
-- Local `script/sanitize.sh` helper for reproducing the ASAN/UBSAN CI job locally on Linux
+- Local `script/sanitize.sh` helper for running ASAN/UBSAN checks on Linux
 - Optional `./build.sh --test`, `./build.sh --valgrind`, and `./build.sh --sanitize` modes
 
 ### Changed
