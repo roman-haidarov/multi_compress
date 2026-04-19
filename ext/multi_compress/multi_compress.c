@@ -137,12 +137,94 @@ static void init_id_cache(void) {
     sym_cache.max_ratio = ID2SYM(id_cache.max_ratio);
 }
 
-static inline VALUE opt_get(VALUE opts, VALUE sym) {
-    return NIL_P(opts) ? Qnil : rb_hash_aref(opts, sym);
+typedef struct {
+    VALUE algo;
+    VALUE level;
+    VALUE dictionary;
+    VALUE size;
+    VALUE format;
+    VALUE max_output_size;
+    VALUE max_ratio;
+    int saw_algorithm_keyword;
+} mc_opts_t;
+
+static inline void mc_opts_init(mc_opts_t *opts) {
+    opts->algo = Qnil;
+    opts->level = Qnil;
+    opts->dictionary = Qnil;
+    opts->size = Qnil;
+    opts->format = Qnil;
+    opts->max_output_size = Qundef;
+    opts->max_ratio = Qundef;
+    opts->saw_algorithm_keyword = 0;
 }
 
-static inline VALUE opt_lookup2(VALUE opts, VALUE sym, VALUE default_value) {
-    return NIL_P(opts) ? default_value : rb_hash_lookup2(opts, sym, default_value);
+static int mc_opts_parse_i(VALUE key, VALUE value, VALUE arg) {
+    mc_opts_t *opts = (mc_opts_t *)arg;
+
+    if (!SYMBOL_P(key))
+        return ST_CONTINUE;
+
+    ID id = SYM2ID(key);
+    if (id == id_cache.algo) {
+        opts->algo = value;
+    } else if (id == id_cache.level) {
+        opts->level = value;
+    } else if (id == id_cache.dictionary) {
+        opts->dictionary = value;
+    } else if (id == id_cache.size) {
+        opts->size = value;
+    } else if (id == id_cache.format) {
+        opts->format = value;
+    } else if (id == id_cache.max_output_size) {
+        opts->max_output_size = value;
+    } else if (id == id_cache.max_ratio) {
+        opts->max_ratio = value;
+    } else if (id == id_cache.algorithm) {
+        opts->saw_algorithm_keyword = 1;
+    }
+
+    return ST_CONTINUE;
+}
+
+static inline void mc_parse_opts(VALUE opts_hash, mc_opts_t *opts) {
+    mc_opts_init(opts);
+    if (NIL_P(opts_hash))
+        return;
+    Check_Type(opts_hash, T_HASH);
+    rb_hash_foreach(opts_hash, mc_opts_parse_i, (VALUE)opts);
+}
+
+static inline void scan_one_required_keywords(int argc, VALUE *argv, VALUE *arg, VALUE *opts) {
+    if (argc == 1) {
+        *arg = argv[0];
+        *opts = Qnil;
+        return;
+    }
+
+    if (argc == 2 && rb_keyword_given_p()) {
+        *arg = argv[0];
+        *opts = argv[1];
+        Check_Type(*opts, T_HASH);
+        return;
+    }
+
+    rb_error_arity(argc, 1, 1);
+}
+
+static inline void scan_zero_required_keywords(int argc, VALUE *argv, VALUE *opts) {
+    if (argc == 0) {
+        *opts = Qnil;
+        return;
+    }
+
+    if (argc == 1 && rb_keyword_given_p()) {
+        *opts = argv[0];
+        Check_Type(*opts, T_HASH);
+        return;
+    }
+
+    rb_error_arity(argc, 0, 0);
 }
 
 enum { LZ4_FRAME_MAGIC_LEN = 4 };
@@ -152,8 +234,9 @@ static inline int is_lz4_frame_magic(const uint8_t *data, size_t len) {
     return len >= LZ4_FRAME_MAGIC_LEN && memcmp(data, LZ4_FRAME_MAGIC, LZ4_FRAME_MAGIC_LEN) == 0;
 }
 
-static lz4_format_t parse_lz4_format(VALUE opts, compress_algo_t algo, int explicit_algo) {
-    VALUE format_val = opt_lookup2(opts, sym_cache.format, Qundef);
+static lz4_format_t parse_lz4_format(const mc_opts_t *opts, compress_algo_t algo,
+                                     int explicit_algo) {
+    VALUE format_val = opts->format;
     if (format_val == Qundef || NIL_P(format_val))
         return LZ4_FORMAT_BLOCK;
     if (explicit_algo && algo != ALGO_LZ4)
@@ -169,10 +252,8 @@ static lz4_format_t parse_lz4_format(VALUE opts, compress_algo_t algo, int expli
     return LZ4_FORMAT_BLOCK;
 }
 
-static inline void reject_algorithm_keyword(VALUE opts) {
-    if (NIL_P(opts))
-        return;
-    if (rb_hash_lookup2(opts, sym_cache.algorithm, Qundef) != Qundef) {
+static inline void reject_algorithm_keyword(const mc_opts_t *opts) {
+    if (opts->saw_algorithm_keyword) {
         rb_raise(rb_eArgError, "unknown keyword: :algorithm (use :algo)");
     }
 }
@@ -383,11 +464,8 @@ static void limits_config_init(limits_config_t *limits) {
     limits->max_ratio = DEFAULT_MAX_RATIO;
 }
 
-static void limits_config_apply_opts(VALUE opts, limits_config_t *limits) {
-    if (NIL_P(opts))
-        return;
-
-    VALUE val = opt_lookup2(opts, sym_cache.max_output_size, Qundef);
+static void limits_config_apply_parsed(const mc_opts_t *opts, limits_config_t *limits) {
+    VALUE val = opts->max_output_size;
     if (val != Qundef && !NIL_P(val)) {
         size_t max_output_size = NUM2SIZET(val);
         if (max_output_size == 0)
@@ -395,7 +473,7 @@ static void limits_config_apply_opts(VALUE opts, limits_config_t *limits) {
         limits->max_output_size = max_output_size;
     }
 
-    val = opt_lookup2(opts, sym_cache.max_ratio, Qundef);
+    val = opts->max_ratio;
     if (val == Qundef)
         return;
     if (NIL_P(val)) {
@@ -411,9 +489,9 @@ static void limits_config_apply_opts(VALUE opts, limits_config_t *limits) {
     limits->max_ratio = max_ratio;
 }
 
-static void parse_limits_from_opts(VALUE opts, limits_config_t *limits) {
+static void parse_limits_from_parsed_opts(const mc_opts_t *opts, limits_config_t *limits) {
     limits_config_init(limits);
-    limits_config_apply_opts(opts, limits);
+    limits_config_apply_parsed(opts, limits);
 }
 
 static inline size_t checked_add_size(size_t left, size_t right, const char *message) {
@@ -1107,20 +1185,20 @@ static void *zstd_fiber_compress_nogvl(void *arg) {
 
 static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
     VALUE data, opts;
-    rb_scan_args(argc, argv, "1:", &data, &opts);
+    scan_one_required_keywords(argc, argv, &data, &opts);
     StringValue(data);
-    reject_algorithm_keyword(opts);
 
-    VALUE algo_sym = Qnil, level_val = Qnil, dict_val = Qnil;
-    if (!NIL_P(opts)) {
-        algo_sym = opt_get(opts, sym_cache.algo);
-        level_val = opt_get(opts, sym_cache.level);
-        dict_val = opt_get(opts, sym_cache.dictionary);
-    }
+    mc_opts_t parsed_opts;
+    mc_parse_opts(opts, &parsed_opts);
+    reject_algorithm_keyword(&parsed_opts);
+
+    VALUE algo_sym = parsed_opts.algo;
+    VALUE level_val = parsed_opts.level;
+    VALUE dict_val = parsed_opts.dictionary;
 
     int explicit_algo = !NIL_P(algo_sym);
     compress_algo_t algo = explicit_algo ? sym_to_algo(algo_sym) : ALGO_ZSTD;
-    lz4_format_t lz4_format = parse_lz4_format(opts, algo, explicit_algo);
+    lz4_format_t lz4_format = parse_lz4_format(&parsed_opts, algo, explicit_algo);
     int level = resolve_level(algo, level_val);
 
     dictionary_t *dict = NULL;
@@ -1406,17 +1484,17 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
 
 static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
     VALUE data, opts;
-    rb_scan_args(argc, argv, "1:", &data, &opts);
+    scan_one_required_keywords(argc, argv, &data, &opts);
     StringValue(data);
-    reject_algorithm_keyword(opts);
 
-    VALUE algo_sym = Qnil, dict_val = Qnil;
+    mc_opts_t parsed_opts;
+    mc_parse_opts(opts, &parsed_opts);
+    reject_algorithm_keyword(&parsed_opts);
+
+    VALUE algo_sym = parsed_opts.algo;
+    VALUE dict_val = parsed_opts.dictionary;
     limits_config_t limits;
-    parse_limits_from_opts(opts, &limits);
-    if (!NIL_P(opts)) {
-        algo_sym = opt_get(opts, sym_cache.algo);
-        dict_val = opt_get(opts, sym_cache.dictionary);
-    }
+    parse_limits_from_parsed_opts(&parsed_opts, &limits);
 
     const uint8_t *src = (const uint8_t *)RSTRING_PTR(data);
     size_t slen = RSTRING_LEN(data);
@@ -1428,7 +1506,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
     } else {
         algo = sym_to_algo(algo_sym);
     }
-    lz4_format_t lz4_format = parse_lz4_format(opts, algo, explicit_algo);
+    lz4_format_t lz4_format = parse_lz4_format(&parsed_opts, algo, explicit_algo);
 
     const algo_policy_t *policy = algo_policy(algo);
 
@@ -2009,18 +2087,18 @@ static VALUE deflater_alloc(VALUE klass) {
 
 static VALUE deflater_initialize(int argc, VALUE *argv, VALUE self) {
     VALUE opts;
-    rb_scan_args(argc, argv, "0:", &opts);
-    reject_algorithm_keyword(opts);
+    scan_zero_required_keywords(argc, argv, &opts);
+
+    mc_opts_t parsed_opts;
+    mc_parse_opts(opts, &parsed_opts);
+    reject_algorithm_keyword(&parsed_opts);
 
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
 
-    VALUE algo_sym = Qnil, level_val = Qnil, dict_val = Qnil;
-    if (!NIL_P(opts)) {
-        algo_sym = opt_get(opts, sym_cache.algo);
-        level_val = opt_get(opts, sym_cache.level);
-        dict_val = opt_get(opts, sym_cache.dictionary);
-    }
+    VALUE algo_sym = parsed_opts.algo;
+    VALUE level_val = parsed_opts.level;
+    VALUE dict_val = parsed_opts.dictionary;
 
     d->algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
     d->level = resolve_level(d->algo, level_val);
@@ -2663,19 +2741,19 @@ static VALUE inflater_alloc(VALUE klass) {
 
 static VALUE inflater_initialize(int argc, VALUE *argv, VALUE self) {
     VALUE opts;
-    rb_scan_args(argc, argv, "0:", &opts);
-    reject_algorithm_keyword(opts);
+    scan_zero_required_keywords(argc, argv, &opts);
+
+    mc_opts_t parsed_opts;
+    mc_parse_opts(opts, &parsed_opts);
+    reject_algorithm_keyword(&parsed_opts);
 
     inflater_t *inf;
     TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
 
-    VALUE algo_sym = Qnil, dict_val = Qnil;
+    VALUE algo_sym = parsed_opts.algo;
+    VALUE dict_val = parsed_opts.dictionary;
     limits_config_t limits;
-    parse_limits_from_opts(opts, &limits);
-    if (!NIL_P(opts)) {
-        algo_sym = opt_get(opts, sym_cache.algo);
-        dict_val = opt_get(opts, sym_cache.dictionary);
-    }
+    parse_limits_from_parsed_opts(&parsed_opts, &limits);
 
     inf->algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
     inf->closed = 0;
@@ -3088,17 +3166,17 @@ static VALUE inflater_closed_p(VALUE self) {
 
 static VALUE dict_initialize(int argc, VALUE *argv, VALUE self) {
     VALUE raw, opts;
-    rb_scan_args(argc, argv, "1:", &raw, &opts);
+    scan_one_required_keywords(argc, argv, &raw, &opts);
     StringValue(raw);
-    reject_algorithm_keyword(opts);
+
+    mc_opts_t parsed_opts;
+    mc_parse_opts(opts, &parsed_opts);
+    reject_algorithm_keyword(&parsed_opts);
 
     dictionary_t *d;
     TypedData_Get_Struct(self, dictionary_t, &dictionary_type, d);
 
-    VALUE algo_sym = Qnil;
-    if (!NIL_P(opts)) {
-        algo_sym = opt_get(opts, sym_cache.algo);
-    }
+    VALUE algo_sym = parsed_opts.algo;
     d->algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
 
     if (d->algo == ALGO_LZ4)
@@ -3183,32 +3261,34 @@ static VALUE train_dictionary_internal(VALUE samples, VALUE size_val, compress_a
 
 static VALUE zstd_train_dictionary(int argc, VALUE *argv, VALUE self) {
     VALUE samples, opts;
-    rb_scan_args(argc, argv, "1:", &samples, &opts);
-    reject_algorithm_keyword(opts);
-    VALUE size_val = opt_get(opts, sym_cache.size);
-    return train_dictionary_internal(samples, size_val, ALGO_ZSTD);
+    scan_one_required_keywords(argc, argv, &samples, &opts);
+    mc_opts_t parsed_opts;
+    mc_parse_opts(opts, &parsed_opts);
+    reject_algorithm_keyword(&parsed_opts);
+    return train_dictionary_internal(samples, parsed_opts.size, ALGO_ZSTD);
 }
 
 static VALUE brotli_train_dictionary(int argc, VALUE *argv, VALUE self) {
     VALUE samples, opts;
-    rb_scan_args(argc, argv, "1:", &samples, &opts);
-    reject_algorithm_keyword(opts);
-    VALUE size_val = opt_get(opts, sym_cache.size);
+    scan_one_required_keywords(argc, argv, &samples, &opts);
+    mc_opts_t parsed_opts;
+    mc_parse_opts(opts, &parsed_opts);
+    reject_algorithm_keyword(&parsed_opts);
 
-    return train_dictionary_internal(samples, size_val, ALGO_BROTLI);
+    return train_dictionary_internal(samples, parsed_opts.size, ALGO_BROTLI);
 }
 
 static VALUE dict_load(int argc, VALUE *argv, VALUE self) {
     VALUE path, opts;
-    rb_scan_args(argc, argv, "1:", &path, &opts);
+    scan_one_required_keywords(argc, argv, &path, &opts);
     StringValue(path);
-    reject_algorithm_keyword(opts);
     raise_if_path_has_null_byte(path);
 
-    VALUE algo_sym = Qnil;
-    if (!NIL_P(opts)) {
-        algo_sym = opt_get(opts, sym_cache.algo);
-    }
+    mc_opts_t parsed_opts;
+    mc_parse_opts(opts, &parsed_opts);
+    reject_algorithm_keyword(&parsed_opts);
+
+    VALUE algo_sym = parsed_opts.algo;
     compress_algo_t algo = NIL_P(algo_sym) ? ALGO_ZSTD : sym_to_algo(algo_sym);
 
     if (algo == ALGO_LZ4)

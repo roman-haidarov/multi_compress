@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.2]
+
+### Changed
+- Micro-optimization
+
 ## [0.3.1]
 
 ### Fixed
