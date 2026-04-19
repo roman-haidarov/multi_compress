@@ -106,9 +106,9 @@ Performance comparison against Ruby's built-in zlib compression (200 iterations 
 │ Medium JSON (~370KB, no GC) │    8.5% │   15.7% │    6.7% │    5.5% │
 │ Medium logs (~168KB, no GC) │    8.6% │   17.2% │    5.4% │    3.2% │
 │ Large JSON (~1.6MB, GC)     │    8.1% │   15.1% │    6.1% │    5.6% │
-│ Large logs (~600KB, GC)     │    7.6% │   16.0% │    2.8% │    2.1% │
+│ Large logs (~600KB, GC)     │    7.6% │   16.0% │    2.9% │    2.0% │
 │ Large JSON (~1.6MB, no GC)  │    8.1% │   15.1% │    6.1% │    5.6% │
-│ Large logs (~600KB, no GC)  │    7.6% │   16.0% │    2.8% │    2.1% │
+│ Large logs (~600KB, no GC)  │    7.6% │   16.0% │    2.9% │    2.0% │
 └─────────────────────────────┴─────────┴─────────┴─────────┴─────────┘
 ```
 
@@ -117,18 +117,18 @@ Performance comparison against Ruby's built-in zlib compression (200 iterations 
 ┌─────────────────────────────┬─────────┬─────────┬─────────┬─────────┐
 │ Configuration               │  zlib   │   lz4   │  zstd   │ brotli  │
 ├─────────────────────────────┼─────────┼─────────┼─────────┼─────────┤
-│ Small JSON (~10KB, GC)      │    0.05 │    0.01 │    0.02 │    0.14 │
-│ Small text (~10KB, GC)      │    0.04 │    0.00 │    0.01 │    0.11 │
+│ Small JSON (~10KB, GC)      │    0.05 │    0.01 │    0.02 │    0.12 │
+│ Small text (~10KB, GC)      │    0.03 │    0.00 │    0.01 │    0.09 │
 │ Small JSON (~10KB, no GC)   │    0.06 │    0.01 │    0.02 │    0.13 │
-│ Small text (~10KB, no GC)   │    0.04 │    0.00 │    0.01 │    0.11 │
-│ Medium JSON (~370KB, GC)    │    2.73 │    0.29 │    0.42 │    2.36 │
-│ Medium logs (~168KB, GC)    │    1.23 │    0.14 │    0.18 │    0.92 │
-│ Medium JSON (~370KB, no GC) │    2.72 │    0.28 │    0.41 │    2.41 │
-│ Medium logs (~168KB, no GC) │    1.26 │    0.13 │    0.18 │    0.96 │
-│ Large JSON (~1.6MB, GC)     │   12.44 │    1.38 │    1.96 │   12.44 │
-│ Large logs (~600KB, GC)     │    4.29 │    0.46 │    0.49 │    2.85 │
-│ Large JSON (~1.6MB, no GC)  │   12.22 │    1.28 │    1.86 │   11.83 │
-│ Large logs (~600KB, no GC)  │    4.39 │    0.42 │    0.44 │    2.86 │
+│ Small text (~10KB, no GC)   │    0.03 │    0.00 │    0.01 │    0.11 │
+│ Medium JSON (~370KB, GC)    │    2.62 │    0.28 │    0.39 │    2.31 │
+│ Medium logs (~168KB, GC)    │    1.23 │    0.13 │    0.18 │    0.88 │
+│ Medium JSON (~370KB, no GC) │    2.65 │    0.27 │    0.40 │    2.31 │
+│ Medium logs (~168KB, no GC) │    1.27 │    0.13 │    0.18 │    0.95 │
+│ Large JSON (~1.6MB, GC)     │   11.70 │    1.36 │    1.93 │   11.95 │
+│ Large logs (~600KB, GC)     │    4.10 │    0.45 │    0.45 │    2.62 │
+│ Large JSON (~1.6MB, no GC)  │   11.47 │    1.27 │    1.88 │   11.47 │
+│ Large logs (~600KB, no GC)  │    4.06 │    0.41 │    0.45 │    2.79 │
 └─────────────────────────────┴─────────┴─────────┴─────────┴─────────┘
 ```
 
@@ -137,18 +137,18 @@ Performance comparison against Ruby's built-in zlib compression (200 iterations 
 ┌─────────────────────────────┬─────────┬─────────┬─────────┬─────────┐
 │ Configuration               │  zlib   │   lz4   │  zstd   │ brotli  │
 ├─────────────────────────────┼─────────┼─────────┼─────────┼─────────┤
-│ Small JSON (~10KB, GC)      │   1.00x │   5.00x │   2.50x │   0.36x │
-│ Small text (~10KB, GC)      │   1.00x │     N/A │   4.00x │   0.36x │
+│ Small JSON (~10KB, GC)      │   1.00x │   5.00x │   2.50x │   0.42x │
+│ Small text (~10KB, GC)      │   1.00x │     N/A │   3.00x │   0.33x │
 │ Small JSON (~10KB, no GC)   │   1.00x │   6.00x │   3.00x │   0.46x │
-│ Small text (~10KB, no GC)   │   1.00x │     N/A │   4.00x │   0.36x │
-│ Medium JSON (~370KB, GC)    │   1.00x │   9.41x │   6.50x │   1.16x │
-│ Medium logs (~168KB, GC)    │   1.00x │   8.79x │   6.83x │   1.34x │
-│ Medium JSON (~370KB, no GC) │   1.00x │   9.71x │   6.63x │   1.13x │
-│ Medium logs (~168KB, no GC) │   1.00x │   9.69x │   7.00x │   1.31x │
-│ Large JSON (~1.6MB, GC)     │   1.00x │   9.01x │   6.35x │   1.00x │
-│ Large logs (~600KB, GC)     │   1.00x │   9.33x │   8.76x │   1.51x │
-│ Large JSON (~1.6MB, no GC)  │   1.00x │   9.55x │   6.57x │   1.03x │
-│ Large logs (~600KB, no GC)  │   1.00x │  10.45x │   9.98x │   1.53x │
+│ Small text (~10KB, no GC)   │   1.00x │     N/A │   3.00x │   0.27x │
+│ Medium JSON (~370KB, GC)    │   1.00x │   9.36x │   6.72x │   1.13x │
+│ Medium logs (~168KB, GC)    │   1.00x │   9.46x │   6.83x │   1.40x │
+│ Medium JSON (~370KB, no GC) │   1.00x │   9.81x │   6.62x │   1.15x │
+│ Medium logs (~168KB, no GC) │   1.00x │   9.77x │   7.06x │   1.34x │
+│ Large JSON (~1.6MB, GC)     │   1.00x │   8.60x │   6.06x │   0.98x │
+│ Large logs (~600KB, GC)     │   1.00x │   9.11x │   9.11x │   1.56x │
+│ Large JSON (~1.6MB, no GC)  │   1.00x │   9.03x │   6.10x │   1.00x │
+│ Large logs (~600KB, no GC)  │   1.00x │   9.90x │   9.02x │   1.46x │
 └─────────────────────────────┴─────────┴─────────┴─────────┴─────────┘
 ```
 
