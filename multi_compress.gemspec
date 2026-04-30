@@ -28,6 +28,7 @@ Gem::Specification.new do |spec|
     "README.md",
     "GET_STARTED.md",
     "LICENSE.txt",
+    "THIRD_PARTY_NOTICES.md",
     "CHANGELOG.md"
   ]
 

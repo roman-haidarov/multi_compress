@@ -16,11 +16,12 @@ VENDOR_DIR = File.expand_path("../ext/multi_compress/vendor", __dir__)
 
 LIBS = {
   zstd: {
-    version: "1.5.2", # Pin vendored zstd to 1.5.2 because dictionary training regresses on newer versions (arm64-darwin)
+    version: "1.5.7",
     url:     "https://github.com/facebook/zstd/archive/refs/tags/v%<version>s.tar.gz",
-    sha256:  "f7de13462f7a82c29ab865820149e778cbfe01087b3a55b5332707abf9db4a6e",
+    sha256:  "37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3",
     strip:   "zstd-%<version>s",
     keep:    %w[lib],
+    keep_files: %w[LICENSE COPYING],
   },
   lz4: {
     version: "1.10.0",
@@ -28,13 +29,15 @@ LIBS = {
     sha256:  "537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b",
     strip:   "lz4-%<version>s",
     keep:    %w[lib],
+    keep_files: %w[LICENSE],
   },
   brotli: {
-    version: "1.1.0",
+    version: "1.2.0", # Requires extconf wrappers for enc/dec static_init.c basename collision
     url:     "https://github.com/google/brotli/archive/refs/tags/v%<version>s.tar.gz",
-    sha256:  "e720a6ca29428b803f4ad165371771f5398faba397edf6778837a18599ea13ff",
+    sha256:  "816c96e8e8f193b40151dad7e8ff37b1221d019dbcb9c35cd3fadbfe6477dfec",
     strip:   "brotli-%<version>s",
     keep:    %w[c/common c/enc c/dec c/include],
+    keep_files: %w[LICENSE],
   },
 }.freeze
 
@@ -43,7 +46,7 @@ def download(url, dest)
   URI.open(url) { |remote| File.binwrite(dest, remote.read) }
 end
 
-def extract(tarball, dest, strip_prefix:, keep_dirs:)
+def extract(tarball, dest, strip_prefix:, keep_dirs:, keep_files: [])
   require "rubygems/package"
   require "zlib"
 
@@ -56,7 +59,9 @@ def extract(tarball, dest, strip_prefix:, keep_dirs:)
     tar.each do |entry|
       relative_path = entry.full_name.sub(prefix_re, "")
       next if relative_path.empty? || relative_path == entry.full_name
-      next unless keep_dirs.any? { |d| relative_path.start_with?(d) }
+      keep_directory = keep_dirs.any? { |d| relative_path.start_with?(d) }
+      keep_file = keep_files.include?(relative_path)
+      next unless keep_directory || keep_file
 
       target = File.join(dest, relative_path)
 
@@ -93,7 +98,13 @@ def vendor_library(name, config, tmpdir)
 
   download(url, tarball)
   verify_checksum!(tarball, name, config[:sha256])
-  extract(tarball, dest, strip_prefix: strip, keep_dirs: config[:keep])
+  extract(
+    tarball,
+    dest,
+    strip_prefix: strip,
+    keep_dirs: config[:keep],
+    keep_files: config.fetch(:keep_files, [])
+  )
 
   puts "  -> #{dest}"
   puts

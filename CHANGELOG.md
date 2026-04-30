@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3]
+
+### Changed
+- Updated vendored native libraries to **zstd 1.5.7** and **brotli 1.2.0**.
+- Updated README / GET_STARTED examples so documented runtime versions match `MultiCompress.version(...)`.
+- Added third-party license notices for the vendored C libraries.
+
 ## [0.3.2]
 
 ### Changed
@@ -59,9 +66,9 @@
 - Optional `./build.sh --test`, `./build.sh --valgrind`, and `./build.sh --sanitize` modes
 
 ### Changed
-- Vendored **zstd** is pinned to **1.5.2** in the current release line.
-  - This restores reliable `MultiCompress::Zstd.train_dictionary(...)` behavior on tested platforms, including arm64-darwin.
-  - Newer vendored zstd versions are temporarily avoided until the dictionary training regression is understood and fixed upstream.
+- Historical note for the 0.2.2 release line: vendored **zstd** was pinned to **1.5.2**.
+  - This restored reliable `MultiCompress::Zstd.train_dictionary(...)` behavior on tested platforms at the time, including arm64-darwin.
+  - Later releases moved forward after the native-library upgrade path was revalidated.
 
 ### Changed
 - Documentation now matches current runtime behavior:

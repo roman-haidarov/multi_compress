@@ -7,9 +7,9 @@
 Modern compression technology: **zstd**, **lz4**, **brotli** — unified compression platform with native C performance, **fiber-friendly** for modern async Ruby stacks.
 
 Bundled library versions in the current release:
-- **zstd 1.5.2**
+- **zstd 1.5.7**
 - **lz4 1.10.0**
-- **brotli 1.1.0**
+- **brotli 1.2.0**
 
 📖 **[Get Started →](GET_STARTED.md)** — Complete technology overview, algorithms, and implementation details
 
@@ -88,70 +88,79 @@ If `max_output_size:` is omitted, one-shot calls use `MultiCompress.config.max_o
 
 ## Benchmark Results
 
-> **📝 Note on v0.2.0**: Performance numbers below are from the v0.2.0 build with fiber-friendly paths enabled. There is no throughput regression compared to v0.1.2 — the fiber-friendly path is only taken when a `Fiber::Scheduler` is active, and even then the worker-thread overhead is negligible for payloads large enough to benefit.
+> Benchmark numbers are environment-dependent. The tables below were generated with **MultiCompress 0.3.2** using vendored **zstd 1.5.7**, **lz4 1.10.0**, and **brotli 1.2.0** on **Ruby 3.1.7 / arm64-darwin24**, 200 iterations per test.
+>
+> Use these numbers as relative guidance, not absolute guarantees. In this run, **lz4** is consistently the fastest, **zstd** gives the best speed/ratio balance, and **brotli** gives the smallest output size but is not optimized for speed-first paths.
 
-Performance comparison against Ruby's built-in zlib compression (200 iterations per test):
+Performance comparison against Ruby's built-in zlib compression:
 
-### 🗜️  COMPRESSION RATIO (%, lower is better)
-```
-┌─────────────────────────────┬─────────┬─────────┬─────────┬─────────┐
-│ Configuration               │  zlib   │   lz4   │  zstd   │ brotli  │
-├─────────────────────────────┼─────────┼─────────┼─────────┼─────────┤
-│ Small JSON (~10KB, GC)      │    9.4% │   16.1% │    6.9% │    6.1% │
-│ Small text (~10KB, GC)      │    3.1% │    4.6% │    3.2% │    2.6% │
-│ Small JSON (~10KB, no GC)   │    9.4% │   16.1% │    6.9% │    6.1% │
-│ Small text (~10KB, no GC)   │    3.1% │    4.6% │    3.2% │    2.6% │
-│ Medium JSON (~370KB, GC)    │    8.5% │   15.7% │    6.7% │    5.5% │
-│ Medium logs (~168KB, GC)    │    8.6% │   17.2% │    5.4% │    3.2% │
-│ Medium JSON (~370KB, no GC) │    8.5% │   15.7% │    6.7% │    5.5% │
-│ Medium logs (~168KB, no GC) │    8.6% │   17.2% │    5.4% │    3.2% │
-│ Large JSON (~1.6MB, GC)     │    8.1% │   15.1% │    6.1% │    5.6% │
-│ Large logs (~600KB, GC)     │    7.6% │   16.0% │    2.9% │    2.0% │
-│ Large JSON (~1.6MB, no GC)  │    8.1% │   15.1% │    6.1% │    5.6% │
-│ Large logs (~600KB, no GC)  │    7.6% │   16.0% │    2.9% │    2.0% │
-└─────────────────────────────┴─────────┴─────────┴─────────┴─────────┘
-```
+### 🗜️ Compression ratio (%, lower is better)
 
-### ⚡ TOTAL TIME (compress + decompress, ms — lower is faster)
-```
-┌─────────────────────────────┬─────────┬─────────┬─────────┬─────────┐
-│ Configuration               │  zlib   │   lz4   │  zstd   │ brotli  │
-├─────────────────────────────┼─────────┼─────────┼─────────┼─────────┤
-│ Small JSON (~10KB, GC)      │    0.05 │    0.01 │    0.02 │    0.12 │
-│ Small text (~10KB, GC)      │    0.03 │    0.00 │    0.01 │    0.09 │
-│ Small JSON (~10KB, no GC)   │    0.06 │    0.01 │    0.02 │    0.13 │
-│ Small text (~10KB, no GC)   │    0.03 │    0.00 │    0.01 │    0.11 │
-│ Medium JSON (~370KB, GC)    │    2.62 │    0.28 │    0.39 │    2.31 │
-│ Medium logs (~168KB, GC)    │    1.23 │    0.13 │    0.18 │    0.88 │
-│ Medium JSON (~370KB, no GC) │    2.65 │    0.27 │    0.40 │    2.31 │
-│ Medium logs (~168KB, no GC) │    1.27 │    0.13 │    0.18 │    0.95 │
-│ Large JSON (~1.6MB, GC)     │   11.70 │    1.36 │    1.93 │   11.95 │
-│ Large logs (~600KB, GC)     │    4.10 │    0.45 │    0.45 │    2.62 │
-│ Large JSON (~1.6MB, no GC)  │   11.47 │    1.27 │    1.88 │   11.47 │
-│ Large logs (~600KB, no GC)  │    4.06 │    0.41 │    0.45 │    2.79 │
-└─────────────────────────────┴─────────┴─────────┴─────────┴─────────┘
-```
+| Configuration | zlib | lz4 | zstd | brotli |
+|---|---:|---:|---:|---:|
+| Small JSON (~10KB, GC) | 9.4% | 16.1% | 6.9% | 6.1% |
+| Small text (~10KB, GC) | 3.1% | 4.6% | 3.2% | 2.6% |
+| Small JSON (~10KB, no GC) | 9.4% | 16.1% | 6.9% | 6.1% |
+| Small text (~10KB, no GC) | 3.1% | 4.6% | 3.2% | 2.6% |
+| Medium JSON (~370KB, GC) | 8.5% | 15.7% | 6.6% | 5.4% |
+| Medium logs (~168KB, GC) | 8.6% | 17.2% | 5.3% | 3.3% |
+| Medium JSON (~370KB, no GC) | 8.5% | 15.7% | 6.6% | 5.4% |
+| Medium logs (~168KB, no GC) | 8.6% | 17.2% | 5.3% | 3.3% |
+| Large JSON (~1.6MB, GC) | 8.1% | 15.1% | 6.1% | 5.6% |
+| Large logs (~600KB, GC) | 7.6% | 16.0% | 2.9% | 2.0% |
+| Large JSON (~1.6MB, no GC) | 8.1% | 15.1% | 6.1% | 5.6% |
+| Large logs (~600KB, no GC) | 7.6% | 16.0% | 2.9% | 2.0% |
 
-### 📊 SPEEDUP vs ZLIB (higher is better)
-```
-┌─────────────────────────────┬─────────┬─────────┬─────────┬─────────┐
-│ Configuration               │  zlib   │   lz4   │  zstd   │ brotli  │
-├─────────────────────────────┼─────────┼─────────┼─────────┼─────────┤
-│ Small JSON (~10KB, GC)      │   1.00x │   5.00x │   2.50x │   0.42x │
-│ Small text (~10KB, GC)      │   1.00x │     N/A │   3.00x │   0.33x │
-│ Small JSON (~10KB, no GC)   │   1.00x │   6.00x │   3.00x │   0.46x │
-│ Small text (~10KB, no GC)   │   1.00x │     N/A │   3.00x │   0.27x │
-│ Medium JSON (~370KB, GC)    │   1.00x │   9.36x │   6.72x │   1.13x │
-│ Medium logs (~168KB, GC)    │   1.00x │   9.46x │   6.83x │   1.40x │
-│ Medium JSON (~370KB, no GC) │   1.00x │   9.81x │   6.62x │   1.15x │
-│ Medium logs (~168KB, no GC) │   1.00x │   9.77x │   7.06x │   1.34x │
-│ Large JSON (~1.6MB, GC)     │   1.00x │   8.60x │   6.06x │   0.98x │
-│ Large logs (~600KB, GC)     │   1.00x │   9.11x │   9.11x │   1.56x │
-│ Large JSON (~1.6MB, no GC)  │   1.00x │   9.03x │   6.10x │   1.00x │
-│ Large logs (~600KB, no GC)  │   1.00x │   9.90x │   9.02x │   1.46x │
-└─────────────────────────────┴─────────┴─────────┴─────────┴─────────┘
-```
+### ⚡ Total time (compress + decompress, ms — lower is faster)
 
+| Configuration | zlib | lz4 | zstd | brotli |
+|---|---:|---:|---:|---:|
+| Small JSON (~10KB, GC) | 0.05 | 0.01 | 0.02 | 0.14 |
+| Small text (~10KB, GC) | 0.04 | 0.00 | 0.01 | 0.12 |
+| Small JSON (~10KB, no GC) | 0.05 | 0.01 | 0.02 | 0.14 |
+| Small text (~10KB, no GC) | 0.04 | 0.00 | 0.01 | 0.11 |
+| Medium JSON (~370KB, GC) | 2.60 | 0.29 | 0.41 | 2.45 |
+| Medium logs (~168KB, GC) | 1.28 | 0.13 | 0.17 | 0.96 |
+| Medium JSON (~370KB, no GC) | 2.62 | 0.27 | 0.39 | 2.41 |
+| Medium logs (~168KB, no GC) | 1.19 | 0.13 | 0.17 | 1.08 |
+| Large JSON (~1.6MB, GC) | 11.60 | 1.30 | 1.81 | 11.12 |
+| Large logs (~600KB, GC) | 4.11 | 0.41 | 0.46 | 2.99 |
+| Large JSON (~1.6MB, no GC) | 11.26 | 1.24 | 1.77 | 10.77 |
+| Large logs (~600KB, no GC) | 4.01 | 0.42 | 0.45 | 2.90 |
+
+### 📊 Speedup vs zlib by total time (higher is better)
+
+| Configuration | zlib | lz4 | zstd | brotli |
+|---|---:|---:|---:|---:|
+| Small JSON (~10KB, GC) | 1.00x | 5.00x | 2.50x | 0.36x |
+| Small text (~10KB, GC) | 1.00x | N/A | 4.00x | 0.33x |
+| Small JSON (~10KB, no GC) | 1.00x | 5.00x | 2.50x | 0.36x |
+| Small text (~10KB, no GC) | 1.00x | N/A | 4.00x | 0.36x |
+| Medium JSON (~370KB, GC) | 1.00x | 8.97x | 6.34x | 1.06x |
+| Medium logs (~168KB, GC) | 1.00x | 9.85x | 7.53x | 1.33x |
+| Medium JSON (~370KB, no GC) | 1.00x | 9.70x | 6.72x | 1.09x |
+| Medium logs (~168KB, no GC) | 1.00x | 9.15x | 7.00x | 1.10x |
+| Large JSON (~1.6MB, GC) | 1.00x | 8.92x | 6.41x | 1.04x |
+| Large logs (~600KB, GC) | 1.00x | 10.02x | 8.93x | 1.37x |
+| Large JSON (~1.6MB, no GC) | 1.00x | 9.08x | 6.36x | 1.05x |
+| Large logs (~600KB, no GC) | 1.00x | 9.55x | 8.91x | 1.38x |
+
+### 📏 Compressed size (bytes, lower is better)
+
+| Configuration | zlib | lz4 | zstd | brotli |
+|---|---:|---:|---:|---:|
+| Small JSON (~10KB, GC) | 900 | 1544 | 665 | 583 |
+| Small text (~10KB, GC) | 310 | 461 | 322 | 256 |
+| Small JSON (~10KB, no GC) | 900 | 1544 | 665 | 583 |
+| Small text (~10KB, no GC) | 310 | 461 | 322 | 256 |
+| Medium JSON (~370KB, GC) | 31524 | 57986 | 24557 | 20122 |
+| Medium logs (~168KB, GC) | 14488 | 28950 | 8985 | 5549 |
+| Medium JSON (~370KB, no GC) | 31524 | 57986 | 24557 | 20122 |
+| Medium logs (~168KB, no GC) | 14488 | 28950 | 8985 | 5549 |
+| Large JSON (~1.6MB, GC) | 133275 | 250026 | 100965 | 92591 |
+| Large logs (~600KB, GC) | 45432 | 96130 | 17385 | 12250 |
+| Large JSON (~1.6MB, no GC) | 133275 | 250026 | 100965 | 92591 |
+| Large logs (~600KB, no GC) | 45432 | 96130 | 17385 | 12250 |
 
 **Dependencies for benchmarking:**
 - `memory_profiler` — Memory usage analysis
