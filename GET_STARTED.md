@@ -400,7 +400,7 @@ end
 
 Dramatically improves compression on small, similar data (JSON APIs, configs, logs).
 
-**Important**: Dictionary training is available for **Zstd** in the current release (vendored zstd **1.5.2**). Brotli dictionaries can be used, but this gem does not expose Brotli training through `train_dictionary`.
+**Important**: Dictionary training is available for **Zstd** in the current release (vendored zstd **1.5.7**). Brotli dictionaries can be used, but this gem does not expose Brotli training through `train_dictionary`.
 
 ### Training Dictionary (Zstd)
 
@@ -677,9 +677,9 @@ MultiCompress.available?(:zstd)    # => true
 MultiCompress.available?(:fake)    # => false
 
 # Get library versions
-MultiCompress.version(:zstd)       # => "1.5.2"
+MultiCompress.version(:zstd)       # => "1.5.7"
 MultiCompress.version(:lz4)        # => "1.10.0"
-MultiCompress.version(:brotli)     # => "1.1.0"
+MultiCompress.version(:brotli)     # => "1.2.0"
 ```
 
 ### Data Integrity

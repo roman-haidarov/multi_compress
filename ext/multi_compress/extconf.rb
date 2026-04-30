@@ -10,6 +10,14 @@ FORCE_VENDORED = arg_config("--force-vendored") ||
 ZSTD_SUBDIRS   = %w[lib/common lib/compress lib/decompress lib/dictBuilder].freeze
 BROTLI_SUBDIRS = %w[c/common c/enc c/dec].freeze
 LZ4_SOURCES    = %w[lz4.c lz4hc.c lz4frame.c].freeze
+BROTLI_STATIC_INIT_SOURCES = %w[
+  c/enc/static_init.c
+  c/dec/static_init.c
+].freeze
+BROTLI_STATIC_INIT_WRAPPERS = %w[
+  brotli_enc_static_init.c
+  brotli_dec_static_init.c
+].freeze
 
 def find_vendor_dir
   candidates = [
@@ -116,7 +124,20 @@ def collect_vendor_sources(zstd_dir, lz4_dir, brotli_dir)
 
   brotli_srcs = BROTLI_SUBDIRS.flat_map { |d| Dir[File.join(brotli_dir, d, "*.c")] }
 
-  zstd_srcs + lz4_srcs + brotli_srcs
+  # Brotli 1.2.0 has both c/enc/static_init.c and c/dec/static_init.c.
+  # mkmf builds object files by basename, so compiling both as static_init.c
+  # makes one object shadow the other. Use unique wrapper translation units
+  # instead; otherwise the decoder static init can be skipped and crash at runtime.
+  brotli_static_init_paths = BROTLI_STATIC_INIT_SOURCES.map do |relative_path|
+    File.join(brotli_dir, relative_path)
+  end
+  brotli_srcs -= brotli_static_init_paths
+
+  brotli_static_init_wrappers = BROTLI_STATIC_INIT_WRAPPERS.map do |file|
+    File.join(__dir__, file)
+  end
+
+  zstd_srcs + lz4_srcs + brotli_srcs + brotli_static_init_wrappers
 end
 
 def add_include_dirs(zstd_dir, lz4_dir, brotli_dir)
