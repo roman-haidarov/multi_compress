@@ -97,17 +97,19 @@ module MultiCompress
   end
 
   def self.zstd(data, level: nil)
-    compress(data, algo: :zstd, **level_opts(level))
+    compress(data, algo: :zstd, level: level)
   end
 
   def self.lz4(data, level: nil, format: nil)
-    opts = level_opts(level)
-    opts[:format] = format if format
-    compress(data, algo: :lz4, **opts)
+    if format
+      compress(data, algo: :lz4, level: level, format: format)
+    else
+      compress(data, algo: :lz4, level: level)
+    end
   end
 
   def self.brotli(data, level: nil)
-    compress(data, algo: :brotli, **level_opts(level))
+    compress(data, algo: :brotli, level: level)
   end
 
   def self.decompress(data, **opts)
@@ -119,9 +121,11 @@ module MultiCompress
   end
 
   def self.lz4_decompress(data, format: nil)
-    opts = { algo: :lz4 }
-    opts[:format] = format if format
-    decompress(data, **opts)
+    if format
+      decompress(data, algo: :lz4, format: format)
+    else
+      decompress(data, algo: :lz4)
+    end
   end
 
   def self.brotli_decompress(data)
@@ -132,17 +136,13 @@ module MultiCompress
     EXTENSION_MAP[File.extname(path).downcase]
   end
 
-  def self.level_opts(level)
-    level ? { level: level } : {}
-  end
-
   def self.resolved_one_shot_options(opts)
-    resolved = opts.dup
-    resolved[:max_output_size] = config.max_output_size unless resolved.key?(:max_output_size)
-    resolved
+    return opts.merge(max_output_size: config.max_output_size) unless opts.key?(:max_output_size)
+
+    opts
   end
 
-  private_class_method :level_opts, :resolved_one_shot_options
+  private_class_method :resolved_one_shot_options
 
   module InflaterDefaults
     def initialize(*args, **opts)
@@ -248,6 +248,7 @@ module MultiCompress
 
   class Reader
     CHUNK_SIZE = 8192
+    BUFFER_COMPACT_THRESHOLD = 64 * 1024
 
     def self.open(path_or_io, algo: nil, dictionary: nil, **opts, &block)
       io, algo, owned = resolve_io(path_or_io, algo, mode: "rb")
@@ -264,12 +265,13 @@ module MultiCompress
     end
 
     def initialize(io, algo: nil, dictionary: nil, **opts)
-      @io       = io
-      @inflater = Inflater.new(algo: algo, dictionary: dictionary, **opts)
-      @closed   = false
-      @owned_io = false
-      @buffer   = +""
-      @eof      = false
+      @io          = io
+      @inflater    = Inflater.new(algo: algo, dictionary: dictionary, **opts)
+      @closed      = false
+      @owned_io    = false
+      @buffer      = +"".b
+      @buffer_pos  = 0
+      @eof         = false
     end
 
     def read(length = nil)
@@ -281,12 +283,12 @@ module MultiCompress
 
     def gets(separator = "\n")
       ensure_open!
-      return nil if @eof && @buffer.empty?
+      return nil if @eof && buffer_empty?
 
-      fill_buffer_until { @buffer.include?(separator) }
+      fill_buffer_until { buffer_includes?(separator) }
 
-      return extract_line(separator) if @buffer.include?(separator)
-      return consume_buffer unless @buffer.empty?
+      return extract_line(separator) if buffer_includes?(separator)
+      return consume_buffer unless buffer_empty?
 
       nil
     end
@@ -305,7 +307,7 @@ module MultiCompress
     end
 
     def eof?
-      @eof && @buffer.empty?
+      @eof && buffer_empty?
     end
 
     def each_line
@@ -334,11 +336,44 @@ module MultiCompress
       raise StreamError, "reader is closed" if @closed
     end
 
-    def read_all
-      return nil if @eof && @buffer.empty?
+    def buffer_size
+      @buffer.bytesize - @buffer_pos
+    end
 
-      result = @buffer.dup
+    def buffer_empty?
+      @buffer_pos >= @buffer.bytesize
+    end
+
+    def buffer_append(data)
+      compact_buffer_if_needed
+      @buffer << data
+    end
+
+    def compact_buffer_if_needed
+      return if @buffer_pos == 0
+
+      total = @buffer.bytesize
+      return unless @buffer_pos >= BUFFER_COMPACT_THRESHOLD && @buffer_pos * 2 >= total
+
+      @buffer = @buffer.byteslice(@buffer_pos, total - @buffer_pos)
+      @buffer_pos = 0
+    end
+
+    def buffer_includes?(separator)
+      idx = @buffer.index(separator, @buffer_pos)
+      !idx.nil?
+    end
+
+    def read_all
+      return nil if @eof && buffer_empty?
+
+      result = if buffer_empty?
+        +"".b
+      else
+        @buffer.byteslice(@buffer_pos, @buffer.bytesize - @buffer_pos) || +"".b
+      end
       @buffer.clear
+      @buffer_pos = 0
 
       until @eof
         chunk = read_compressed_chunk
@@ -355,15 +390,16 @@ module MultiCompress
     end
 
     def read_exactly(length)
-      return nil if @eof && @buffer.empty?
+      return nil if @eof && buffer_empty?
 
-      fill_buffer_until { @buffer.bytesize >= length }
+      fill_buffer_until { buffer_size >= length }
 
-      if @buffer.bytesize >= length
-        result  = @buffer[0, length]
-        @buffer = @buffer[length..]
+      if buffer_size >= length
+        result = @buffer.byteslice(@buffer_pos, length)
+        @buffer_pos += length
+        compact_buffer_if_needed
         result
-      elsif !@buffer.empty?
+      elsif !buffer_empty?
         consume_buffer
       end
     end
@@ -376,20 +412,23 @@ module MultiCompress
           break
         end
         decompressed = @inflater.write(chunk)
-        @buffer << decompressed if decompressed
+        buffer_append(decompressed) if decompressed
       end
     end
 
     def extract_line(separator)
-      idx = @buffer.index(separator)
-      result = @buffer[0, idx + separator.bytesize]
-      @buffer = @buffer[(idx + separator.bytesize)..] || +""
+      idx = @buffer.index(separator, @buffer_pos)
+      end_pos = idx + separator.bytesize
+      result = @buffer.byteslice(@buffer_pos, end_pos - @buffer_pos)
+      @buffer_pos = end_pos
+      compact_buffer_if_needed
       result
     end
 
     def consume_buffer
-      result  = @buffer
-      @buffer = +""
+      result = @buffer.byteslice(@buffer_pos, @buffer.bytesize - @buffer_pos) || +"".b
+      @buffer.clear
+      @buffer_pos = 0
       result
     end
 

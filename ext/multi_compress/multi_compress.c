@@ -95,6 +95,97 @@ typedef enum { LZ4_FORMAT_BLOCK = 0, LZ4_FORMAT_FRAME = 1 } lz4_format_t;
 
 #define MC_NUM_ALGOS 3
 
+static pthread_once_t zstd_tls_once = PTHREAD_ONCE_INIT;
+static pthread_key_t zstd_cctx_key;
+static pthread_key_t zstd_dctx_key;
+
+static void zstd_tls_free_cctx(void *ptr) {
+    if (ptr)
+        ZSTD_freeCCtx((ZSTD_CCtx *)ptr);
+}
+
+static void zstd_tls_free_dctx(void *ptr) {
+    if (ptr)
+        ZSTD_freeDCtx((ZSTD_DCtx *)ptr);
+}
+
+static void zstd_tls_init(void) {
+    if (pthread_key_create(&zstd_cctx_key, zstd_tls_free_cctx) != 0)
+        abort();
+    if (pthread_key_create(&zstd_dctx_key, zstd_tls_free_dctx) != 0)
+        abort();
+}
+
+static ZSTD_CCtx *zstd_tls_get_cctx(void) {
+    pthread_once(&zstd_tls_once, zstd_tls_init);
+
+    ZSTD_CCtx *cctx = (ZSTD_CCtx *)pthread_getspecific(zstd_cctx_key);
+    if (cctx)
+        return cctx;
+
+    cctx = ZSTD_createCCtx();
+    if (!cctx)
+        return NULL;
+
+    if (pthread_setspecific(zstd_cctx_key, cctx) != 0) {
+        ZSTD_freeCCtx(cctx);
+        return NULL;
+    }
+
+    return cctx;
+}
+
+static ZSTD_DCtx *zstd_tls_get_dctx(void) {
+    pthread_once(&zstd_tls_once, zstd_tls_init);
+
+    ZSTD_DCtx *dctx = (ZSTD_DCtx *)pthread_getspecific(zstd_dctx_key);
+    if (dctx)
+        return dctx;
+
+    dctx = ZSTD_createDCtx();
+    if (!dctx)
+        return NULL;
+
+    if (pthread_setspecific(zstd_dctx_key, dctx) != 0) {
+        ZSTD_freeDCtx(dctx);
+        return NULL;
+    }
+
+    return dctx;
+}
+
+static size_t zstd_compress_cached(char *dst, size_t dst_cap, const char *src, size_t src_len,
+                                   int level, ZSTD_CDict *cdict, int *ctx_error) {
+    *ctx_error = 0;
+
+    ZSTD_CCtx *cctx = zstd_tls_get_cctx();
+    if (!cctx) {
+        *ctx_error = 1;
+        return 0;
+    }
+
+    if (cdict)
+        return ZSTD_compress_usingCDict(cctx, dst, dst_cap, src, src_len, cdict);
+
+    return ZSTD_compressCCtx(cctx, dst, dst_cap, src, src_len, level);
+}
+
+static size_t zstd_decompress_cached(void *dst, size_t dst_cap, const void *src, size_t src_len,
+                                     ZSTD_DDict *ddict, int *ctx_error) {
+    *ctx_error = 0;
+
+    ZSTD_DCtx *dctx = zstd_tls_get_dctx();
+    if (!dctx) {
+        *ctx_error = 1;
+        return 0;
+    }
+
+    if (ddict)
+        return ZSTD_decompress_usingDDict(dctx, dst, dst_cap, src, src_len, ddict);
+
+    return ZSTD_decompressDCtx(dctx, dst, dst_cap, src, src_len);
+}
+
 _Static_assert(ALGO_BROTLI == MC_NUM_ALGOS - 1,
                "compress_algo_t must be contiguous [0..MC_NUM_ALGOS-1]");
 
@@ -439,8 +530,6 @@ static inline VALUE rb_binary_str_buf_new(long capa) {
 static inline VALUE rb_binary_str_buf_reserve(long capa) {
     VALUE str = rb_str_buf_new(capa);
     rb_enc_associate(str, binary_encoding);
-    if (capa > 0)
-        rb_str_modify_expand(str, capa + 1);
     return str;
 }
 
@@ -689,13 +778,19 @@ static inline size_t fiber_maybe_yield(size_t bytes_since_yield, size_t just_pro
     return bytes_since_yield;
 }
 
-#define DICT_CDICT_CACHE_SIZE 22
-_Static_assert(DICT_CDICT_CACHE_SIZE > 0, "CDict cache needs at least one slot");
+#define DICT_ZSTD_MIN_LEVEL   1
+#define DICT_ZSTD_MAX_LEVEL   22
+#define DICT_CDICT_CACHE_SIZE (DICT_ZSTD_MAX_LEVEL + 1)
+_Static_assert(DICT_CDICT_CACHE_SIZE > DICT_ZSTD_MAX_LEVEL,
+               "CDict cache needs one slot for every accepted zstd level");
 
-typedef struct {
-    int level;
-    ZSTD_CDict *cdict;
-} cdict_cache_entry_t;
+#if defined(__GNUC__) || defined(__clang__)
+#define MC_HAS_ATOMIC_PTR             1
+#define MC_ATOMIC_LOAD_PTR(ptr)       __atomic_load_n((ptr), __ATOMIC_ACQUIRE)
+#define MC_ATOMIC_STORE_PTR(ptr, val) __atomic_store_n((ptr), (val), __ATOMIC_RELEASE)
+#else
+#define MC_HAS_ATOMIC_PTR 0
+#endif
 
 struct dictionary_s {
     compress_algo_t algo;
@@ -703,8 +798,7 @@ struct dictionary_s {
     size_t size;
     pthread_mutex_t cache_mutex;
 
-    cdict_cache_entry_t cdict_cache[DICT_CDICT_CACHE_SIZE];
-    int cdict_cache_count;
+    ZSTD_CDict *cdict_cache[DICT_CDICT_CACHE_SIZE];
 
     ZSTD_DDict *ddict;
 };
@@ -713,9 +807,9 @@ static void dict_free(void *ptr) {
     dictionary_t *dict = (dictionary_t *)ptr;
     if (!dict)
         return;
-    for (int i = 0; i < dict->cdict_cache_count; i++) {
-        if (dict->cdict_cache[i].cdict)
-            ZSTD_freeCDict(dict->cdict_cache[i].cdict);
+    for (int i = DICT_ZSTD_MIN_LEVEL; i <= DICT_ZSTD_MAX_LEVEL; i++) {
+        if (dict->cdict_cache[i])
+            ZSTD_freeCDict(dict->cdict_cache[i]);
     }
     if (dict->ddict)
         ZSTD_freeDDict(dict->ddict);
@@ -732,9 +826,9 @@ static size_t dict_memsize(const void *ptr) {
 
     size_t total = sizeof(dictionary_t) + d->size;
     if (d->algo == ALGO_ZSTD) {
-        for (int i = 0; i < d->cdict_cache_count; i++) {
-            if (d->cdict_cache[i].cdict)
-                total += ZSTD_sizeof_CDict(d->cdict_cache[i].cdict);
+        for (int i = DICT_ZSTD_MIN_LEVEL; i <= DICT_ZSTD_MAX_LEVEL; i++) {
+            if (d->cdict_cache[i])
+                total += ZSTD_sizeof_CDict(d->cdict_cache[i]);
         }
         if (d->ddict)
             total += ZSTD_sizeof_DDict(d->ddict);
@@ -756,17 +850,18 @@ static VALUE dict_alloc(VALUE klass) {
 }
 
 static ZSTD_CDict *dict_get_cdict(dictionary_t *dict, int level) {
-    ZSTD_CDict *existing = NULL;
+    if (MC_UNLIKELY(level < DICT_ZSTD_MIN_LEVEL || level > DICT_ZSTD_MAX_LEVEL))
+        rb_raise(eLevelError, "zstd level must be %d..%d, got %d", DICT_ZSTD_MIN_LEVEL,
+                 DICT_ZSTD_MAX_LEVEL, level);
 
+    ZSTD_CDict *existing;
+#if MC_HAS_ATOMIC_PTR
+    existing = MC_ATOMIC_LOAD_PTR(&dict->cdict_cache[level]);
+#else
     pthread_mutex_lock(&dict->cache_mutex);
-    for (int i = 0; i < dict->cdict_cache_count; i++) {
-        if (dict->cdict_cache[i].level == level) {
-            existing = dict->cdict_cache[i].cdict;
-            break;
-        }
-    }
+    existing = dict->cdict_cache[level];
     pthread_mutex_unlock(&dict->cache_mutex);
-
+#endif
     if (existing)
         return existing;
 
@@ -775,34 +870,31 @@ static ZSTD_CDict *dict_get_cdict(dictionary_t *dict, int level) {
         return NULL;
 
     pthread_mutex_lock(&dict->cache_mutex);
-    for (int i = 0; i < dict->cdict_cache_count; i++) {
-        if (dict->cdict_cache[i].level == level) {
-            existing = dict->cdict_cache[i].cdict;
-            pthread_mutex_unlock(&dict->cache_mutex);
-            ZSTD_freeCDict(cdict);
-            return existing;
-        }
-    }
-
-    if (dict->cdict_cache_count >= DICT_CDICT_CACHE_SIZE) {
+    existing = dict->cdict_cache[level];
+    if (!existing) {
+#if MC_HAS_ATOMIC_PTR
+        MC_ATOMIC_STORE_PTR(&dict->cdict_cache[level], cdict);
+#else
+        dict->cdict_cache[level] = cdict;
+#endif
         pthread_mutex_unlock(&dict->cache_mutex);
-        ZSTD_freeCDict(cdict);
-        rb_raise(eError, "zstd dictionary cdict cache exhausted");
+        return cdict;
     }
 
-    dict->cdict_cache[dict->cdict_cache_count].level = level;
-    dict->cdict_cache[dict->cdict_cache_count].cdict = cdict;
-    dict->cdict_cache_count++;
     pthread_mutex_unlock(&dict->cache_mutex);
-    return cdict;
+    ZSTD_freeCDict(cdict);
+    return existing;
 }
 
 static ZSTD_DDict *dict_get_ddict(dictionary_t *dict) {
     ZSTD_DDict *existing;
-
+#if MC_HAS_ATOMIC_PTR
+    existing = MC_ATOMIC_LOAD_PTR(&dict->ddict);
+#else
     pthread_mutex_lock(&dict->cache_mutex);
     existing = dict->ddict;
     pthread_mutex_unlock(&dict->cache_mutex);
+#endif
     if (existing)
         return existing;
 
@@ -811,12 +903,17 @@ static ZSTD_DDict *dict_get_ddict(dictionary_t *dict) {
         return NULL;
 
     pthread_mutex_lock(&dict->cache_mutex);
-    if (!dict->ddict) {
+    existing = dict->ddict;
+    if (!existing) {
+#if MC_HAS_ATOMIC_PTR
+        MC_ATOMIC_STORE_PTR(&dict->ddict, created);
+#else
         dict->ddict = created;
+#endif
         pthread_mutex_unlock(&dict->cache_mutex);
         return created;
     }
-    existing = dict->ddict;
+
     pthread_mutex_unlock(&dict->cache_mutex);
     ZSTD_freeDDict(created);
     return existing;
@@ -835,19 +932,8 @@ typedef struct {
 
 static void *zstd_compress_nogvl(void *arg) {
     zstd_compress_args_t *a = (zstd_compress_args_t *)arg;
-    if (a->cdict) {
-        ZSTD_CCtx *cctx = ZSTD_createCCtx();
-        if (!cctx) {
-            a->error = 1;
-            return NULL;
-        }
-        a->result =
-            ZSTD_compress_usingCDict(cctx, a->dst, a->dst_cap, a->src, a->src_len, a->cdict);
-        ZSTD_freeCCtx(cctx);
-    } else {
-        a->result = ZSTD_compress(a->dst, a->dst_cap, a->src, a->src_len, a->level);
-    }
-    a->error = 0;
+    a->result =
+        zstd_compress_cached(a->dst, a->dst_cap, a->src, a->src_len, a->level, a->cdict, &a->error);
     return NULL;
 }
 
@@ -863,19 +949,7 @@ typedef struct {
 
 static void *zstd_decompress_nogvl(void *arg) {
     zstd_decompress_args_t *a = (zstd_decompress_args_t *)arg;
-    if (a->ddict) {
-        ZSTD_DCtx *dctx = ZSTD_createDCtx();
-        if (!dctx) {
-            a->error = 1;
-            return NULL;
-        }
-        a->result =
-            ZSTD_decompress_usingDDict(dctx, a->dst, a->dst_cap, a->src, a->src_len, a->ddict);
-        ZSTD_freeDCtx(dctx);
-    } else {
-        a->result = ZSTD_decompress(a->dst, a->dst_cap, a->src, a->src_len);
-    }
-    a->error = 0;
+    a->result = zstd_decompress_cached(a->dst, a->dst_cap, a->src, a->src_len, a->ddict, &a->error);
     return NULL;
 }
 
@@ -1168,18 +1242,8 @@ static void *brotli_decompress_stream_fiber_nogvl(void *arg) {
 
 static void *zstd_fiber_compress_nogvl(void *arg) {
     zstd_fiber_compress_t *a = (zstd_fiber_compress_t *)arg;
-    if (a->cdict) {
-        ZSTD_CCtx *cctx = ZSTD_createCCtx();
-        if (!cctx) {
-            a->error = 1;
-            return NULL;
-        }
-        a->result =
-            ZSTD_compress_usingCDict(cctx, a->dst, a->dst_cap, a->src, a->src_len, a->cdict);
-        ZSTD_freeCCtx(cctx);
-    } else {
-        a->result = ZSTD_compress(a->dst, a->dst_cap, a->src, a->src_len, a->level);
-    }
+    a->result =
+        zstd_compress_cached(a->dst, a->dst_cap, a->src, a->src_len, a->level, a->cdict, &a->error);
     return NULL;
 }
 
@@ -1226,16 +1290,11 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
 
         if (slen < policy->gvl_unlock_threshold) {
             VALUE dst = rb_binary_str_buf_reserve(bound);
-            size_t csize;
-            if (cdict) {
-                ZSTD_CCtx *cctx = ZSTD_createCCtx();
-                if (!cctx)
-                    rb_raise(eMemError, "zstd: failed to create context");
-                csize = ZSTD_compress_usingCDict(cctx, RSTRING_PTR(dst), bound, src, slen, cdict);
-                ZSTD_freeCCtx(cctx);
-            } else {
-                csize = ZSTD_compress(RSTRING_PTR(dst), bound, src, slen, level);
-            }
+            int ctx_error = 0;
+            size_t csize =
+                zstd_compress_cached(RSTRING_PTR(dst), bound, src, slen, level, cdict, &ctx_error);
+            if (ctx_error)
+                rb_raise(eMemError, "zstd: failed to create context");
             if (ZSTD_isError(csize))
                 rb_raise(eError, "zstd compress: %s", ZSTD_getErrorName(csize));
             rb_str_set_len(dst, (long)csize);
@@ -1416,8 +1475,18 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
                 rb_raise(eMemError, "brotli: failed to prepare dictionary");
             }
 
-            if (!BrotliEncoderSetParameter(enc, BROTLI_PARAM_QUALITY, level) ||
-                !BrotliEncoderAttachPreparedDictionary(enc, pd)) {
+            if (!BrotliEncoderSetParameter(enc, BROTLI_PARAM_QUALITY, level)) {
+                BrotliEncoderDestroyPreparedDictionary(pd);
+                BrotliEncoderDestroyInstance(enc);
+                rb_raise(eError, "brotli: failed to set quality parameter");
+            }
+            if (!BrotliEncoderSetParameter(enc, BROTLI_PARAM_SIZE_HINT,
+                                           slen > UINT32_MAX ? UINT32_MAX : (uint32_t)slen)) {
+                BrotliEncoderDestroyPreparedDictionary(pd);
+                BrotliEncoderDestroyInstance(enc);
+                rb_raise(eError, "brotli: failed to set size hint parameter");
+            }
+            if (!BrotliEncoderAttachPreparedDictionary(enc, pd)) {
                 BrotliEncoderDestroyPreparedDictionary(pd);
                 BrotliEncoderDestroyInstance(enc);
                 rb_raise(eError, "brotli: failed to attach dictionary");
@@ -1576,19 +1645,18 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
             } else {
                 VALUE dst = rb_binary_str_buf_reserve((size_t)frame_size);
 
+                ZSTD_DDict *ddict = NULL;
                 if (dict) {
-                    ZSTD_DDict *ddict = dict_get_ddict(dict);
+                    ddict = dict_get_ddict(dict);
                     if (!ddict)
                         rb_raise(eMemError, "zstd: failed to create ddict");
-                    ZSTD_DCtx *dctx = ZSTD_createDCtx();
-                    if (!dctx)
-                        rb_raise(eMemError, "zstd: failed to create dctx");
-                    dsize = ZSTD_decompress_usingDDict(dctx, RSTRING_PTR(dst), (size_t)frame_size,
-                                                       src, slen, ddict);
-                    ZSTD_freeDCtx(dctx);
-                } else {
-                    dsize = ZSTD_decompress(RSTRING_PTR(dst), (size_t)frame_size, src, slen);
                 }
+
+                int ctx_error = 0;
+                dsize = zstd_decompress_cached(RSTRING_PTR(dst), (size_t)frame_size, src, slen,
+                                               ddict, &ctx_error);
+                if (ctx_error)
+                    rb_raise(eMemError, "zstd: failed to create dctx");
 
                 if (ZSTD_isError(dsize))
                     rb_raise(eDataError, "zstd decompress: %s", ZSTD_getErrorName(dsize));
@@ -1601,16 +1669,21 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
             }
         }
 
-        ZSTD_DCtx *dctx = ZSTD_createDCtx();
+        ZSTD_DCtx *dctx = zstd_tls_get_dctx();
         if (!dctx)
             rb_raise(eMemError, "zstd: failed to create dctx");
+
+        {
+            size_t r = ZSTD_DCtx_reset(dctx, ZSTD_reset_session_and_parameters);
+            if (ZSTD_isError(r))
+                rb_raise(eError, "zstd dctx reset: %s", ZSTD_getErrorName(r));
+        }
 
         if (dict) {
             ZSTD_DDict *ddict = dict_get_ddict(dict);
             if (ddict) {
                 size_t r = ZSTD_DCtx_refDDict(dctx, ddict);
                 if (ZSTD_isError(r)) {
-                    ZSTD_freeDCtx(dctx);
                     rb_raise(eError, "zstd dict ref: %s", ZSTD_getErrorName(r));
                 }
             }
@@ -1629,7 +1702,6 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
         while (input.pos < input.size) {
             if (total_out >= alloc_size) {
                 if (alloc_size >= limits.max_output_size) {
-                    ZSTD_freeDCtx(dctx);
                     rb_raise(eDataError, "decompressed output exceeds limit (%zu bytes)",
                              limits.max_output_size);
                 }
@@ -1642,7 +1714,6 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
 
             size_t remaining_budget = limits.max_output_size - total_out;
             if (remaining_budget == 0) {
-                ZSTD_freeDCtx(dctx);
                 rb_raise(eDataError, "decompressed output exceeds limit (%zu bytes)",
                          limits.max_output_size);
             }
@@ -1654,7 +1725,6 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
             ZSTD_outBuffer output = {RSTRING_PTR(dst) + total_out, out_cap, 0};
             size_t ret = ZSTD_decompressStream(dctx, &output, &input);
             if (ZSTD_isError(ret)) {
-                ZSTD_freeDCtx(dctx);
                 rb_raise(eDataError, "zstd decompress: %s", ZSTD_getErrorName(ret));
             }
             total_out = checked_add_size(total_out, output.pos,
@@ -1665,7 +1735,6 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                 break;
         }
 
-        ZSTD_freeDCtx(dctx);
         rb_str_set_len(dst, total_out);
         RB_GC_GUARD(data);
         RB_GC_GUARD(dict_val);
@@ -1875,7 +1944,7 @@ static void crc32_init_tables(void) {
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t crc = i;
         for (int j = 0; j < 8; j++) {
-            crc = (crc >> 1) ^ (0xEDB88320 & (-(int32_t)(crc & 1)));
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
         }
         crc32_tables[0][i] = crc;
     }
@@ -2189,6 +2258,10 @@ static VALUE lz4_compress_ring_block(deflater_t *d) {
 
     write_le_u32((uint8_t *)out, (uint32_t)src_size);
 
+    /* Keep blocks independently decodable. Switching to LZ4_*_continue would
+     * require a coordinated format/decoder change that preserves dictionaries
+     * across blocks.
+     */
     int csize;
     if (d->level > 1) {
         csize = LZ4_compress_HC(block_start, out + 8, src_size, bound, d->level);
@@ -2979,13 +3052,24 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
     }
     case ALGO_LZ4: {
         size_t data_len = inf->lz4_buf.len - inf->lz4_buf.offset;
-        size_t needed = data_len + slen;
+        size_t needed =
+            checked_add_size(data_len, slen, "lz4 stream input buffer exceeds representable size");
 
-        if (inf->lz4_buf.offset > 0 && needed > inf->lz4_buf.cap) {
-            if (data_len > 0)
-                memmove(inf->lz4_buf.buf, inf->lz4_buf.buf + inf->lz4_buf.offset, data_len);
-            inf->lz4_buf.offset = 0;
-            inf->lz4_buf.len = data_len;
+        if (needed > inf->lz4_buf.cap) {
+            size_t new_cap = needed > SIZE_MAX / 2 ? needed : needed * 2;
+            if (inf->lz4_buf.offset > 0) {
+                char *new_buf = ALLOC_N(char, new_cap);
+                if (data_len > 0)
+                    memcpy(new_buf, inf->lz4_buf.buf + inf->lz4_buf.offset, data_len);
+                xfree(inf->lz4_buf.buf);
+                inf->lz4_buf.buf = new_buf;
+                inf->lz4_buf.offset = 0;
+                inf->lz4_buf.len = data_len;
+                inf->lz4_buf.cap = new_cap;
+            } else {
+                REALLOC_N(inf->lz4_buf.buf, char, new_cap);
+                inf->lz4_buf.cap = new_cap;
+            }
         } else if (inf->lz4_buf.offset > inf->lz4_buf.cap / 2) {
             if (data_len > 0)
                 memmove(inf->lz4_buf.buf, inf->lz4_buf.buf + inf->lz4_buf.offset, data_len);
@@ -2993,11 +3077,6 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
             inf->lz4_buf.len = data_len;
         }
 
-        needed = inf->lz4_buf.len + slen;
-        if (needed > inf->lz4_buf.cap) {
-            inf->lz4_buf.cap = needed * 2;
-            REALLOC_N(inf->lz4_buf.buf, char, inf->lz4_buf.cap);
-        }
         memcpy(inf->lz4_buf.buf + inf->lz4_buf.len, src, slen);
         inf->lz4_buf.len += slen;
 

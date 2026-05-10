@@ -1,6 +1,7 @@
 require "minitest/autorun"
 require "multi_compress"
 require "stringio"
+require "zlib"
 
 class TestMultiCompress < Minitest::Test
   def setup
@@ -209,20 +210,24 @@ class TestMultiCompress < Minitest::Test
     crc1 = MultiCompress.crc32(@data)
     crc2 = MultiCompress.crc32(@data)
     assert_equal crc1, crc2, "CRC32 should be deterministic"
+    assert_equal Zlib.crc32(@data), crc1, "CRC32 should match zlib's IEEE CRC32"
 
     crc_part1 = MultiCompress.crc32(@data[0, 10])
     crc_full = MultiCompress.crc32(@data[10..-1], crc_part1)
     assert_equal MultiCompress.crc32(@data), crc_full, "Incremental CRC32 should work"
+    assert_equal Zlib.crc32(@data[10..-1], Zlib.crc32(@data[0, 10])), crc_full
   end
 
   def test_adler32
     adler1 = MultiCompress.adler32(@data)
     adler2 = MultiCompress.adler32(@data)
     assert_equal adler1, adler2, "Adler32 should be deterministic"
+    assert_equal Zlib.adler32(@data), adler1, "Adler32 should match zlib"
 
     adler_part1 = MultiCompress.adler32(@data[0, 10])
     adler_full = MultiCompress.adler32(@data[10..-1], adler_part1)
     assert_equal MultiCompress.adler32(@data), adler_full, "Incremental Adler32 should work"
+    assert_equal Zlib.adler32(@data[10..-1], Zlib.adler32(@data[0, 10])), adler_full
   end
 
   

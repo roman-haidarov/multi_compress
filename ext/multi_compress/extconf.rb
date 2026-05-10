@@ -6,6 +6,8 @@ USE_SYSTEM = arg_config("--use-system-libraries") ||
              ENV["COMPRESS_USE_SYSTEM_LIBRARIES"]
 FORCE_VENDORED = arg_config("--force-vendored") ||
                  ENV["COMPRESS_FORCE_VENDORED"]
+DISABLE_ZSTD_ASM = arg_config("--disable-zstd-asm") ||
+                   ENV["MULTI_COMPRESS_DISABLE_ZSTD_ASM"] == "1"
 
 ZSTD_SUBDIRS   = %w[lib/common lib/compress lib/decompress lib/dictBuilder].freeze
 BROTLI_SUBDIRS = %w[c/common c/enc c/dec].freeze
@@ -53,6 +55,15 @@ def find_compress_c_dir
             &.then { |path| File.expand_path(path) } || __dir__
 end
 
+def zstd_asm_supported?
+  case RUBY_PLATFORM
+  when /x86_64|amd64/
+    !RUBY_PLATFORM.include?("mswin") && !RUBY_PLATFORM.include?("mingw")
+  else
+    false
+  end
+end
+
 def configure_system_libraries
   puts "Building with SYSTEM libraries"
 
@@ -98,7 +109,10 @@ def configure_vendored_libraries(vendor_dir)
   puts "  #{all_vendor_srcs.length} vendored C files"
 
   add_include_dirs(zstd_dir, lz4_dir, brotli_dir)
-  $CPPFLAGS += " -DZSTD_DISABLE_ASM"
+  if DISABLE_ZSTD_ASM
+    $CPPFLAGS += " -DZSTD_DISABLE_ASM"
+    puts "  ZSTD ASM Huffman decoder disabled (--disable-zstd-asm or MULTI_COMPRESS_DISABLE_ZSTD_ASM=1)"
+  end
 
   vpath_dirs = build_vpath_dirs(zstd_dir, lz4_dir, brotli_dir)
 
@@ -106,8 +120,13 @@ def configure_vendored_libraries(vendor_dir)
 
   compress_c_dir = find_compress_c_dir
 
-  $srcs  = ["multi_compress.c"] + all_vendor_srcs.map { |s| File.basename(s) }
+  c_srcs   = all_vendor_srcs.reject { |s| s.end_with?(".S") }
+  asm_srcs = all_vendor_srcs.select { |s| s.end_with?(".S") }
+
+  $srcs  = ["multi_compress.c"] + c_srcs.map { |s| File.basename(s) }
   $VPATH = [compress_c_dir] + vpath_dirs
+
+  $multi_compress_asm_srcs = asm_srcs
 
   $warnflags = ""
 
@@ -116,6 +135,11 @@ end
 
 def collect_vendor_sources(zstd_dir, lz4_dir, brotli_dir)
   zstd_srcs = ZSTD_SUBDIRS.flat_map { |d| Dir[File.join(zstd_dir, d, "*.c")] }
+
+  unless DISABLE_ZSTD_ASM
+    asm = File.join(zstd_dir, "lib", "decompress", "huf_decompress_amd64.S")
+    zstd_srcs << asm if File.exist?(asm) && zstd_asm_supported?
+  end
 
   lz4_srcs = LZ4_SOURCES.filter_map do |f|
     path = File.join(lz4_dir, "lib", f)
@@ -178,6 +202,36 @@ def patch_makefile_vpath!(vpath_dirs)
   puts "  Patched Makefile with #{vpath_dirs.length} VPATH entries"
 end
 
+def patch_makefile_asm!(asm_srcs)
+  return if asm_srcs.nil? || asm_srcs.empty?
+
+  makefile = File.read("Makefile")
+  return if makefile.include?("# vendored asm")
+
+  asm_dirs = asm_srcs.map { |s| File.dirname(s) }.uniq
+  vpath_lines = asm_dirs.map { |d| "vpath %.S #{d}" }.join("\n")
+
+  asm_objs = asm_srcs.map { |s| File.basename(s, ".S") + ".o" }
+  obj_append = asm_objs.join(" ")
+
+  unless makefile.sub!(/^(OBJS\s*=\s*[^\n]+?)(\s*)$/) { "#{Regexp.last_match(1)} #{obj_append}#{Regexp.last_match(2)}" }
+    makefile << "\nOBJS = #{obj_append}\n"
+  end
+
+  pattern_rule = <<~MAKE
+    # vendored asm
+    #{vpath_lines}
+    %.o: %.S
+    \t$(ECHO) compiling $(<)
+    \t$(Q) $(CC) $(INCFLAGS) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+  MAKE
+
+  makefile << "\n#{pattern_rule}\n"
+
+  File.write("Makefile", makefile)
+  puts "  Patched Makefile with #{asm_srcs.length} ASM source(s): #{asm_objs.join(", ")}"
+end
+
 # --- Main ---
 
 VENDOR_DIR = find_vendor_dir
@@ -211,3 +265,4 @@ have_library("pthread") unless RUBY_PLATFORM.include?("darwin")
 create_makefile("multi_compress/multi_compress")
 
 patch_makefile_vpath!(vpath_dirs) if VENDORED && !USE_SYSTEM && vpath_dirs
+patch_makefile_asm!($multi_compress_asm_srcs) if VENDORED && !USE_SYSTEM && $multi_compress_asm_srcs

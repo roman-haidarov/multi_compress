@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.4]
+
+### Changed
+- Improved one-shot Zstd performance by reusing per-thread CCtx/DCtx.
+- On deterministic arm64-darwin benchmarks, total zstd roundtrip improved by ~11–19% on ~10KB payloads,
+  ~1–4% on medium payloads, and ~2–6% on log-like large payloads, with identical compressed sizes.
+
 ## [0.3.3]
 
 ### Changed
