@@ -1,7 +1,10 @@
 #include <ruby.h>
 #include <ruby/encoding.h>
 #include <ruby/thread.h>
+
+#ifdef HAVE_RUBY_FIBER_SCHEDULER_H
 #include <ruby/fiber/scheduler.h>
+#endif
 #include <brotli/decode.h>
 #include <brotli/encode.h>
 #include <lz4.h>
@@ -616,10 +619,16 @@ static inline void enforce_output_and_ratio_limits(size_t total_output, size_t t
 }
 
 static VALUE current_fiber_scheduler(void) {
+#ifdef HAVE_RUBY_FIBER_SCHEDULER_H
     VALUE sched = rb_fiber_scheduler_current();
+
     if (sched == Qnil || sched == Qfalse)
         return Qnil;
+
     return sched;
+#else
+    return Qnil;
+#endif
 }
 
 static int has_fiber_scheduler(void) {

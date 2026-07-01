@@ -43,10 +43,10 @@ class TestDocsParity < Minitest::Test
     assert_match(/not supported/i, error.message)
   end
 
-  def test_gemspec_required_ruby_version_is_at_least_3_1
+  def test_gemspec_required_ruby_version_is_at_least_2_7_1
     spec = Gem::Specification.load(File.expand_path("../multi_compress.gemspec", __dir__))
 
-    assert spec.required_ruby_version.satisfied_by?(Gem::Version.new("3.1.0"))
-    refute spec.required_ruby_version.satisfied_by?(Gem::Version.new("3.0.9"))
+    assert spec.required_ruby_version.satisfied_by?(Gem::Version.new("2.7.1"))
+    refute spec.required_ruby_version.satisfied_by?(Gem::Version.new("2.7.0"))
   end
 end

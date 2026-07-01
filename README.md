@@ -33,7 +33,7 @@ Bundled library versions in the current release:
 - **Zero external dependencies**: All C libraries are vendored and compiled
 - **Unified API**: Same interface for all algorithms — just change the `algo:` parameter
 - **Performance first**: Direct bindings to C libraries, minimal overhead
-- **Fiber-friendly**: Compression and decompression cooperate with Ruby's fiber scheduler — safe to use under `async`, `falcon`, or any `Fiber::Scheduler`-based runtime without blocking the event loop. See [GET_STARTED.md](GET_STARTED.md) for details and examples.
+- **Fiber-friendly when available**: On Ruby runtimes exposing the Fiber Scheduler C API, compression and decompression cooperate with an active `Fiber::Scheduler` — safe to use under `async`, `falcon`, or similar runtimes without blocking the event loop. On Ruby 2.7.1, the same API works through the normal direct/NOGVL execution paths. See [GET_STARTED.md](GET_STARTED.md) for details and examples.
 - **Memory efficient**: Streaming support for large datasets, proper resource cleanup
 - **Operationally focused**: Clear errors, comprehensive tests, and streaming support for practical workloads
 
@@ -174,7 +174,7 @@ Or use the build script:
 
 ## Requirements
 
-- Ruby >= 3.1.0
+- Ruby >= 2.7.1
 - C compiler (gcc, clang)
 
 ## License
