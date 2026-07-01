@@ -188,7 +188,7 @@ end
 
 ## Fiber-friendly Execution
 
-Starting with **v0.2.0**, MultiCompress is fully fiber-friendly and plays nicely with Ruby's `Fiber::Scheduler`-based runtimes like [async](https://github.com/socketry/async) and [falcon](https://github.com/socketry/falcon).
+Starting with **v0.2.0**, MultiCompress is fiber-friendly on Ruby runtimes that expose the Fiber Scheduler C API and plays nicely with `Fiber::Scheduler`-based runtimes like [async](https://github.com/socketry/async) and [falcon](https://github.com/socketry/falcon). Ruby 2.7.1 is supported through the same public API, using direct/NOGVL execution because that runtime does not expose this scheduler API.
 
 ### The Problem It Solves
 
@@ -196,7 +196,7 @@ Compression is CPU-bound work. Historically, calling `zstd`/`lz4`/`brotli` from 
 
 ### How It Works
 
-When MultiCompress detects an active `Fiber::Scheduler`, it:
+When the compiled Ruby runtime exposes the scheduler API and MultiCompress detects an active `Fiber::Scheduler`, it:
 
 1. Spawns a **dedicated worker thread** via `rb_thread_create` to run the compression with the GVL released.
 2. Parks the calling fiber with `rb_fiber_scheduler_block(scheduler, blocker, Qnil)`.
@@ -325,8 +325,10 @@ end
 
 ### Requirements
 
-- Ruby **>= 3.1.0**
-- A running `Fiber::Scheduler` — typically provided by `Async { ... }` or Falcon's web server
+- Ruby **>= 2.7.1**
+- For Fiber Scheduler cooperation: a Ruby runtime exposing the Fiber Scheduler C API and a running `Fiber::Scheduler` — typically provided by `Async { ... }` or Falcon's web server
+
+Ruby 2.7.1 supports all compression, decompression, streaming, dictionary, and IO APIs. It does not expose the Fiber Scheduler C API, so operations use the normal direct/NOGVL execution paths instead of scheduler coordination.
 
 ### No Code Changes Required
 

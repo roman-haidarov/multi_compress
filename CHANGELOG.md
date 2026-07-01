@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.5]
+
+### Changed
+- Lowered the minimum supported Ruby version to **2.7.1**.
+
+### Fixed
+- Made Fiber Scheduler integration conditional on the presence of Ruby's `ruby/fiber/scheduler.h` C API.
+  Ruby 2.7.1 now builds and installs without the scheduler header; scheduler-aware execution remains enabled automatically on supported newer Rubies.
+
+### Notes
+- On Ruby 2.7.1, all public compression, decompression, streaming, dictionary, and IO APIs are available.
+  Fiber Scheduler coordination is unavailable on that runtime, so operations use the existing direct/NOGVL execution paths.
+
 ## [0.3.4]
 
 ### Changed
