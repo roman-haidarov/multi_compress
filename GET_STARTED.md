@@ -862,4 +862,130 @@ puts results
 # => {:lz4=>{:time=>0.0012, :ratio=>0.234, :size=>1024}, ...}
 ```
 
+## Command-Line Tool
+
+Installing the gem provides a `multi_compress` executable (gzip-style):
+
+```bash
+multi_compress file.json                 # -> file.json.zst (zstd default)
+multi_compress -a brotli -l best a.css   # -> a.css.br
+multi_compress -d file.json.zst          # -> file.json (algo from extension)
+cat big.log | multi_compress -a zstd -c > big.log.zst   # pipe mode
+```
+
+Flags: `-a/--algo` (`zstd|lz4|brotli`), `-l/--level` (number or `fastest|default|best`),
+`-d/--decompress`, `-o/--output`, `-c/--stdout`, `-k/--keep`, `-f/--force`,
+`-q/--quiet`, `--max-output SIZE` (e.g. `64MB`), `--version`.
+
+Safety: output is written to a temp file in the destination directory, fsynced,
+atomically renamed, and the directory is fsynced before the source is removed —
+an interrupted run never leaves a partial file or touches the source. The tool
+refuses `input == output` and refuses `-o` with multiple inputs.
+
+**LZ4 note:** this gem's LZ4 uses an internal block format that is *not*
+interchangeable with the standard `lz4` CLI. To avoid a false compatibility
+promise, LZ4 output uses the **`.mclz4`** extension; `.lz4` is never produced.
+
+## Database Column Compression
+
+There are two intentionally separate database paths:
+
+1. **`MultiCompress::Codec`** is a general application-side envelope for one
+   column. It is useful when only Ruby needs to read the data.
+2. **`MultiCompress::Database` (`MCDB1`)** is the narrow, frozen format for
+   MySQL 5.7 or PostgreSQL + DBeaver. It has matching server-side C readers,
+   so SQL can decode the BLOB / `bytea`.
+
+### MySQL 5.7 or PostgreSQL / DBeaver: `MultiCompress::Database` (`MCDB1`)
+
+Use this path when employees must inspect decoded values in DBeaver, DataGrip,
+or the MySQL console:
+
+```ruby
+require "multi_compress/database"
+
+blob = MultiCompress::Database.compress("Привет") # UTF-8 bytes for LONGBLOB / bytea
+text = MultiCompress::Database.decompress(blob)    # => "Привет"
+```
+
+MCDB1 is deliberately narrow: zstd only, valid non-NUL UTF-8 text, exactly one
+zstd frame, no dictionaries/Base64, and a 16 MiB decompressed limit. The
+corresponding MySQL UDF is in `mysql_udf/`; the PostgreSQL extension is in
+`postgres_extension/`. Both are built/deployed separately from the gem. Install
+one on the relevant database server, then expose a read-only view.
+
+For MySQL:
+
+```sql
+CREATE VIEW events_readable AS
+SELECT id,
+       CONVERT(multi_compress_db_decompress(payload_compressed) USING utf8mb4) AS payload
+FROM events;
+```
+
+For PostgreSQL after `CREATE EXTENSION multi_compress WITH SCHEMA multi_compress`:
+
+```sql
+CREATE VIEW events_readable AS
+SELECT id,
+       multi_compress.multi_compress_db_decompress(payload_compressed) AS payload
+FROM events;
+```
+
+In DBeaver, staff query `events_readable`, not the raw `LONGBLOB` / `bytea`.
+For MySQL use [`mysql_udf/README.md`](mysql_udf/README.md); for PostgreSQL use
+[`postgres_extension/README.md`](postgres_extension/README.md). The shared,
+long-term format contract is [`docs/database-envelope-v1.md`](docs/database-envelope-v1.md).
+
+### General Ruby-side `Codec`
+
+`MultiCompress::Codec` transparently compresses on write and "unwraps" on read,
+with a strict, self-describing envelope suitable for persistent storage.
+
+```ruby
+require "multi_compress/codec"
+
+codec = MultiCompress::Codec.new(algo: :zstd, level: 6)
+blob  = codec.dump(big_json)   # always-compressed envelope for a :binary column
+json  = codec.load(blob)       # exact original string back (UTF-8 by default)
+```
+
+Guarantees: always one compressed format (no mixed raw/compressed rows); a
+recognized-but-corrupt envelope raises `MultiCompress::DataError` (never silent
+data loss); invalid encoding is rejected at **write** time; the decompression
+cap is frozen locally so global config can't loosen it.
+
+Options: `encode: :base64` (for text/varchar columns; prefer `:binary`/`bytea`),
+`serializer:` (JSON or Marshal for non-String values), `encoding:`
+(default UTF-8; use `Encoding::BINARY` for arbitrary bytes), `max_output_size:`,
+`dictionary:`, and `legacy:` for reading pre-existing values:
+
+```ruby
+MultiCompress::Codec.new(legacy: :reject)                 # default: no envelope -> raise
+MultiCompress::Codec.new(legacy: :plain)                  # treat as uncompressed string
+MultiCompress::Codec.new(legacy: { compressed: :zstd })  # decompress old raw blobs
+```
+
+### ActiveRecord (experimental)
+
+Requires ActiveModel. The adapter has unit coverage but must still be integration-tested
+against each Rails/database combination before being treated as a stable deployment contract. Register the type (`attribute`) or use a coder (`serialize`):
+
+```ruby
+require "multi_compress/active_record"
+
+class Event < ApplicationRecord
+  # attribute API (prefer a :binary / bytea column)
+  attribute :payload, MultiCompress::ActiveRecordSupport::Type.new(algo: :zstd, level: 6)
+
+  # or the serialize macro with JSON objects
+  # serialize :payload, coder: MultiCompress::ActiveRecordSupport::Coder.new(algo: :zstd, serializer: JSON)
+end
+```
+
+Dirty tracking: by default in-place mutation isn't detected — reassign the
+attribute (`event.payload = event.payload.merge(...)`) or pass `mutable: true`
+to the `Type` to enable `changed_in_place?` (which decompresses the old value
+on each check).
+
 This guide covers comprehensive usage of the MultiCompress gem. For advanced use cases or questions, see the source code or create an issue on GitHub.

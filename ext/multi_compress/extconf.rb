@@ -253,6 +253,10 @@ end
 $CFLAGS += " -O3"
 $CFLAGS += " -DXXH_NAMESPACE=MULTICOMPRESS_"
 
+if RUBY_PLATFORM.include?("darwin") && try_cflags("-Wno-default-const-init-field-unsafe")
+  $CFLAGS += " -Wno-default-const-init-field-unsafe"
+end
+
 case RUBY_PLATFORM
 when /x86_64|amd64|aarch64|arm64/
   $CFLAGS += " -DBROTLI_BUILD_LITTLE_ENDIAN"

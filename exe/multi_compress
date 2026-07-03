@@ -1,0 +1,222 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "optparse"
+require "securerandom"
+require "multi_compress"
+
+module MultiCompress
+  class CLI
+    EXT          = { zstd: ".zst", lz4: ".mclz4", brotli: ".br" }.freeze
+    KNOWN_EXT    = { ".zst" => :zstd, ".zstd" => :zstd, ".mclz4" => :lz4, ".br" => :brotli }.freeze
+    NAMED_LEVELS = %w[fastest default best].freeze
+    READ_CHUNK   = 256 * 1024
+    MAX_OUTPUT_LIMIT = (2**(1.size * 8 - 1)) - 1
+
+    def self.run(argv)
+      new.run(argv)
+    end
+
+    def run(argv)
+      opts  = parse(argv)
+      files = opts.delete(:files)
+
+      validate_invocation!(files, opts)
+
+      if files.empty?
+        process_stream($stdin, $stdout, opts)
+      else
+        files.each { |path| process_file(path, opts) }
+      end
+      0
+    rescue OptionParser::ParseError => e
+      warn "multi_compress: #{e.message}"
+      2
+    rescue MultiCompress::Error, SystemCallError, IOError, ArgumentError, RangeError => e
+      warn "multi_compress: #{e.message}"
+      1
+    end
+
+    private
+
+    def parse(argv)
+      o = { decompress: false, keep: false, force: false, stdout: false, quiet: false }
+
+      @parser = OptionParser.new do |p|
+        p.banner = "Usage: multi_compress [OPTIONS] [FILE...]"
+        p.separator ""
+        p.on("-a", "--algo NAME", %w[zstd lz4 brotli], "zstd | lz4 | brotli (default: by extension, else zstd)") { |v| o[:algo] = v.to_sym }
+        p.on("-l", "--level LEVEL", "number, or: fastest | default | best") { |v| o[:level] = parse_level(v) }
+        p.on("-d", "--decompress", "decompress instead of compress") { o[:decompress] = true }
+        p.on("-o", "--output PATH", "write result to PATH (single input only)") { |v| o[:output] = v }
+        p.on("-c", "--stdout", "write to stdout, keep input") { o[:stdout] = true }
+        p.on("-k", "--keep", "keep input file (default: remove on success)") { o[:keep] = true }
+        p.on("-f", "--force", "overwrite existing output") { o[:force] = true }
+        p.on("-q", "--quiet", "no progress line") { o[:quiet] = true }
+        p.on("--max-output SIZE", "cap decompressed size, e.g. 64MB") { |v| o[:max_output_size] = parse_size(v) }
+        p.on("--version", "print gem + library versions") do
+          puts "multi_compress #{MultiCompress::VERSION} (zstd #{MultiCompress.version(:zstd)}, " \
+               "lz4 #{MultiCompress.version(:lz4)}, brotli #{MultiCompress.version(:brotli)})"
+          exit 0
+        end
+        p.on("-h", "--help") { puts p; exit 0 }
+      end
+
+      o[:files] = @parser.parse(argv)
+      o
+    end
+
+    def parse_level(v)
+      return v.to_sym if NAMED_LEVELS.include?(v)
+      Integer(v)
+    rescue ArgumentError
+      raise OptionParser::InvalidArgument, "invalid level: #{v}"
+    end
+
+    def parse_size(v)
+      m = v.strip.match(/\A(\d+)\s*([kmg]?)b?\z/i) or
+        raise OptionParser::InvalidArgument, "invalid size: #{v}"
+      mult = { "" => 1, "k" => 1024, "m" => 1024**2, "g" => 1024**3 }
+      bytes = m[1].to_i * mult[m[2].downcase]
+      if bytes <= 0
+        raise OptionParser::InvalidArgument, "max-output must be greater than zero: #{v}"
+      end
+      if bytes > MAX_OUTPUT_LIMIT
+        raise OptionParser::InvalidArgument, "max-output too large (limit #{MAX_OUTPUT_LIMIT} bytes): #{v}"
+      end
+      bytes
+    end
+
+    def validate_invocation!(files, opts)
+      return if opts[:output].nil?
+
+      if opts[:stdout]
+        raise OptionParser::InvalidOption, "-o and -c are mutually exclusive"
+      end
+      if files.size > 1
+        raise ArgumentError, "-o cannot be used with multiple input files (would overwrite the same output)"
+      end
+    end
+
+    def process_file(path, opts)
+      raise Errno::ENOENT, path unless File.exist?(path)
+
+      if opts[:stdout]
+        File.open(path, "rb") { |input| run_pipeline(input, $stdout, resolve_algo(path, opts), opts) }
+        return
+      end
+
+      out_path = opts[:output] || default_out_path(path, opts)
+      guard_paths!(path, out_path, opts)
+
+      in_size = File.size(path)
+      started = Time.now
+      write_atomically(out_path) do |tmp|
+        File.open(path, "rb") { |input| run_pipeline(input, tmp, resolve_algo(path, opts), opts) }
+      end
+
+      report(path, out_path, in_size, File.size(out_path), started, opts)
+      File.delete(path) unless opts[:keep]
+    end
+
+    def process_stream(input, output, opts)
+      run_pipeline(input, output, opts[:algo] || :zstd, opts)
+    end
+
+    def run_pipeline(input, output, algo, opts)
+      if opts[:decompress]
+        reader_opts = {}
+        reader_opts[:max_output_size] = opts[:max_output_size] if opts[:max_output_size]
+        reader = MultiCompress::Reader.new(input, algo: algo, **reader_opts)
+        while (chunk = reader.read(READ_CHUNK))
+          output.write(chunk)
+        end
+        reader.close
+      else
+        writer = MultiCompress::Writer.new(output, algo: algo, level: opts[:level])
+        while (chunk = input.read(READ_CHUNK))
+          writer.write(chunk)
+        end
+        writer.close
+      end
+    end
+
+    def write_atomically(dst)
+      dir  = File.dirname(dst)
+      tmp  = unique_temp(dir)
+      file = File.open(tmp, File::WRONLY | File::CREAT | File::EXCL | File::BINARY, 0o644)
+      begin
+        yield file
+        file.flush
+        file.fsync
+        file.close
+        File.rename(tmp, dst)
+        fsync_dir(dir)
+      rescue StandardError
+        file.close unless file.closed?
+        File.delete(tmp) if File.exist?(tmp)
+        raise
+      end
+    end
+
+    def unique_temp(dir)
+      loop do
+        candidate = File.join(dir, ".multi_compress.#{Process.pid}.#{SecureRandom.hex(8)}.tmp")
+        return candidate unless File.exist?(candidate)
+      end
+    end
+
+    def fsync_dir(dir)
+      d = File.open(dir)
+      begin
+        d.fsync
+      rescue NotImplementedError, Errno::EINVAL, Errno::EACCES
+        # some platforms/filesystems can't fsync a directory; best-effort
+      ensure
+        d.close
+      end
+    end
+
+    def guard_paths!(src, dst, opts)
+      if same_file?(src, dst)
+        raise ArgumentError, "input and output are the same file: #{src}"
+      end
+      if File.exist?(dst) && !opts[:force]
+        raise ArgumentError, "#{dst} already exists (use -f to overwrite)"
+      end
+    end
+
+    def same_file?(a, b)
+      return true if File.expand_path(a) == File.expand_path(b)
+      File.exist?(a) && File.exist?(b) && File.identical?(a, b)
+    end
+
+    def resolve_algo(path, opts)
+      opts[:algo] || KNOWN_EXT[File.extname(path).downcase] || :zstd
+    end
+
+    def default_out_path(path, opts)
+      if opts[:decompress]
+        stripped = strip_known_ext(path)
+        stripped == path ? "#{path}.out" : stripped
+      else
+        "#{path}#{EXT.fetch(resolve_algo(path, opts))}"
+      end
+    end
+
+    def strip_known_ext(path)
+      ext = File.extname(path).downcase
+      KNOWN_EXT.key?(ext) ? path[0...-ext.length] : path
+    end
+
+    def report(src, dst, in_size, out_size, started, opts)
+      return if opts[:quiet]
+      pct = in_size.zero? ? 0 : (100.0 * out_size / in_size)
+      dir = opts[:decompress] ? "expanded" : "reduced"
+      warn format("%s -> %s  %d -> %d bytes (%s to %.1f%%, %.2fs)",
+                  src, dst, in_size, out_size, dir, pct, Time.now - started)
+    end
+  end
+end
+
+exit MultiCompress::CLI.run(ARGV)

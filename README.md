@@ -172,6 +172,39 @@ Or use the build script:
 ./build.sh
 ```
 
+## Command-line tool & DB column compression
+
+Installing the gem provides a gzip-style `multi_compress` executable:
+
+```bash
+multi_compress file.json          # -> file.json.zst
+multi_compress -d file.json.zst   # -> file.json
+cat big.log | multi_compress -a zstd -c > big.log.zst
+```
+
+`MultiCompress::Codec` is a general-purpose application-side envelope for a
+single database column (optional ActiveRecord `Type`/`Coder` adapters and
+optional Base64 for text columns). It is **not** the format for SQL-side
+inspection.
+
+For MySQL 5.7 or PostgreSQL + DBeaver, use the separate, frozen `MCDB1` API instead:
+
+```ruby
+require "multi_compress/database"
+
+blob = MultiCompress::Database.compress("JSON or UTF-8 text") # store in LONGBLOB / bytea
+text = MultiCompress::Database.decompress(blob)
+```
+
+The repository's `mysql_udf/` and `postgres_extension/` targets read that exact
+`MCDB1` format through server-side C functions, so a view can expose decoded
+UTF-8 to DBeaver. They are separate native artifacts, not compiled during
+`gem install`. See [GET_STARTED.md](GET_STARTED.md#database-column-compression),
+[`mysql_udf/README.md`](mysql_udf/README.md), and
+[`postgres_extension/README.md`](postgres_extension/README.md).
+
+> The CLI writes this gem's internal LZ4 format as `.mclz4` (not `.lz4`), since it is not interchangeable with the standard `lz4` CLI.
+
 ## Requirements
 
 - Ruby >= 2.7.1

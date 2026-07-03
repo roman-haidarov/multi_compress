@@ -22,6 +22,8 @@ Gem::Specification.new do |spec|
 
   spec.files = Dir[
     "lib/**/*.rb",
+    "exe/*",
+    "docs/**/*.md",
     "ext/**/*.{c,h,rb}",
     "ext/multi_compress/vendor/**/*",
     "ext/multi_compress/vendor/.vendored",
@@ -33,7 +35,7 @@ Gem::Specification.new do |spec|
   ]
 
   spec.bindir        = "exe"
-  spec.executables   = []
+  spec.executables   = ["multi_compress"]
   spec.require_paths = ["lib"]
   spec.extensions    = ["ext/multi_compress/extconf.rb"]
 

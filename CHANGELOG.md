@@ -1,5 +1,73 @@
 # Changelog
 
+## [0.5.0]
+
+- MCDB1 now rejects trailing bytes, skippable frames, and concatenated zstd frames.
+
+### Fixed
+- Pin the MySQL 5.7 Docker acceptance target to the official linux/amd64 image digest. The e2e script now rejects incompatible host-built UDF binaries and supports a prebuilt Linux/x86_64 artifact through `MCDB_UDF_SO` on macOS and ARM hosts.
+
+
+### Added
+- **Database envelope v1 (`MCDB1`)** — a frozen, self-describing storage format
+  (`docs/database-envelope-v1.md`): 19-byte header (magic/version/codec/flags/
+  original_size/crc32) + a zstd frame. zstd-only, UTF-8 text without NUL bytes, 16 MiB cap, no
+  dictionaries/base64. Corruption (bad header, size or **CRC-32** mismatch,
+  broken zstd) is a hard error in every reader — never a silent fallback.
+- **`MultiCompress::Database`** — narrow Ruby writer/reader for `MCDB1`
+  (`compress`/`decompress`/`valid?`), independent of ActiveRecord. Validates
+  UTF-8 and size on write; requires exactly one zstd frame and verifies size +
+  CRC-32 on read.
+- **MySQL 5.7 UDF** (`mysql_udf/`) — a separate native target (not built by the
+  gem) implementing the same `MCDB1` contract in C over the vendored zstd, with
+  `multi_compress_db_version()`, `multi_compress_db_is_valid(blob)`, and
+  `multi_compress_db_decompress(blob)`, plus SQL install/uninstall/views,
+  a Makefile, a real-MySQL Docker acceptance script, and a Ruby↔C parity
+  harness.
+- **PostgreSQL extension** (`postgres_extension/`) — a PGXS target over the
+  same shared C decoder, exposing the matching `version`, `is_valid(bytea)`, and
+  `decompress(bytea)` SQL functions through `CREATE EXTENSION multi_compress`.
+  It includes SQL/view templates and a Docker e2e gate.
+- Golden fixtures (`test/fixtures/database_v1/`) shared by the Ruby tests and the
+  C parity harness, proving both implementations agree byte-for-byte.
+
+### Notes
+- The 16 MiB cap and CRC-32 check are enforced identically in Ruby, the MySQL
+  UDF, and the PostgreSQL extension. The CRC-32 matches `MultiCompress.crc32`
+  (zlib/IEEE). MCDB1 payload text must be valid UTF-8 without NUL bytes so it
+  maps safely to PostgreSQL `text`.
+- The ActiveRecord adapter remains experimental pending real Rails integration
+  tests; the `MCDB1` path does not depend on it.
+
+## [0.4.0]
+
+### Added
+- **`multi_compress` command-line tool.** Gzip-style file (de)compression with
+  `-a/--algo`, `-l/--level`, `-d/--decompress`, `-o`, `-c/--stdout`, `-k/--keep`,
+  `-f/--force`, `--max-output`. Streams through `Reader`/`Writer`, writes output
+  atomically (temp + fsync + rename, directory fsync before removing the source),
+  refuses `input == output` and `-o` with multiple inputs.
+- **`MultiCompress::Codec`** — strict, self-describing compression envelope for
+  values stored in a database. Always compresses (one storage format), 7-byte
+  magic/version/algo header, strict decode (a corrupt envelope raises
+  `DataError`, never silent passthrough), opt-in `legacy:` handling
+  (`:reject` default, `:plain`, `{ compressed: :algo }`), `encode: :base64` for
+  text columns (explicit `mc1:` prefix), locally-frozen `max_output_size`,
+  configurable `encoding:` (validated on write), and optional `serializer:`
+  (JSON/Marshal) for non-String values.
+- **ActiveRecord integration** via `MultiCompress::ActiveRecordSupport::Type`
+  (for `attribute`) and `::Coder` (for `serialize`). Opt-in `mutable:` enables
+  in-place dirty tracking.
+
+### Notes
+- The CLI writes this gem's internal LZ4 block format with the **`.mclz4`**
+  extension (not `.lz4`), since it is not interchangeable with the standard
+  `lz4` CLI frame.
+- `MultiCompress::Codec` treats one column as one fixed encoding. Use
+  `encoding: Encoding::BINARY` (a `:binary`/`bytea` column) for arbitrary bytes.
+- The AR `Type` default does not detect in-place mutation; reassign the
+  attribute, or pass `mutable: true`.
+
 ## [0.3.5]
 
 ### Changed

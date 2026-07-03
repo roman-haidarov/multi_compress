@@ -28,6 +28,8 @@ ext/multi_compress/vendor/*
 !ext/multi_compress/vendor/brotli/
 !ext/multi_compress/vendor/lz4/
 !ext/multi_compress/vendor/zstd/
+!mysql_udf/Makefile
+!postgres_extension/Makefile
 
 # Compiled gem files
 *.gem
