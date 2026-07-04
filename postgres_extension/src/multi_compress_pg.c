@@ -43,7 +43,8 @@ Datum multi_compress_db_version(PG_FUNCTION_ARGS) {
 
     (void)fcinfo;
 
-    snprintf(version, sizeof(version), "MCDB1 (zstd %s)", ZSTD_versionString());
+    snprintf(version, sizeof(version), "multi_compress reader %s; MCDB1; zstd %s",
+             MCDB_READER_VERSION, ZSTD_versionString());
     PG_RETURN_TEXT_P(cstring_to_text(version));
 }
 
@@ -64,7 +65,6 @@ Datum multi_compress_db_is_valid(PG_FUNCTION_ARGS) {
 
 Datum multi_compress_db_decompress(PG_FUNCTION_ARGS) {
     bytea *input;
-    unsigned char *output = NULL;
     size_t output_len = 0;
     char err[MCDB_ERRLEN];
     mcdb_status status;
@@ -84,15 +84,13 @@ Datum multi_compress_db_decompress(PG_FUNCTION_ARGS) {
 
     result = (text *)palloc(VARHDRSZ + (size_t)original_size);
 
-    status = mcdb_decode((const unsigned char *)VARDATA_ANY(input),
-                         (size_t)VARSIZE_ANY_EXHDR(input), &output, &output_len, err);
+    status = mcdb_decode_into((const unsigned char *)VARDATA_ANY(input),
+                              (size_t)VARSIZE_ANY_EXHDR(input), (unsigned char *)VARDATA(result),
+                              (size_t)original_size, &output_len, err);
     if (status != MCDB_OK)
         mcdb_raise(status, err);
 
     SET_VARSIZE(result, VARHDRSZ + output_len);
-    if (output_len > 0)
-        memcpy(VARDATA(result), output, output_len);
-    free(output);
 
     PG_RETURN_TEXT_P(result);
 }

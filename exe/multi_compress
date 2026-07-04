@@ -3,6 +3,12 @@
 
 require "optparse"
 require "securerandom"
+
+if ARGV.first == "db"
+  require "multi_compress/db_deployment"
+  exit MultiCompress::DBDeployment::CLI.run(ARGV.drop(1))
+end
+
 require "multi_compress"
 
 module MultiCompress

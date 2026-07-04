@@ -13,7 +13,8 @@ AR          ?= ar
 WARNFLAGS   ?= -Wall -Wextra -Werror
 PG_CPPFLAGS += -I$(CORE_DIR)/include -I$(ZSTD_DIR)
 PG_CFLAGS   += -O2 -fPIC -std=c99 $(WARNFLAGS)
-SHLIB_LINK  += $(ZSTD_LIB)
+EXPORT_MAP  := $(CURDIR)/multi_compress_pg.exports
+SHLIB_LINK  += -Wl,--version-script=$(EXPORT_MAP) $(ZSTD_LIB)
 EXTRA_CLEAN += $(BUILD)
 
 ZSTD_CFLAGS  ?= -O2 -fPIC -std=c99 -I$(ZSTD_DIR) -I$(ZSTD_DIR)/common

@@ -8,15 +8,25 @@ IMAGE="${MCDB_POSTGRES_IMAGE:-$DEFAULT_POSTGRES_IMAGE}"
 PLATFORM="${MCDB_POSTGRES_PLATFORM:-linux/amd64}"
 CONTAINER="${MCDB_POSTGRES_CONTAINER:-mcdb-postgres-e2e}"
 WAIT_SECONDS="${MCDB_POSTGRES_WAIT_SECONDS:-90}"
-PREBUILT_PG_SO="${MCDB_PG_SO:-}"
-BUILD_ROOT="/tmp/mcdb-build"
+WORK_ROOT="${MCDB_POSTGRES_WORK_ROOT:-$(mktemp -d -t multi-compress-postgres.XXXXXX)}"
+REMOVE_WORK_ROOT=0
+ARCHIVE="$WORK_ROOT/multi_compress-postgres.tar.gz"
+GEM_UNPACK_DIR="$WORK_ROOT/unpacked"
+GEM_FILE="$WORK_ROOT/multi_compress.gem"
+PACKAGED_GEM_ROOT=""
+BUNDLE_PARENT="/opt"
 
 command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 2; }
 
 cleanup() {
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  [ "$REMOVE_WORK_ROOT" -eq 1 ] && rm -rf "$WORK_ROOT"
 }
 trap cleanup EXIT
+
+if [ -z "${MCDB_POSTGRES_WORK_ROOT:-}" ]; then
+  REMOVE_WORK_ROOT=1
+fi
 
 ensure_ruby_extension() {
   if ruby -Ilib -e 'require "multi_compress"; require "multi_compress/database"' >/dev/null 2>&1; then
@@ -41,9 +51,38 @@ fixture_hex() {
   ruby -e 'print File.binread(ARGV.fetch(0)).unpack1("H*")' "$1"
 }
 
+prepare_packaged_gem() {
+  gem build multi_compress.gemspec --output "$GEM_FILE" >/dev/null
+  mkdir -p "$GEM_UNPACK_DIR"
+  gem unpack "$GEM_FILE" --target "$GEM_UNPACK_DIR" >/dev/null
+  shopt -s nullglob
+  roots=("$GEM_UNPACK_DIR"/*)
+  shopt -u nullglob
+  [ "${#roots[@]}" -eq 1 ] && [ -d "${roots[0]}" ] || { echo "could not unpack exactly one multi_compress gem root" >&2; exit 2; }
+  PACKAGED_GEM_ROOT="${roots[0]}"
+  [ -f "$PACKAGED_GEM_ROOT/multi_compress.gemspec" ] || { echo "packaged gem lacks gemspec" >&2; exit 2; }
+  [ -d "$PACKAGED_GEM_ROOT/lib" ] || { echo "packaged gem lacks lib" >&2; exit 2; }
+  [ -d "$PACKAGED_GEM_ROOT/exe" ] || { echo "packaged gem lacks exe" >&2; exit 2; }
+  [ -f "$PACKAGED_GEM_ROOT/lib/multi_compress/db_deployment.rb" ] || { echo "packaged gem lacks db deployment CLI" >&2; exit 2; }
+}
+
+db_cli() {
+  ruby -I "$PACKAGED_GEM_ROOT/lib" "$PACKAGED_GEM_ROOT/exe/multi_compress" db "$@"
+}
+
 compress_hex() {
   MCDB_TEXT="$1" ruby -Ilib -r multi_compress -r multi_compress/database \
     -e 'print MultiCompress::Database.compress(ENV.fetch("MCDB_TEXT")).unpack1("H*")'
+}
+
+bundle_name() {
+  ruby -I "$PACKAGED_GEM_ROOT/lib" -r multi_compress/version \
+    -e 'print "multi_compress-postgres-#{MultiCompress::VERSION}"'
+}
+
+build_deployment_bundle() {
+  db_cli package postgres --output "$ARCHIVE" --force
+  test -s "$ARCHIVE"
 }
 
 install_postgres_build_tools() {
@@ -63,19 +102,19 @@ install_postgres_build_tools() {
 
       if ! command -v make >/dev/null 2>&1 || ! command -v cc >/dev/null 2>&1; then
         if ! command -v apt-get >/dev/null 2>&1; then
-          echo "PostgreSQL container has no supported package manager; set MCDB_PG_SO" >&2
+          echo "PostgreSQL container has no supported package manager" >&2
           exit 2
         fi
         apt-get update >&2
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-          build-essential ca-certificates curl gnupg >&2
+          build-essential ca-certificates curl gnupg tar gzip >&2
       fi
 
       runtime_pgxs="$("$runtime_pg_config" --pgxs 2>/dev/null || true)"
       runtime_headers="$("$runtime_pg_config" --includedir-server 2>/dev/null || true)"
       if [ ! -f "$runtime_pgxs" ] || [ ! -f "$runtime_headers/postgres.h" ]; then
         if ! command -v apt-get >/dev/null 2>&1; then
-          echo "PostgreSQL development headers are unavailable; set MCDB_PG_SO" >&2
+          echo "PostgreSQL development headers are unavailable" >&2
           exit 2
         fi
 
@@ -102,38 +141,55 @@ install_postgres_build_tools() {
       done
 
       [ -n "$build_pg_config" ] || {
-        echo "PostgreSQL PGXS/server headers are unavailable; set MCDB_PG_SO" >&2
+        echo "PostgreSQL PGXS/server headers are unavailable" >&2
         exit 2
       }
       printf "%s\n" "$build_pg_config"
     '
 }
 
-copy_postgres_build_tree() {
-  docker exec -u 0 "$CONTAINER" rm -rf "$BUILD_ROOT"
-  docker exec -u 0 "$CONTAINER" mkdir -p "$BUILD_ROOT/ext/multi_compress"
-  docker cp "$PWD/db_core" "$CONTAINER:${BUILD_ROOT}/"
-  docker cp "$PWD/postgres_extension" "$CONTAINER:${BUILD_ROOT}/"
-  docker cp "$PWD/ext/multi_compress/vendor" "$CONTAINER:${BUILD_ROOT}/ext/multi_compress/"
+install_bundle_on_db_host() {
+  local bundle_name="$1"
+  local build_pg_config="$2"
+  local runtime_pg_config="$3"
+  local bundle_root="${BUNDLE_PARENT}/${bundle_name}"
+
+  tar -tzf "$ARCHIVE" | grep -Fx "${bundle_name}/THIRD_PARTY_NOTICES.md" >/dev/null
+  if tar -tzf "$ARCHIVE" | grep -E '/\.DS_Store$' >/dev/null; then
+    echo 'deployment bundle must not contain .DS_Store' >&2
+    exit 2
+  fi
+  docker cp "$ARCHIVE" "$CONTAINER:/tmp/${bundle_name}.tar.gz"
+  docker exec -u 0 \
+    -e "MCDB_BUNDLE_ROOT=$bundle_root" \
+    -e "MCDB_BUILD_PG_CONFIG=$build_pg_config" \
+    -e "MCDB_RUNTIME_PG_CONFIG=$runtime_pg_config" \
+    "$CONTAINER" sh -ceu '
+      rm -rf "$MCDB_BUNDLE_ROOT"
+      mkdir -p "$(dirname "$MCDB_BUNDLE_ROOT")"
+      tar -xzf "/tmp/$(basename "$MCDB_BUNDLE_ROOT").tar.gz" -C "$(dirname "$MCDB_BUNDLE_ROOT")"
+      cd "$MCDB_BUNDLE_ROOT"
+      make verify
+      make doctor PG_CONFIG="$MCDB_BUILD_PG_CONFIG"
+      make install BUILD_PG_CONFIG="$MCDB_BUILD_PG_CONFIG" RUNTIME_PG_CONFIG="$MCDB_RUNTIME_PG_CONFIG"
+    '
+
 }
 
-build_or_copy_extension() {
-  if [ -n "$PREBUILT_PG_SO" ]; then
-    [ -f "$PREBUILT_PG_SO" ] || { echo "MCDB_PG_SO does not exist: $PREBUILT_PG_SO" >&2; exit 2; }
-    SO_IN_CONTAINER="/tmp/multi_compress_pg.so"
-    docker cp "$PREBUILT_PG_SO" "$CONTAINER:$SO_IN_CONTAINER"
-  else
-    BUILD_PG_CONFIG=$(install_postgres_build_tools "$RUNTIME_PG_CONFIG")
-    copy_postgres_build_tree
-    docker exec -u 0 "$CONTAINER" sh -ceu \
-      "make -C '$BUILD_ROOT/postgres_extension' clean all PG_CONFIG='$BUILD_PG_CONFIG'"
-    SO_IN_CONTAINER="$BUILD_ROOT/postgres_extension/multi_compress_pg.so"
-  fi
-
-  docker exec "$CONTAINER" test -f "$SO_IN_CONTAINER"
+apply_readable_view() {
+  local path="$1"
+  db_cli view postgres \
+    --table app.events \
+    --column payload_compressed \
+    --view admin.events_readable \
+    --columns id \
+    --output "$path"
+  docker exec -i "$CONTAINER" psql -X -U app_migrations -d postgres -v ON_ERROR_STOP=1 < "$path"
 }
 
 ensure_ruby_extension
+prepare_packaged_gem
+build_deployment_bundle
 
 for name in corrupt_magic corrupt_payload corrupt_crc invalid_utf8 nul_text trailing_skippable trailing_frame; do
   require_fixture "test/fixtures/database_v1/${name}.mcdb"
@@ -143,6 +199,9 @@ TEXT='Привет, DBeaver! Сәлем! 🌍'
 BIG=$(ruby -e 'print "a" * 300')
 VALID_HEX=$(compress_hex "$TEXT")
 BIG_HEX=$(compress_hex "$BIG")
+BUNDLE_NAME="$(bundle_name)"
+VIEW_SQL="$(mktemp -t multi-compress-postgres-view.XXXXXX.sql)"
+trap 'rm -f "$VIEW_SQL"; cleanup' EXIT
 
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker run --platform "$PLATFORM" -d --name "$CONTAINER" \
@@ -163,22 +222,55 @@ q() { docker exec "$CONTAINER" psql -X -U postgres -d postgres -Atq -v ON_ERROR_
 qfail() {
   if q "$1" >/dev/null 2>&1; then return 1; else return 0; fi
 }
+q_read() { docker exec "$CONTAINER" psql -X -U dbeaver_readonly -d postgres -Atq -v ON_ERROR_STOP=1 -c "$1"; }
+q_read_fail() {
+  if q_read "$1" >/dev/null 2>&1; then return 1; else return 0; fi
+}
 
 RUNTIME_PG_CONFIG=$(docker exec "$CONTAINER" sh -ceu 'command -v pg_config' | tr -d '\r\n')
 [ -n "$RUNTIME_PG_CONFIG" ] || { echo "PostgreSQL runtime does not provide pg_config" >&2; exit 2; }
+BUILD_PG_CONFIG=$(install_postgres_build_tools "$RUNTIME_PG_CONFIG")
+install_bundle_on_db_host "$BUNDLE_NAME" "$BUILD_PG_CONFIG" "$RUNTIME_PG_CONFIG"
 
-build_or_copy_extension
+q "CREATE ROLE app_migrations LOGIN;
+   CREATE ROLE dbeaver_readonly LOGIN;
+   CREATE SCHEMA app;
+   CREATE SCHEMA admin;
+   CREATE TABLE app.events (id integer PRIMARY KEY, payload_compressed bytea NULL);
+   INSERT INTO app.events VALUES
+     (1, decode('$VALID_HEX', 'hex')),
+     (2, NULL),
+     (3, decode('$BIG_HEX', 'hex')),
+     (4, decode('$VALID_HEX', 'hex'));
+   GRANT USAGE ON SCHEMA app, admin TO app_migrations, dbeaver_readonly;
+   GRANT CREATE ON SCHEMA admin TO app_migrations;
+   GRANT SELECT ON app.events TO app_migrations;"
+docker exec -u postgres -e "MCDB_BUNDLE_ROOT=${BUNDLE_PARENT}/${BUNDLE_NAME}" "$CONTAINER" sh -ceu '
+  cd "$MCDB_BUNDLE_ROOT"
+  make enable DB=postgres MIGRATION_ROLE=app_migrations READ_ROLE=dbeaver_readonly
+'
+apply_readable_view "$VIEW_SQL"
+q 'GRANT SELECT ON admin.events_readable TO dbeaver_readonly;'
 
-PKGLIBDIR=$(docker exec "$CONTAINER" "$RUNTIME_PG_CONFIG" --pkglibdir | tr -d '\r\n')
-SHAREDIR=$(docker exec "$CONTAINER" "$RUNTIME_PG_CONFIG" --sharedir | tr -d '\r\n')
-[ -n "$PKGLIBDIR" ] && [ -n "$SHAREDIR" ] || { echo "PostgreSQL returned empty install paths" >&2; exit 1; }
-docker exec "$CONTAINER" test -d "$PKGLIBDIR"
-docker exec "$CONTAINER" test -d "$SHAREDIR/extension"
-
-docker exec -u 0 "$CONTAINER" cp "$SO_IN_CONTAINER" "${PKGLIBDIR%/}/multi_compress_pg.so"
-docker cp postgres_extension/multi_compress.control "$CONTAINER:${SHAREDIR%/}/extension/multi_compress.control"
-docker cp postgres_extension/sql/multi_compress--0.5.0.sql "$CONTAINER:${SHAREDIR%/}/extension/multi_compress--0.5.0.sql"
-docker exec -u 0 "$CONTAINER" chmod 755 "${PKGLIBDIR%/}/multi_compress_pg.so"
+q "CREATE DATABASE mcdb_latin1 WITH TEMPLATE template0 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C';"
+docker exec -u postgres -e "MCDB_BUNDLE_ROOT=${BUNDLE_PARENT}/${BUNDLE_NAME}" "$CONTAINER" sh -ceu '
+  cd "$MCDB_BUNDLE_ROOT"
+  if make enable DB=mcdb_latin1 MIGRATION_ROLE=app_migrations READ_ROLE=dbeaver_readonly >/tmp/mcdb-latin1.out 2>&1; then
+    echo "LATIN1 enable unexpectedly succeeded" >&2
+    exit 1
+  fi
+  grep -F "requires UTF8" /tmp/mcdb-latin1.out
+'
+q "CREATE DATABASE mcdb_other_schema WITH TEMPLATE template0 ENCODING 'UTF8';"
+docker exec "$CONTAINER" psql -X -U postgres -d mcdb_other_schema -v ON_ERROR_STOP=1 -c 'CREATE SCHEMA wrong_schema; CREATE EXTENSION multi_compress WITH SCHEMA wrong_schema;' >/dev/null
+docker exec -u postgres -e "MCDB_BUNDLE_ROOT=${BUNDLE_PARENT}/${BUNDLE_NAME}" "$CONTAINER" sh -ceu '
+  cd "$MCDB_BUNDLE_ROOT"
+  if make enable DB=mcdb_other_schema SCHEMA=multi_compress MIGRATION_ROLE=app_migrations READ_ROLE=dbeaver_readonly >/tmp/mcdb-schema.out 2>&1; then
+    echo "mismatched extension schema unexpectedly succeeded" >&2
+    exit 1
+  fi
+  grep -F "already installed in schema wrong_schema" /tmp/mcdb-schema.out
+'
 
 fails=0
 check() {
@@ -188,25 +280,23 @@ check_err() {
   if qfail "$2"; then echo "  PASS  $1 (rejected)"; else echo "  FAIL  $1 (should have errored)"; fails=$((fails + 1)); fi
 }
 
-q "CREATE SCHEMA multi_compress;
-   CREATE EXTENSION multi_compress WITH SCHEMA multi_compress;
-   CREATE SCHEMA app;
-   CREATE TABLE app.events (id integer PRIMARY KEY, payload_compressed bytea NULL);
-   INSERT INTO app.events VALUES
-     (1, decode('$VALID_HEX', 'hex')),
-     (2, NULL),
-     (3, decode('$BIG_HEX', 'hex')),
-     (4, decode('$VALID_HEX', 'hex'));
-   CREATE VIEW app.events_readable AS
-     SELECT id, multi_compress.multi_compress_db_decompress(payload_compressed) AS payload
-     FROM app.events;"
-
 check "UTF8 database" "$(q 'SHOW server_encoding;' | tr -d '\r\n')" "UTF8"
-check "version() smoke" "$(q 'SELECT left(multi_compress.multi_compress_db_version(), 5);' | tr -d '\r\n')" "MCDB1"
+check "deployment bundle version() smoke" "$(q 'SELECT strpos(multi_compress.multi_compress_db_version(), chr(77) || chr(67) || chr(68) || chr(66) || chr(49)) > 0;' | tr -d '\r\n')" "t"
+check "PostgreSQL reader uses vendored zstd" "$(q "SELECT strpos(multi_compress.multi_compress_db_version(), 'zstd 1.5.7') > 0;" | tr -d '\r\n')" "t"
 check "decode roundtrip" "$(q 'SELECT multi_compress.multi_compress_db_decompress(payload_compressed) FROM app.events WHERE id=1;' | tr -d '\r')" "$TEXT"
 check "NULL -> NULL" "$(q 'SELECT multi_compress.multi_compress_db_decompress(payload_compressed) IS NULL FROM app.events WHERE id=2;' | tr -d '\r\n')" "t"
 check "big (>255, >input)" "$(q 'SELECT octet_length(multi_compress.multi_compress_db_decompress(payload_compressed)) FROM app.events WHERE id=3;' | tr -d '\r\n')" "300"
-check "multi-row via view" "$(q 'SELECT count(*) FROM app.events_readable WHERE id IN (1, 4);' | tr -d '\r\n')" "2"
+check "generated readable view" "$(q 'SELECT count(*) FROM admin.events_readable WHERE id IN (1, 4);' | tr -d '\r\n')" "2"
+check "read role reads generated Unicode view" "$(q_read 'SELECT payload FROM admin.events_readable WHERE id=1;' | tr -d '\r')" "$TEXT"
+if q_read_fail 'SELECT payload_compressed FROM app.events WHERE id=1;'; then
+  echo "  PASS  read role cannot read source table"
+else
+  echo "  FAIL  read role unexpectedly read source table"
+  fails=$((fails + 1))
+fi
+RUNTIME_MAJOR="$(docker exec "$CONTAINER" "$RUNTIME_PG_CONFIG" --version | awk '{print $2}' | cut -d. -f1 | tr -d '\r\n')"
+SERVER_MAJOR="$(q 'SHOW server_version;' | cut -d. -f1 | tr -d '\r\n')"
+check "connected server major matches PG_CONFIG" "$SERVER_MAJOR" "$RUNTIME_MAJOR"
 check "is_valid true" "$(q 'SELECT multi_compress.multi_compress_db_is_valid(payload_compressed) FROM app.events WHERE id=1;' | tr -d '\r\n')" "t"
 check "is_valid on NULL" "$(q 'SELECT multi_compress.multi_compress_db_is_valid(payload_compressed) IS NULL FROM app.events WHERE id=2;' | tr -d '\r\n')" "t"
 
@@ -216,8 +306,18 @@ for name in corrupt_magic corrupt_payload corrupt_crc invalid_utf8 nul_text trai
 done
 check "is_valid false (crc)" "$(q "SELECT multi_compress.multi_compress_db_is_valid(decode('$(fixture_hex test/fixtures/database_v1/corrupt_crc.mcdb)', 'hex'));" | tr -d '\r\n')" "f"
 
-q 'DROP VIEW app.events_readable; DROP EXTENSION multi_compress;'
+q 'DROP VIEW admin.events_readable; DROP EXTENSION multi_compress;'
+docker exec "$CONTAINER" psql -X -U postgres -d mcdb_other_schema -v ON_ERROR_STOP=1 -c 'DROP EXTENSION multi_compress;' >/dev/null
+docker exec -u 0 -e "MCDB_BUNDLE_ROOT=${BUNDLE_PARENT}/${BUNDLE_NAME}" -e "MCDB_RUNTIME_PG_CONFIG=$RUNTIME_PG_CONFIG" "$CONTAINER" sh -ceu '
+  cd "$MCDB_BUNDLE_ROOT"
+  if make uninstall RUNTIME_PG_CONFIG="$MCDB_RUNTIME_PG_CONFIG" >/dev/null 2>&1; then
+    echo "uninstall succeeded without CONFIRM" >&2
+    exit 1
+  fi
+  make uninstall CONFIRM=REMOVE_MULTI_COMPRESS RUNTIME_PG_CONFIG="$MCDB_RUNTIME_PG_CONFIG"
+'
 check_err "uninstall removes functions" "SELECT multi_compress.multi_compress_db_version();"
+check_err "uninstall removes extension files" "CREATE EXTENSION multi_compress;"
 
 if [ "$fails" -ne 0 ]; then echo "E2E FAILED ($fails)"; exit 1; fi
 echo "E2E OK"

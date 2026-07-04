@@ -1,0 +1,12 @@
+{
+  global:
+    Pg_magic_func;
+    pg_finfo_multi_compress_db_version;
+    pg_finfo_multi_compress_db_is_valid;
+    pg_finfo_multi_compress_db_decompress;
+    multi_compress_db_version;
+    multi_compress_db_is_valid;
+    multi_compress_db_decompress;
+  local:
+    *;
+};

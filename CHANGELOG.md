@@ -5,15 +5,23 @@
 - MCDB1 now rejects trailing bytes, skippable frames, and concatenated zstd frames.
 
 ### Fixed
-- Pin the MySQL 5.7 Docker acceptance target to the official linux/amd64 image digest. The e2e script now rejects incompatible host-built UDF binaries and supports a prebuilt Linux/x86_64 artifact through `MCDB_UDF_SO` on macOS and ARM hosts.
+- Pin the MySQL 5.7 Docker acceptance target to the official linux/amd64 image digest.
 
 
 ### Added
+- **Casual database deployment bundles** — `multi_compress db package postgres`
+  and `multi_compress db package mysql` build a version-locked tarball directly
+  from the installed gem. A DBA extracts it on the database host and uses
+  `make verify`, `make doctor`, `sudo make install`, and `make enable` instead
+  of cloning the repository or manually locating/copying a `.so`.
+- **Readable-view generator** — `multi_compress db view postgres|mysql` emits
+  safely quoted, migration-ready views for DBeaver. MySQL output always converts
+  UDF output through `utf8mb4`.
 - **Database envelope v1 (`MCDB1`)** — a frozen, self-describing storage format
   (`docs/database-envelope-v1.md`): 19-byte header (magic/version/codec/flags/
   original_size/crc32) + a zstd frame. zstd-only, UTF-8 text without NUL bytes, 16 MiB cap, no
-  dictionaries/base64. Corruption (bad header, size or **CRC-32** mismatch,
-  broken zstd) is a hard error in every reader — never a silent fallback.
+  dictionaries/base64. Corruption raises in Ruby and PostgreSQL; MySQL returns
+  `NULL` and exposes `multi_compress_db_is_valid(blob) = 0` for diagnostics.
 - **`MultiCompress::Database`** — narrow Ruby writer/reader for `MCDB1`
   (`compress`/`decompress`/`valid?`), independent of ActiveRecord. Validates
   UTF-8 and size on write; requires exactly one zstd frame and verifies size +

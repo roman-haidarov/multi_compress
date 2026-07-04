@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MYSQL="${MYSQL:-mysql}"
+DEFAULTS_FILE=""
+MYSQL_SOCKET="${MYSQL_SOCKET:-}"
+
+usage() {
+  cat <<'TEXT'
+Usage: sudo MYSQL_SOCKET=/run/mysqld/mysqld.sock ./bin/install [--mysql PATH] [--defaults-extra-file PATH]
+
+Builds and installs a fresh MySQL 5.7 UDF library. It refuses to replace a
+library while any expected UDF is registered; use ./bin/upgrade for upgrades.
+TEXT
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --mysql)
+      [ "$#" -ge 2 ] || { echo '--mysql requires a path' >&2; exit 2; }
+      MYSQL="$2"; shift 2 ;;
+    --defaults-extra-file)
+      [ "$#" -ge 2 ] || { echo '--defaults-extra-file requires a path' >&2; exit 2; }
+      DEFAULTS_FILE="$2"; shift 2 ;;
+    --help|-h)
+      usage; exit 0 ;;
+    *)
+      echo "multi_compress mysql install: unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ "${EUID:-$(id -u)}" -eq 0 ] || { echo 'multi_compress mysql install: run as root: sudo ./bin/install ...' >&2; exit 2; }
+DOCTOR_ARGS=(--mysql "$MYSQL")
+if [ -n "$DEFAULTS_FILE" ]; then
+  DOCTOR_ARGS+=(--defaults-extra-file "$DEFAULTS_FILE")
+fi
+MYSQL_SOCKET="$MYSQL_SOCKET" "$ROOT/bin/doctor" "${DOCTOR_ARGS[@]}"
+
+# shellcheck source=common
+source "$ROOT/bin/common"
+mcdb_resolve_mysql
+mcdb_mysql_args
+mcdb_read_udf_state
+if ! mcdb_state_is_clean_absent; then
+  mcdb_die 'fresh install refuses to replace a library while UDF registrations exist; run status or upgrade instead'
+fi
+
+PLUGIN_DIR="$(mcdb_plugin_dir)"
+TEMP_LIBRARY="$PLUGIN_DIR/.${MCDB_UDF_LIBRARY}.$$.$RANDOM.tmp"
+trap 'rm -f "$TEMP_LIBRARY"' EXIT
+
+make -C "$ROOT/mysql_udf" clean udf MYSQL_UDF_ABI=mysql57
+install -d -m 0755 "$PLUGIN_DIR"
+install -m 0755 "$ROOT/mysql_udf/build/$MCDB_UDF_LIBRARY" "$TEMP_LIBRARY"
+mv -f "$TEMP_LIBRARY" "$PLUGIN_DIR/$MCDB_UDF_LIBRARY"
+trap - EXIT
+
+printf '%s\n' \
+  'MultiCompress MySQL UDF library installed.' \
+  "  library: $PLUGIN_DIR/$MCDB_UDF_LIBRARY" \
+  '' \
+  'Register the UDFs once on this MySQL server:' \
+  '  make enable'

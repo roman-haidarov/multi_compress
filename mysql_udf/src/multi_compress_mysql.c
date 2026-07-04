@@ -44,7 +44,8 @@ char *multi_compress_db_version(UDF_INIT *initid, UDF_ARGS *args, char *result,
     *is_null = 0;
     *error = 0;
     /* result buffer is 255 bytes per the UDF ABI */
-    int n = snprintf(result, 255, "MCDB1 (zstd %s)", ZSTD_versionString());
+    int n = snprintf(result, 255, "multi_compress reader %s; MCDB1; zstd %s", MCDB_READER_VERSION,
+                     ZSTD_versionString());
     *length = (unsigned long)(n > 0 ? n : 0);
     return result;
 }
@@ -120,7 +121,6 @@ char *multi_compress_db_decompress(UDF_INIT *initid, UDF_ARGS *args, char *resul
     mcdb_status st = mcdb_decode((const unsigned char *)args->args[0], (size_t)args->lengths[0],
                                  &out, &out_len, err);
     if (st != MCDB_OK) {
-        *error = 1;
         *is_null = 1;
         free(out);
         return NULL;

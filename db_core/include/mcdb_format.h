@@ -18,6 +18,7 @@
 #define MCDB_MAX_ENVELOPE 16842771u
 
 #define MCDB_ERRLEN 256
+#define MCDB_READER_VERSION "0.5.0"
 
 typedef enum {
     MCDB_OK = 0,
@@ -39,6 +40,11 @@ typedef enum {
 
 mcdb_status mcdb_validate_header(const unsigned char *in, size_t in_len,
                                  uint64_t *out_original_size);
+
+/* The caller must validate the header and size out from it before calling. */
+mcdb_status mcdb_decode_into(const unsigned char *in, size_t in_len,
+                             unsigned char *out, size_t out_capacity,
+                             size_t *out_len, char *errbuf);
 
 mcdb_status mcdb_decode(const unsigned char *in, size_t in_len,
                         unsigned char **out, size_t *out_len,

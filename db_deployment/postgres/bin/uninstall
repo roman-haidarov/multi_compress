@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PG_CONFIG="${PG_CONFIG:-pg_config}"
+
+usage() {
+  cat <<'TEXT'
+Usage: sudo ./bin/uninstall [--pg-config PATH]
+
+Removes installed PostgreSQL extension files from this host. Drop the extension
+from every database first; this command cannot discover all databases/views. The
+Makefile requires CONFIRM=REMOVE_MULTI_COMPRESS before this script can run.
+TEXT
+}
+
+die() {
+  echo "multi_compress postgres uninstall: $*" >&2
+  exit 2
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --pg-config)
+      [ "$#" -ge 2 ] || die "--pg-config requires a path"
+      PG_CONFIG="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+[ "${EUID:-$(id -u)}" -eq 0 ] || die "run as root: sudo ./bin/uninstall"
+
+if [[ "$PG_CONFIG" == */* ]]; then
+  [ -x "$PG_CONFIG" ] || die "pg_config is not executable: $PG_CONFIG"
+else
+  PG_CONFIG="$(command -v "$PG_CONFIG" || true)"
+  [ -n "$PG_CONFIG" ] || die "pg_config was not found"
+fi
+PKGLIBDIR="$($PG_CONFIG --pkglibdir)"
+EXTENSION_DIR="$($PG_CONFIG --sharedir)/extension"
+
+rm -f "$PKGLIBDIR/multi_compress_pg.so" \
+      "$EXTENSION_DIR/multi_compress.control" \
+      "$EXTENSION_DIR/multi_compress--0.5.0.sql"
+
+echo "MultiCompress PostgreSQL files removed from this host."

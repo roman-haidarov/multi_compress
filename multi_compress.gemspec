@@ -27,12 +27,21 @@ Gem::Specification.new do |spec|
     "ext/**/*.{c,h,rb}",
     "ext/multi_compress/vendor/**/*",
     "ext/multi_compress/vendor/.vendored",
+    "db_core/**/*.{c,h}",
+    "postgres_extension/**/*",
+    "mysql_udf/**/*",
+    "db_deployment/**/*",
+    "multi_compress.gemspec",
     "README.md",
     "GET_STARTED.md",
     "LICENSE.txt",
     "THIRD_PARTY_NOTICES.md",
     "CHANGELOG.md"
-  ]
+  ].reject do |path|
+    File.basename(path) == ".DS_Store" ||
+      path.split(File::SEPARATOR).include?("build") ||
+      %w[.o .so .bundle .dylib .bc .d].include?(File.extname(path))
+  end
 
   spec.bindir        = "exe"
   spec.executables   = ["multi_compress"]

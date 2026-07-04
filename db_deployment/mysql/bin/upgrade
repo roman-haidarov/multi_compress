@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MYSQL="${MYSQL:-mysql}"
+DEFAULTS_FILE=""
+MYSQL_SOCKET="${MYSQL_SOCKET:-}"
+
+usage() {
+  cat <<'TEXT'
+Usage: sudo MYSQL_SOCKET=/run/mysqld/mysqld.sock ./bin/upgrade [--mysql PATH] [--defaults-extra-file PATH]
+
+Performs the required MySQL UDF upgrade order: DROP FUNCTION, replace the
+library, CREATE FUNCTION, then smoke-check. The Makefile requires
+CONFIRM=UPGRADE_MULTI_COMPRESS before this script can run.
+TEXT
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --mysql)
+      [ "$#" -ge 2 ] || { echo '--mysql requires a path' >&2; exit 2; }
+      MYSQL="$2"; shift 2 ;;
+    --defaults-extra-file)
+      [ "$#" -ge 2 ] || { echo '--defaults-extra-file requires a path' >&2; exit 2; }
+      DEFAULTS_FILE="$2"; shift 2 ;;
+    --help|-h)
+      usage; exit 0 ;;
+    *)
+      echo "multi_compress mysql upgrade: unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ "${EUID:-$(id -u)}" -eq 0 ] || { echo 'multi_compress mysql upgrade: run as root' >&2; exit 2; }
+DOCTOR_ARGS=(--mysql "$MYSQL")
+if [ -n "$DEFAULTS_FILE" ]; then
+  DOCTOR_ARGS+=(--defaults-extra-file "$DEFAULTS_FILE")
+fi
+MYSQL_SOCKET="$MYSQL_SOCKET" "$ROOT/bin/doctor" "${DOCTOR_ARGS[@]}"
+
+# shellcheck source=common
+source "$ROOT/bin/common"
+mcdb_resolve_mysql
+mcdb_mysql_args
+mcdb_read_udf_state
+mcdb_require_clean_owned_state
+mcdb_state_is_clean_enabled || mcdb_die 'upgrade requires all three MultiCompress UDFs to be enabled'
+CAPTURED_REGISTRATIONS=("${MCDB_REGISTERED_ROWS[@]}")
+mcdb_smoke_check
+
+restore_captured_registrations() {
+  local registration name dl returns
+
+  for registration in "${CAPTURED_REGISTRATIONS[@]}"; do
+    IFS=$'\t' read -r name dl <<< "$registration"
+    case "$name" in
+      multi_compress_db_version|multi_compress_db_decompress) returns='STRING' ;;
+      multi_compress_db_is_valid) returns='INTEGER' ;;
+      *) mcdb_die "captured unexpected UDF registration: $name" ;;
+    esac
+    mcdb_query "CREATE FUNCTION ${name} RETURNS ${returns} SONAME '${dl}';"
+  done
+}
+
+PLUGIN_DIR="$(mcdb_plugin_dir)"
+LIBRARY="$PLUGIN_DIR/$MCDB_UDF_LIBRARY"
+[ -f "$LIBRARY" ] || mcdb_die "installed library is missing: $LIBRARY"
+BACKUP="$PLUGIN_DIR/.${MCDB_UDF_LIBRARY}.backup.$$.$RANDOM"
+TEMP_LIBRARY="$PLUGIN_DIR/.${MCDB_UDF_LIBRARY}.new.$$.$RANDOM.tmp"
+RESTORED=0
+cleanup() {
+  rm -f "$TEMP_LIBRARY"
+  if [ "$RESTORED" -eq 1 ]; then
+    rm -f "$BACKUP"
+  fi
+}
+trap cleanup EXIT
+
+make -C "$ROOT/mysql_udf" clean udf MYSQL_UDF_ABI=mysql57
+install -m 0755 "$ROOT/mysql_udf/build/$MCDB_UDF_LIBRARY" "$TEMP_LIBRARY"
+
+if ! mcdb_drop_owned_udfs; then
+  mcdb_die 'could not drop existing MultiCompress UDFs; library was not replaced'
+fi
+if ! cp -p "$LIBRARY" "$BACKUP"; then
+  restore_captured_registrations || true
+  mcdb_die 'could not back up the installed library; original registrations were restored when possible'
+fi
+
+mv -f "$TEMP_LIBRARY" "$LIBRARY"
+if mcdb_register_expected_udfs && mcdb_smoke_check; then
+  [ "${#CAPTURED_REGISTRATIONS[@]}" -eq 3 ] || mcdb_die 'captured registration state is incomplete'
+  rm -f "$BACKUP"
+  RESTORED=1
+  echo 'MultiCompress MySQL UDFs upgraded successfully.'
+  exit 0
+fi
+
+ROLLBACK_OK=1
+mcdb_drop_owned_udfs || ROLLBACK_OK=0
+if [ -f "$BACKUP" ]; then
+  mv -f "$BACKUP" "$LIBRARY" || ROLLBACK_OK=0
+else
+  ROLLBACK_OK=0
+fi
+if ! restore_captured_registrations || ! mcdb_smoke_check; then
+  ROLLBACK_OK=0
+fi
+if [ "$ROLLBACK_OK" -eq 1 ]; then
+  RESTORED=1
+  echo 'multi_compress mysql upgrade: failed; previous library and registrations were restored' >&2
+else
+  echo 'multi_compress mysql upgrade: failed and rollback did not complete; inspect mysql.func and plugin_dir immediately' >&2
+fi
+exit 1

@@ -83,8 +83,9 @@ frame of a zero-length input. The reader returns an empty string.
 
 ## Reader algorithm (decompress / validate)
 
-A reader MUST reject, with an error (never a silent fallback), any input that
-fails any check below:
+A reader MUST reject any input that fails any check below. Ruby raises
+`MultiCompress::DataError`, PostgreSQL raises a SQL error, and the MySQL UDF
+returns SQL `NULL` while `multi_compress_db_is_valid(blob)` returns `0`.
 
 1. `19 <= length <= 16842771` (a complete, bounded envelope).
 2. `magic == "MCDB"`.
@@ -110,14 +111,19 @@ raising, so it can be used in `WHERE`/`CASE`.
 
 ## Error taxonomy
 
-| Condition | Ruby | MySQL UDF / PostgreSQL extension |
-|-----------|------|----------------------------------|
-| truncated / oversized envelope / bad magic / version | `MultiCompress::DataError` | SQL error |
-| codec/flags not v1 | `MultiCompress::DataError` | SQL error |
-| `original_size` over the cap | `MultiCompress::DataError` | SQL error |
-| invalid, trailing, or concatenated zstd frame / size mismatch | `MultiCompress::DataError` | SQL error |
-| crc32 mismatch (payload corruption) | `MultiCompress::DataError` | SQL error |
-| non-UTF-8 or NUL text on write or read | `ArgumentError` / `MultiCompress::DataError` | SQL error |
+| Condition | Ruby | PostgreSQL extension | MySQL UDF |
+|-----------|------|----------------------|-----------|
+| truncated / oversized envelope / bad magic / version | `MultiCompress::DataError` | SQL error | `NULL`, `is_valid = 0` |
+| codec/flags not v1 | `MultiCompress::DataError` | SQL error | `NULL`, `is_valid = 0` |
+| `original_size` over the cap | `MultiCompress::DataError` | SQL error | `NULL`, `is_valid = 0` |
+| invalid, trailing, or concatenated zstd frame / size mismatch | `MultiCompress::DataError` | SQL error | `NULL`, `is_valid = 0` |
+| crc32 mismatch (payload corruption) | `MultiCompress::DataError` | SQL error | `NULL`, `is_valid = 0` |
+| non-UTF-8 or NUL text on write or read | `ArgumentError` / `MultiCompress::DataError` | SQL error | `NULL`, `is_valid = 0` |
+
+
+**MySQL NULL diagnostics.** In a MySQL readable view, `payload IS NULL` cannot
+distinguish an original SQL `NULL` from a corrupt MCDB1 envelope. Diagnose a
+specific stored value with `multi_compress_db_is_valid(payload_compressed)`.
 
 ## Versioning policy
 
@@ -133,3 +139,21 @@ v1 has **no legacy/plaintext auto-detection**. To migrate an existing text
 column, add a new `LONGBLOB` column and write the envelope there; never
 reinterpret old plaintext bytes as an envelope. See the rollout steps in
 `mysql_udf/README.md` or `postgres_extension/README.md`.
+
+## Deployment and integrity notes
+
+`make verify` detects accidental corruption after extraction. It does not
+authenticate an archive because the archive's own Makefile is executed during
+installation. Use an out-of-band SHA-256, a minisign/GPG signature, or signed
+release provenance for a real trust chain.
+
+For MySQL, `@@GLOBAL.max_allowed_packet`, the Ruby driver, and the DBeaver/JDBC
+connection must all allow MCDB1 payloads up to the 16 MiB limit; the deployment
+bundle's mysql client uses `--max_allowed_packet=32M` but cannot configure Rails
+or DBeaver.
+
+Install the native library on every host that will read through a generated
+view—primary, replicas, reporting, failover, and restore targets—before
+registering UDFs, creating the PostgreSQL extension, or applying a view
+migration. A read-only view does not itself enter MySQL replication; replication
+requires the UDF on a replica only when a replicated statement invokes it.

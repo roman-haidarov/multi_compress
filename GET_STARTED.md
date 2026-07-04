@@ -909,33 +909,95 @@ text = MultiCompress::Database.decompress(blob)    # => "Привет"
 ```
 
 MCDB1 is deliberately narrow: zstd only, valid non-NUL UTF-8 text, exactly one
-zstd frame, no dictionaries/Base64, and a 16 MiB decompressed limit. The
-corresponding MySQL UDF is in `mysql_udf/`; the PostgreSQL extension is in
-`postgres_extension/`. Both are built/deployed separately from the gem. Install
-one on the relevant database server, then expose a read-only view.
+zstd frame, no dictionaries/Base64, and a 16 MiB decompressed limit.
 
-For MySQL:
+#### 1. Application developer: create the DBA bundle
 
-```sql
-CREATE VIEW events_readable AS
-SELECT id,
-       CONVERT(multi_compress_db_decompress(payload_compressed) USING utf8mb4) AS payload
-FROM events;
+The native reader is intentionally **not** built during `gem install`: it must
+be compiled on the database host, against that host's PostgreSQL/MySQL ABI.
+The developer does not hand a DBA a Git revision or a loose `.so`; they create
+a version-locked source bundle from the installed gem:
+
+```bash
+bundle exec multi_compress db package postgres --output tmp/multi-compress-postgres.tar.gz
+# or
+bundle exec multi_compress db package mysql --output tmp/multi-compress-mysql.tar.gz
 ```
 
-For PostgreSQL after `CREATE EXTENSION multi_compress WITH SCHEMA multi_compress`:
+The archive contains the shared MCDB1 decoder, the right server-side source,
+vendored zstd, checksum manifest, and a small `Makefile`/installer. It is the
+only artifact the DBA needs.
 
-```sql
-CREATE VIEW events_readable AS
-SELECT id,
-       multi_compress.multi_compress_db_decompress(payload_compressed) AS payload
-FROM events;
+#### 2. DBA: install and enable on the database server
+
+PostgreSQL, on the PostgreSQL host:
+
+```bash
+ tar -xzf multi-compress-postgres.tar.gz
+ cd multi_compress-postgres-0.5.0
+ make verify
+ make doctor
+ sudo make install
+ sudo -u postgres make enable DB=app_production \
+  MIGRATION_ROLE=app_migrations READ_ROLE=dbeaver_readonly
 ```
 
-In DBeaver, staff query `events_readable`, not the raw `LONGBLOB` / `bytea`.
-For MySQL use [`mysql_udf/README.md`](mysql_udf/README.md); for PostgreSQL use
-[`postgres_extension/README.md`](postgres_extension/README.md). The shared,
-long-term format contract is [`docs/database-envelope-v1.md`](docs/database-envelope-v1.md).
+`install` builds `multi_compress_pg.so` on that host, discovers paths through
+`pg_config`, and installs the library/control/extension SQL. Install the matching
+`postgresql-server-dev-<major>` package and a C toolchain first; `make doctor`
+checks those prerequisites before changing the server. `enable` runs
+`CREATE EXTENSION` in exactly one database. Repeat `make enable DB=...` for
+reporting databases or any separate database that must query MCDB1 columns.
+
+MySQL 5.7, on the MySQL host:
+
+```bash
+ tar -xzf multi-compress-mysql.tar.gz
+ cd multi_compress-mysql-0.5.0
+ make verify
+ make doctor MYSQL_DEFAULTS_FILE=/etc/mysql/admin.cnf
+ sudo make install MYSQL_DEFAULTS_FILE=/etc/mysql/admin.cnf
+ make enable MYSQL_DEFAULTS_FILE=/etc/mysql/admin.cnf
+```
+
+The MySQL installer verifies the local server is MySQL 5.7, asks that same
+server for `@@plugin_dir`, builds the UDF locally, and installs the library
+there. `enable` registers the functions once for that MySQL server.
+
+#### 3. Application developer: commit the readable view
+
+Do not ask DBAs or DBeaver users to type decoder calls. Generate a safe,
+quoted view definition and commit it as a Rails migration or versioned SQL:
+
+```bash
+bundle exec multi_compress db view postgres \
+  --table app.events \
+  --column payload_compressed \
+  --view admin.events_readable \
+  --columns id,created_at,status \
+  --as payload \
+  --output db/views/events_readable.sql
+```
+
+For MySQL use `db view mysql` with the same arguments. The MySQL definition
+includes `CONVERT(... USING utf8mb4)`, so Cyrillic, Kazakh text and emoji are
+returned correctly to DBeaver. If PostgreSQL was enabled in a non-default schema,
+pass `--extension-schema that_schema` to the PostgreSQL view generator.
+
+DBeaver users now make ordinary queries against the view:
+
+```sql
+SELECT id, created_at, status, payload
+FROM admin.events_readable
+WHERE id = 123;
+```
+
+The view decompresses selected rows. Filter by indexed, uncompressed fields
+before reading it; do not perform unbounded `LIKE '%text%'` searches on the
+decoded payload.
+
+The shared, long-term format contract is
+[`docs/database-envelope-v1.md`](docs/database-envelope-v1.md).
 
 ### General Ruby-side `Codec`
 

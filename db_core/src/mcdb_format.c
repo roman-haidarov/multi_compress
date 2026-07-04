@@ -171,31 +171,24 @@ mcdb_status mcdb_validate_header(const unsigned char *in, size_t in_len,
     return MCDB_OK;
 }
 
-mcdb_status mcdb_decode(const unsigned char *in, size_t in_len, unsigned char **out,
-                        size_t *out_len, char *errbuf) {
-    uint64_t original_size = 0;
-    mcdb_status st;
+static mcdb_status mcdb_decode_payload(const unsigned char *in, size_t in_len,
+                                       uint64_t original_size, unsigned char *out,
+                                       size_t out_capacity, size_t *out_len, char *errbuf) {
     const unsigned char *frame;
     size_t frame_len;
     size_t frame_size;
     unsigned long long frame_content_size;
-    unsigned char *buf;
     size_t produced;
     uint32_t expected_crc;
     uint32_t actual_crc;
 
-    if (out)
-        *out = NULL;
     if (out_len)
         *out_len = 0;
-    if (errbuf)
-        errbuf[0] = '\0';
 
-    st = mcdb_validate_header(in, in_len, &original_size);
-    if (st != MCDB_OK) {
+    if (out == NULL || out_capacity < (size_t)original_size) {
         if (errbuf)
-            snprintf(errbuf, MCDB_ERRLEN, "MCDB: %s", mcdb_status_str(st));
-        return st;
+            snprintf(errbuf, MCDB_ERRLEN, "MCDB: output buffer is too small");
+        return MCDB_ERR_SIZE_MISMATCH;
     }
 
     frame = in + MCDB_HEADER_SIZE;
@@ -222,6 +215,73 @@ mcdb_status mcdb_decode(const unsigned char *in, size_t in_len, unsigned char **
         return MCDB_ERR_FRAME_CONTENT_SIZE;
     }
 
+    produced = ZSTD_decompress(out, (size_t)original_size, frame, frame_len);
+    if (ZSTD_isError(produced)) {
+        if (errbuf)
+            snprintf(errbuf, MCDB_ERRLEN, "MCDB: zstd error: %s", ZSTD_getErrorName(produced));
+        return MCDB_ERR_DECOMPRESS;
+    }
+    if (produced != original_size) {
+        if (errbuf)
+            snprintf(errbuf, MCDB_ERRLEN, "MCDB: size mismatch (header %llu, got %zu)",
+                     (unsigned long long)original_size, produced);
+        return MCDB_ERR_SIZE_MISMATCH;
+    }
+
+    expected_crc = read_u32_le(in + MCDB_CRC_OFFSET);
+    actual_crc = mcdb_crc32(out, produced);
+    if (actual_crc != expected_crc) {
+        if (errbuf)
+            snprintf(errbuf, MCDB_ERRLEN, "MCDB: crc32 mismatch (header %u, computed %u)",
+                     expected_crc, actual_crc);
+        return MCDB_ERR_CRC;
+    }
+
+    if (!mcdb_is_valid_utf8(out, produced)) {
+        if (errbuf)
+            snprintf(errbuf, MCDB_ERRLEN,
+                     "MCDB: payload is not valid UTF-8 text or contains a NUL byte");
+        return MCDB_ERR_UTF8;
+    }
+
+    if (out_len)
+        *out_len = produced;
+    return MCDB_OK;
+}
+
+mcdb_status mcdb_decode_into(const unsigned char *in, size_t in_len, unsigned char *out,
+                             size_t out_capacity, size_t *out_len, char *errbuf) {
+    uint64_t original_size = 0;
+
+    if (out_len)
+        *out_len = 0;
+    if (errbuf)
+        errbuf[0] = '\0';
+
+    original_size = read_u64_le(in + 7);
+    return mcdb_decode_payload(in, in_len, original_size, out, out_capacity, out_len, errbuf);
+}
+
+mcdb_status mcdb_decode(const unsigned char *in, size_t in_len, unsigned char **out,
+                        size_t *out_len, char *errbuf) {
+    uint64_t original_size = 0;
+    mcdb_status st;
+    unsigned char *buf;
+
+    if (out)
+        *out = NULL;
+    if (out_len)
+        *out_len = 0;
+    if (errbuf)
+        errbuf[0] = '\0';
+
+    st = mcdb_validate_header(in, in_len, &original_size);
+    if (st != MCDB_OK) {
+        if (errbuf)
+            snprintf(errbuf, MCDB_ERRLEN, "MCDB: %s", mcdb_status_str(st));
+        return st;
+    }
+
     buf = (unsigned char *)malloc(original_size ? original_size : 1);
     if (buf == NULL) {
         if (errbuf)
@@ -229,45 +289,17 @@ mcdb_status mcdb_decode(const unsigned char *in, size_t in_len, unsigned char **
         return MCDB_ERR_ALLOC;
     }
 
-    produced = ZSTD_decompress(buf, (size_t)original_size, frame, frame_len);
-    if (ZSTD_isError(produced)) {
-        if (errbuf)
-            snprintf(errbuf, MCDB_ERRLEN, "MCDB: zstd error: %s", ZSTD_getErrorName(produced));
+    st =
+        mcdb_decode_payload(in, in_len, original_size, buf, (size_t)original_size, out_len, errbuf);
+    if (st != MCDB_OK) {
         free(buf);
-        return MCDB_ERR_DECOMPRESS;
-    }
-    if (produced != original_size) {
-        if (errbuf)
-            snprintf(errbuf, MCDB_ERRLEN, "MCDB: size mismatch (header %llu, got %zu)",
-                     (unsigned long long)original_size, produced);
-        free(buf);
-        return MCDB_ERR_SIZE_MISMATCH;
-    }
-
-    expected_crc = read_u32_le(in + MCDB_CRC_OFFSET);
-    actual_crc = mcdb_crc32(buf, produced);
-    if (actual_crc != expected_crc) {
-        if (errbuf)
-            snprintf(errbuf, MCDB_ERRLEN, "MCDB: crc32 mismatch (header %u, computed %u)",
-                     expected_crc, actual_crc);
-        free(buf);
-        return MCDB_ERR_CRC;
-    }
-
-    if (!mcdb_is_valid_utf8(buf, produced)) {
-        if (errbuf)
-            snprintf(errbuf, MCDB_ERRLEN,
-                     "MCDB: payload is not valid UTF-8 text or contains a NUL byte");
-        free(buf);
-        return MCDB_ERR_UTF8;
+        return st;
     }
 
     if (out)
         *out = buf;
     else
         free(buf);
-    if (out_len)
-        *out_len = produced;
     return MCDB_OK;
 }
 
