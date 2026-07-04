@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DATABASE="${PGDATABASE:-}"
+SCHEMA="multi_compress"
+MIGRATION_ROLE=""
+READ_ROLE=""
+PSQL="${PSQL:-psql}"
+HOST=""
+PORT=""
+USERNAME=""
+
+usage() {
+  cat <<'TEXT'
+Usage: ./bin/enable --database DATABASE --migration-role ROLE --read-role ROLE [OPTIONS]
+
+Options:
+  --schema NAME          extension schema (default: multi_compress)
+  --migration-role ROLE  role that creates the generated view migration
+  --read-role ROLE       role that reads the generated view
+  --host HOST            PostgreSQL host passed to psql
+  --port PORT            PostgreSQL port passed to psql
+  --username USER        PostgreSQL user passed to psql
+  --psql PATH            psql binary (default: psql)
+TEXT
+}
+
+die() {
+  echo "multi_compress postgres enable: $*" >&2
+  exit 2
+}
+
+validate_identifier() {
+  local value="$1"
+  local option="$2"
+  printf '%s' "$value" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$' || die "$option must be a simple SQL identifier"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --database)
+      [ "$#" -ge 2 ] || die "--database requires a value"
+      DATABASE="$2"
+      shift 2
+      ;;
+    --schema)
+      [ "$#" -ge 2 ] || die "--schema requires a value"
+      SCHEMA="$2"
+      shift 2
+      ;;
+    --migration-role)
+      [ "$#" -ge 2 ] || die "--migration-role requires a value"
+      MIGRATION_ROLE="$2"
+      shift 2
+      ;;
+    --read-role)
+      [ "$#" -ge 2 ] || die "--read-role requires a value"
+      READ_ROLE="$2"
+      shift 2
+      ;;
+    --host)
+      [ "$#" -ge 2 ] || die "--host requires a value"
+      HOST="$2"
+      shift 2
+      ;;
+    --port)
+      [ "$#" -ge 2 ] || die "--port requires a value"
+      PORT="$2"
+      shift 2
+      ;;
+    --username)
+      [ "$#" -ge 2 ] || die "--username requires a value"
+      USERNAME="$2"
+      shift 2
+      ;;
+    --psql)
+      [ "$#" -ge 2 ] || die "--psql requires a path"
+      PSQL="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+[ -n "$DATABASE" ] || die "--database is required"
+[ -n "$MIGRATION_ROLE" ] || die "--migration-role is required"
+[ -n "$READ_ROLE" ] || die "--read-role is required"
+validate_identifier "$SCHEMA" '--schema'
+validate_identifier "$MIGRATION_ROLE" '--migration-role'
+validate_identifier "$READ_ROLE" '--read-role'
+
+if [[ "$PSQL" == */* ]]; then
+  [ -x "$PSQL" ] || die "psql is not executable: $PSQL"
+else
+  PSQL="$(command -v "$PSQL" || true)"
+  [ -n "$PSQL" ] || die "psql was not found"
+fi
+
+ARGS=(-X -v ON_ERROR_STOP=1 -d "$DATABASE")
+[ -n "$HOST" ] && ARGS+=(-h "$HOST")
+[ -n "$PORT" ] && ARGS+=(-p "$PORT")
+[ -n "$USERNAME" ] && ARGS+=(-U "$USERNAME")
+
+SERVER_ENCODING="$("$PSQL" "${ARGS[@]}" -Atq -c 'SHOW server_encoding;' | tr -d '\r\n')"
+[ "$SERVER_ENCODING" = 'UTF8' ] || die "database $DATABASE uses $SERVER_ENCODING; multi_compress requires UTF8"
+
+EXISTING_SCHEMA="$("$PSQL" "${ARGS[@]}" -Atq -c "SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'multi_compress';" | tr -d '\r\n')"
+if [ -n "$EXISTING_SCHEMA" ] && [ "$EXISTING_SCHEMA" != "$SCHEMA" ]; then
+  die "multi_compress is already installed in schema $EXISTING_SCHEMA; requested schema is $SCHEMA"
+fi
+
+if [ -z "$EXISTING_SCHEMA" ]; then
+  "$PSQL" "${ARGS[@]}" <<SQL
+CREATE SCHEMA IF NOT EXISTS "$SCHEMA";
+CREATE EXTENSION multi_compress WITH SCHEMA "$SCHEMA";
+SQL
+fi
+
+"$PSQL" "${ARGS[@]}" <<SQL
+REVOKE ALL ON SCHEMA "$SCHEMA" FROM PUBLIC;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA "$SCHEMA" FROM PUBLIC;
+GRANT USAGE ON SCHEMA "$SCHEMA" TO "$MIGRATION_ROLE";
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA "$SCHEMA" TO "$MIGRATION_ROLE", "$READ_ROLE";
+SELECT "$SCHEMA".multi_compress_db_version() AS multi_compress_version;
+SQL
+
+printf '%s\n' \
+  "MultiCompress is enabled in $DATABASE.$SCHEMA." \
+  "Grant SELECT on each generated readable view to $READ_ROLE in the application migration." \
+  'Apply the generated readable-view SQL in the application migration, then query that view from DBeaver.'

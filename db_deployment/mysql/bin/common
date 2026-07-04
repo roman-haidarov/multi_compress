@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+
+MCDB_UDF_LIBRARY='multi_compress_mysql.so'
+MCDB_EMPTY_ENVELOPE_HEX='4d43444201010000000000000000000000000028b52ffd2000010000'
+MCDB_UDF_NAMES=(
+  multi_compress_db_version
+  multi_compress_db_is_valid
+  multi_compress_db_decompress
+)
+
+mcdb_die() {
+  echo "multi_compress mysql: $*" >&2
+  exit 2
+}
+
+mcdb_resolve_mysql() {
+  if [[ "$MYSQL" == */* ]]; then
+    [ -x "$MYSQL" ] || mcdb_die "mysql client is not executable: $MYSQL"
+  else
+    MYSQL="$(command -v "$MYSQL" || true)"
+    [ -n "$MYSQL" ] || mcdb_die "mysql client was not found"
+  fi
+}
+
+mcdb_mysql_args() {
+  MYSQL_ARGS=(--batch --skip-column-names --raw --max_allowed_packet=32M --protocol=SOCKET)
+  if [ -n "$DEFAULTS_FILE" ]; then
+    [ -f "$DEFAULTS_FILE" ] || mcdb_die "defaults file does not exist: $DEFAULTS_FILE"
+    MYSQL_ARGS=("--defaults-extra-file=$DEFAULTS_FILE" "${MYSQL_ARGS[@]}")
+  fi
+  if [ -n "${MYSQL_SOCKET:-}" ]; then
+    MYSQL_ARGS+=("--socket=$MYSQL_SOCKET")
+  fi
+}
+
+mcdb_query() {
+  "$MYSQL" "${MYSQL_ARGS[@]}" -e "$1"
+}
+
+mcdb_server_version() {
+  mcdb_query 'SELECT VERSION();' | tr -d '\r\n'
+}
+
+mcdb_require_mysql57() {
+  local version
+  version="$(mcdb_server_version)"
+  case "$version" in
+    5.7.*) ;;
+    *) mcdb_die "this bundle targets MySQL 5.7; server reports $version" ;;
+  esac
+}
+
+mcdb_plugin_dir() {
+  mcdb_query 'SELECT @@plugin_dir;' | tr -d '\r\n'
+}
+
+mcdb_server_socket() {
+  mcdb_query 'SELECT @@socket;' | tr -d '\r\n'
+}
+
+mcdb_server_hostname() {
+  mcdb_query 'SELECT @@hostname;' | tr -d '\r\n'
+}
+
+mcdb_server_max_allowed_packet() {
+  mcdb_query 'SELECT @@GLOBAL.max_allowed_packet;' | tr -d '\r\n'
+}
+
+mcdb_require_expected_socket() {
+  local actual_socket
+  actual_socket="$(mcdb_server_socket)"
+  [ -n "$actual_socket" ] || mcdb_die 'MySQL returned an empty @@socket'
+  if [ -n "${MYSQL_SOCKET:-}" ] && [ "$MYSQL_SOCKET" != "$actual_socket" ]; then
+    mcdb_die "connected server socket $actual_socket does not match MYSQL_SOCKET $MYSQL_SOCKET"
+  fi
+}
+
+mcdb_read_udf_state() {
+  local rows name dl
+
+  MCDB_EXPECTED_OWNED=0
+  MCDB_FOREIGN_EXPECTED=0
+  MCDB_UNEXPECTED_LIBRARY=0
+  MCDB_REGISTERED_ROWS=()
+
+  rows="$(mcdb_query "SELECT name, dl FROM mysql.func WHERE dl = '${MCDB_UDF_LIBRARY}' OR name IN ('multi_compress_db_version', 'multi_compress_db_is_valid', 'multi_compress_db_decompress') ORDER BY name;")"
+  while IFS=$'\t' read -r name dl; do
+    [ -n "$name" ] || continue
+    MCDB_REGISTERED_ROWS+=("$name"$'\t'"$dl")
+    case "$name" in
+      multi_compress_db_version|multi_compress_db_is_valid|multi_compress_db_decompress)
+        if [ "$dl" = "$MCDB_UDF_LIBRARY" ]; then
+          MCDB_EXPECTED_OWNED=$((MCDB_EXPECTED_OWNED + 1))
+        else
+          MCDB_FOREIGN_EXPECTED=$((MCDB_FOREIGN_EXPECTED + 1))
+        fi
+        ;;
+      *)
+        if [ "$dl" = "$MCDB_UDF_LIBRARY" ]; then
+          MCDB_UNEXPECTED_LIBRARY=$((MCDB_UNEXPECTED_LIBRARY + 1))
+        fi
+        ;;
+    esac
+  done <<< "$rows"
+}
+
+mcdb_state_is_clean_absent() {
+  [ "$MCDB_EXPECTED_OWNED" -eq 0 ] && [ "$MCDB_FOREIGN_EXPECTED" -eq 0 ] && [ "$MCDB_UNEXPECTED_LIBRARY" -eq 0 ]
+}
+
+mcdb_state_is_clean_enabled() {
+  [ "$MCDB_EXPECTED_OWNED" -eq 3 ] && [ "$MCDB_FOREIGN_EXPECTED" -eq 0 ] && [ "$MCDB_UNEXPECTED_LIBRARY" -eq 0 ]
+}
+
+mcdb_require_clean_owned_state() {
+  if [ "$MCDB_FOREIGN_EXPECTED" -ne 0 ]; then
+    mcdb_die 'one or more expected UDF names are registered to a foreign SONAME; refusing to modify them'
+  fi
+  if [ "$MCDB_UNEXPECTED_LIBRARY" -ne 0 ]; then
+    mcdb_die "unexpected registrations reference ${MCDB_UDF_LIBRARY}; refusing to modify the shared library"
+  fi
+}
+
+mcdb_smoke_check() {
+  local version decoded
+  version="$(mcdb_query 'SELECT multi_compress_db_version();' | tr -d '\r\n')"
+  case "$version" in
+    *'MCDB1'*) ;;
+    *) mcdb_die "version() smoke check failed: $version" ;;
+  esac
+  decoded="$(mcdb_query "SELECT multi_compress_db_decompress(UNHEX('${MCDB_EMPTY_ENVELOPE_HEX}')) = '';" | tr -d '\r\n')"
+  [ "$decoded" = '1' ] || mcdb_die 'decode smoke check failed'
+}
+
+mcdb_drop_owned_udfs() {
+  mcdb_read_udf_state
+  mcdb_require_clean_owned_state
+  for name in "${MCDB_UDF_NAMES[@]}"; do
+    if mcdb_query "SELECT COUNT(*) FROM mysql.func WHERE name = '${name}' AND dl = '${MCDB_UDF_LIBRARY}';" | tr -d '\r\n' | grep -qx '1'; then
+      mcdb_query "DROP FUNCTION ${name};"
+    fi
+  done
+}
+
+mcdb_register_expected_udfs() {
+  "$MYSQL" "${MYSQL_ARGS[@]}" < "$ROOT/mysql_udf/sql/install.sql"
+}
+
+mcdb_library_checksum() {
+  local library="$1"
+  if [ ! -f "$library" ]; then
+    printf '%s\n' 'missing'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$library" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$library" | awk '{print $1}'
+  else
+    printf '%s\n' 'unavailable (sha256sum or shasum is required)'
+  fi
+}

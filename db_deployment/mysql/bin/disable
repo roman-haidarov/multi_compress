@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MYSQL="${MYSQL:-mysql}"
+DEFAULTS_FILE=""
+MYSQL_SOCKET="${MYSQL_SOCKET:-}"
+
+usage() {
+  cat <<'TEXT'
+Usage: MYSQL_SOCKET=/run/mysqld/mysqld.sock ./bin/disable [--mysql PATH] [--defaults-extra-file PATH]
+
+Removes only MultiCompress-owned UDF registrations and leaves the native library in place.
+TEXT
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --mysql)
+      [ "$#" -ge 2 ] || { echo '--mysql requires a path' >&2; exit 2; }
+      MYSQL="$2"; shift 2 ;;
+    --defaults-extra-file)
+      [ "$#" -ge 2 ] || { echo '--defaults-extra-file requires a path' >&2; exit 2; }
+      DEFAULTS_FILE="$2"; shift 2 ;;
+    --help|-h)
+      usage; exit 0 ;;
+    *)
+      echo "multi_compress mysql disable: unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+# shellcheck source=common
+source "$ROOT/bin/common"
+mcdb_resolve_mysql
+mcdb_mysql_args
+mcdb_require_mysql57
+mcdb_require_expected_socket
+mcdb_drop_owned_udfs
+
+echo 'MultiCompress MySQL UDFs are disabled.'

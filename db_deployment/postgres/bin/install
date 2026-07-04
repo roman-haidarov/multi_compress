@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEFAULT_PG_CONFIG="${PG_CONFIG:-pg_config}"
+BUILD_PG_CONFIG="$DEFAULT_PG_CONFIG"
+RUNTIME_PG_CONFIG="$DEFAULT_PG_CONFIG"
+
+usage() {
+  cat <<'TEXT'
+Usage: sudo ./bin/install [--pg-config PATH]
+
+Builds the extension on this PostgreSQL host and installs its library, control
+file and extension SQL into the directories reported by the selected pg_config.
+
+Advanced: --build-pg-config and --runtime-pg-config let a container build with
+separate development headers while installing into the running server's paths.
+Ordinary installations should use only --pg-config, or no option at all.
+TEXT
+}
+
+die() {
+  echo "multi_compress postgres install: $*" >&2
+  exit 2
+}
+
+resolve_pg_config() {
+  local candidate="$1"
+
+  if [[ "$candidate" == */* ]]; then
+    [ -x "$candidate" ] || die "pg_config is not executable: $candidate"
+    printf '%s\n' "$candidate"
+  else
+    candidate="$(command -v "$candidate" || true)"
+    [ -n "$candidate" ] || die "pg_config was not found"
+    printf '%s\n' "$candidate"
+  fi
+}
+
+pg_major() {
+  "$1" --version | awk '{print $2}' | cut -d. -f1
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --pg-config)
+      [ "$#" -ge 2 ] || die "--pg-config requires a path"
+      BUILD_PG_CONFIG="$2"
+      RUNTIME_PG_CONFIG="$2"
+      shift 2
+      ;;
+    --build-pg-config)
+      [ "$#" -ge 2 ] || die "--build-pg-config requires a path"
+      BUILD_PG_CONFIG="$2"
+      shift 2
+      ;;
+    --runtime-pg-config)
+      [ "$#" -ge 2 ] || die "--runtime-pg-config requires a path"
+      RUNTIME_PG_CONFIG="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+[ "${EUID:-$(id -u)}" -eq 0 ] || die "run as root: sudo ./bin/install"
+BUILD_PG_CONFIG="$(resolve_pg_config "$BUILD_PG_CONFIG")"
+RUNTIME_PG_CONFIG="$(resolve_pg_config "$RUNTIME_PG_CONFIG")"
+
+BUILD_MAJOR="$(pg_major "$BUILD_PG_CONFIG")"
+RUNTIME_MAJOR="$(pg_major "$RUNTIME_PG_CONFIG")"
+case "$BUILD_MAJOR" in
+  ""|*[!0-9]*) die "could not determine PostgreSQL build major version" ;;
+esac
+case "$RUNTIME_MAJOR" in
+  ""|*[!0-9]*) die "could not determine PostgreSQL runtime major version" ;;
+esac
+[ "$BUILD_MAJOR" = "$RUNTIME_MAJOR" ] || die "build PostgreSQL major $BUILD_MAJOR does not match runtime major $RUNTIME_MAJOR"
+
+"$ROOT/bin/doctor" --pg-config "$BUILD_PG_CONFIG"
+
+make -C "$ROOT/postgres_extension" clean all PG_CONFIG="$BUILD_PG_CONFIG"
+
+PKGLIBDIR="$($RUNTIME_PG_CONFIG --pkglibdir)"
+EXTENSION_DIR="$($RUNTIME_PG_CONFIG --sharedir)/extension"
+install -d -m 0755 "$PKGLIBDIR" "$EXTENSION_DIR"
+install -m 0755 "$ROOT/postgres_extension/multi_compress_pg.so" "$PKGLIBDIR/multi_compress_pg.so"
+install -m 0644 "$ROOT/postgres_extension/multi_compress.control" "$EXTENSION_DIR/multi_compress.control"
+install -m 0644 "$ROOT/postgres_extension/sql/multi_compress--0.5.0.sql" "$EXTENSION_DIR/multi_compress--0.5.0.sql"
+
+printf '%s\n' \
+  'MultiCompress PostgreSQL files installed.' \
+  "  library: $PKGLIBDIR/multi_compress_pg.so" \
+  "  control: $EXTENSION_DIR/multi_compress.control" \
+  "  SQL:     $EXTENSION_DIR/multi_compress--0.5.0.sql" \
+  '' \
+  'Activate once per application database:' \
+  '  sudo -u postgres make enable DB=app_production'

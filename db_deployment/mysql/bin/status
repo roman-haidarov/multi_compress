@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MYSQL="${MYSQL:-mysql}"
+DEFAULTS_FILE=""
+MYSQL_SOCKET="${MYSQL_SOCKET:-}"
+
+usage() {
+  cat <<'TEXT'
+Usage: MYSQL_SOCKET=/run/mysqld/mysqld.sock ./bin/status [--mysql PATH] [--defaults-extra-file PATH]
+
+Reports MultiCompress UDF registrations. This command needs SELECT on mysql.func.
+TEXT
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --mysql)
+      [ "$#" -ge 2 ] || { echo '--mysql requires a path' >&2; exit 2; }
+      MYSQL="$2"; shift 2 ;;
+    --defaults-extra-file)
+      [ "$#" -ge 2 ] || { echo '--defaults-extra-file requires a path' >&2; exit 2; }
+      DEFAULTS_FILE="$2"; shift 2 ;;
+    --help|-h)
+      usage; exit 0 ;;
+    *)
+      echo "multi_compress mysql status: unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+# shellcheck source=common
+source "$ROOT/bin/common"
+mcdb_resolve_mysql
+mcdb_mysql_args
+mcdb_require_mysql57
+mcdb_require_expected_socket
+PLUGIN_DIR="$(mcdb_plugin_dir)"
+LIBRARY="$PLUGIN_DIR/$MCDB_UDF_LIBRARY"
+mcdb_read_udf_state
+
+printf '%s\n' \
+  "MySQL: $(mcdb_server_version)" \
+  "server hostname: $(mcdb_server_hostname)" \
+  "server socket: $(mcdb_server_socket)" \
+  "plugin directory: $PLUGIN_DIR" \
+  "library: $LIBRARY" \
+  "library sha256: $(mcdb_library_checksum "$LIBRARY")"
+
+if [ "${#MCDB_REGISTERED_ROWS[@]}" -eq 0 ]; then
+  echo 'registrations: none'
+else
+  echo 'registrations:'
+  printf '  %s\n' "${MCDB_REGISTERED_ROWS[@]}"
+fi
+
+if mcdb_state_is_clean_enabled; then
+  mcdb_smoke_check
+  echo 'state: enabled'
+elif mcdb_state_is_clean_absent; then
+  echo 'state: absent'
+else
+  echo 'state: inconsistent or foreign registration detected'
+  exit 2
+fi

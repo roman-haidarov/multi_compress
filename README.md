@@ -172,6 +172,62 @@ Or use the build script:
 ./build.sh
 ```
 
+## Command-line tool & DB column compression
+
+Installing the gem provides a gzip-style `multi_compress` executable:
+
+```bash
+multi_compress file.json          # -> file.json.zst
+multi_compress -d file.json.zst   # -> file.json
+cat big.log | multi_compress -a zstd -c > big.log.zst
+```
+
+`MultiCompress::Codec` is a general-purpose application-side envelope for a
+single database column (optional ActiveRecord `Type`/`Coder` adapters and
+optional Base64 for text columns). It is **not** the format for SQL-side
+inspection.
+
+For MySQL 5.7 or PostgreSQL + DBeaver, use the separate, frozen `MCDB1` API instead:
+
+```ruby
+require "multi_compress/database"
+
+blob = MultiCompress::Database.compress("JSON or UTF-8 text") # store in LONGBLOB / bytea
+text = MultiCompress::Database.decompress(blob)
+```
+
+For database-side reading, the installed gem creates a **self-contained DBA
+bundle** from the exact gem version — no Git clone, manual `.so` copy, or
+hand-written extension SQL:
+
+```bash
+bundle exec multi_compress db package postgres --output tmp/multi-compress-postgres.tar.gz
+# or
+bundle exec multi_compress db package mysql --output tmp/multi-compress-mysql.tar.gz
+```
+
+The DBA extracts that archive on the database host and runs `make verify`,
+`make doctor`, and `sudo make install`. PostgreSQL enablement also requires the
+migration and read roles; MySQL uses a local Unix socket and has explicit
+`upgrade`, `disable`, and `uninstall` confirmations. The bundle compiles the
+native reader against that host's real PostgreSQL/MySQL environment and installs
+it into the server-reported directory. Generate the DBeaver-facing read view
+from the application repository as well:
+
+```bash
+bundle exec multi_compress db view postgres \
+  --table app.events --column payload_compressed \
+  --view admin.events_readable --columns id,created_at,status \
+  --output db/views/events_readable.sql
+```
+
+Use `--extension-schema NAME` with the PostgreSQL view generator only when the
+DBA enabled the extension outside the default `multi_compress` schema. See
+[GET_STARTED.md](GET_STARTED.md#database-column-compression) for the full
+app-server → DBA → DBeaver flow.
+
+> The CLI writes this gem's internal LZ4 format as `.mclz4` (not `.lz4`), since it is not interchangeable with the standard `lz4` CLI.
+
 ## Requirements
 
 - Ruby >= 2.7.1

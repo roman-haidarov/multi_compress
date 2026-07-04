@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MYSQL="${MYSQL:-mysql}"
+DEFAULTS_FILE=""
+MYSQL_SOCKET="${MYSQL_SOCKET:-}"
+
+usage() {
+  cat <<'TEXT'
+Usage: sudo MYSQL_SOCKET=/run/mysqld/mysqld.sock ./bin/uninstall [--mysql PATH] [--defaults-extra-file PATH]
+
+Removes MultiCompress-owned UDF registrations and its native library. The Makefile
+requires CONFIRM=REMOVE_MULTI_COMPRESS before this script can run.
+TEXT
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --mysql)
+      [ "$#" -ge 2 ] || { echo '--mysql requires a path' >&2; exit 2; }
+      MYSQL="$2"; shift 2 ;;
+    --defaults-extra-file)
+      [ "$#" -ge 2 ] || { echo '--defaults-extra-file requires a path' >&2; exit 2; }
+      DEFAULTS_FILE="$2"; shift 2 ;;
+    --help|-h)
+      usage; exit 0 ;;
+    *)
+      echo "multi_compress mysql uninstall: unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ "${EUID:-$(id -u)}" -eq 0 ] || { echo 'multi_compress mysql uninstall: run as root' >&2; exit 2; }
+
+# shellcheck source=common
+source "$ROOT/bin/common"
+mcdb_resolve_mysql
+mcdb_mysql_args
+mcdb_require_mysql57
+mcdb_require_expected_socket
+mcdb_read_udf_state
+mcdb_require_clean_owned_state
+PLUGIN_DIR="$(mcdb_plugin_dir)"
+mcdb_drop_owned_udfs
+rm -f "$PLUGIN_DIR/$MCDB_UDF_LIBRARY"
+
+echo "MultiCompress MySQL UDFs disabled and library removed from $PLUGIN_DIR."

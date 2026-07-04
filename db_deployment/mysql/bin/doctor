@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MYSQL="${MYSQL:-mysql}"
+DEFAULTS_FILE=""
+MYSQL_SOCKET="${MYSQL_SOCKET:-}"
+
+usage() {
+  cat <<'TEXT'
+Usage: MYSQL_SOCKET=/run/mysqld/mysqld.sock ./bin/doctor [--mysql PATH] [--defaults-extra-file PATH]
+
+Run this on the MySQL 5.7 host. The bundle uses a local Unix socket so the UDF
+library is installed into the plugin_dir of that same mysqld.
+TEXT
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --mysql)
+      [ "$#" -ge 2 ] || { echo '--mysql requires a path' >&2; exit 2; }
+      MYSQL="$2"; shift 2 ;;
+    --defaults-extra-file)
+      [ "$#" -ge 2 ] || { echo '--defaults-extra-file requires a path' >&2; exit 2; }
+      DEFAULTS_FILE="$2"; shift 2 ;;
+    --help|-h)
+      usage; exit 0 ;;
+    *)
+      echo "multi_compress mysql doctor: unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+# shellcheck source=common
+source "$ROOT/bin/common"
+mcdb_resolve_mysql
+mcdb_mysql_args
+command -v make >/dev/null 2>&1 || mcdb_die 'make is required'
+command -v cc >/dev/null 2>&1 || mcdb_die 'a C compiler is required (cc/gcc/clang)'
+command -v ar >/dev/null 2>&1 || mcdb_die 'ar is required'
+mcdb_require_mysql57
+mcdb_require_expected_socket
+
+PLUGIN_DIR="$(mcdb_plugin_dir)"
+SERVER_SOCKET="$(mcdb_server_socket)"
+SERVER_HOSTNAME="$(mcdb_server_hostname)"
+MAX_ALLOWED_PACKET="$(mcdb_server_max_allowed_packet)"
+[ -n "$PLUGIN_DIR" ] || mcdb_die 'MySQL returned an empty @@plugin_dir'
+[ -d "$PLUGIN_DIR" ] || mcdb_die "@@plugin_dir is not a local directory: $PLUGIN_DIR"
+case "$MAX_ALLOWED_PACKET" in
+  ''|*[!0-9]*) mcdb_die "MySQL returned an invalid @@GLOBAL.max_allowed_packet: $MAX_ALLOWED_PACKET" ;;
+esac
+if [ "$MAX_ALLOWED_PACKET" -lt 33554432 ]; then
+  echo "multi_compress mysql doctor: WARNING @@GLOBAL.max_allowed_packet is ${MAX_ALLOWED_PACKET}; configure at least 32M for the 16 MiB MCDB1 limit" >&2
+fi
+
+printf '%s\n' \
+  "MySQL: $(mcdb_server_version)" \
+  "mysql client: $MYSQL" \
+  "server hostname: $SERVER_HOSTNAME" \
+  "server socket: $SERVER_SOCKET" \
+  "plugin directory: $PLUGIN_DIR" \
+  "max_allowed_packet: $MAX_ALLOWED_PACKET" \
+  "bundle: $ROOT" \
+  'doctor: OK'

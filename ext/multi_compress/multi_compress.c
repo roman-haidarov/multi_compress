@@ -1560,6 +1560,35 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
     return Qnil;
 }
 
+static VALUE zstd_single_frame_info(VALUE self, VALUE data) {
+    (void)self;
+    StringValue(data);
+
+    const void *src = RSTRING_PTR(data);
+    size_t src_len = (size_t)RSTRING_LEN(data);
+    size_t frame_size = ZSTD_findFrameCompressedSize(src, src_len);
+    if (ZSTD_isError(frame_size)) {
+        rb_raise(eDataError, "zstd: invalid frame: %s", ZSTD_getErrorName(frame_size));
+    }
+    if (frame_size != src_len) {
+        rb_raise(eDataError, "zstd: expected exactly one frame with no trailing bytes");
+    }
+
+    unsigned long long content_size = ZSTD_getFrameContentSize(src, src_len);
+    if (content_size == ZSTD_CONTENTSIZE_ERROR) {
+        rb_raise(eDataError, "zstd: invalid frame content size");
+    }
+    if (content_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+        rb_raise(eDataError, "zstd: frame must declare content size");
+    }
+
+    VALUE result = rb_ary_new_capa(2);
+    rb_ary_push(result, SIZET2NUM(frame_size));
+    rb_ary_push(result, ULL2NUM(content_size));
+    RB_GC_GUARD(data);
+    return result;
+}
+
 static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
     VALUE data, opts;
     scan_one_required_keywords(argc, argv, &data, &opts);
@@ -3478,6 +3507,7 @@ void Init_multi_compress(void) {
 
     rb_define_module_function(mMultiCompress, "compress", compress_compress, -1);
     rb_define_module_function(mMultiCompress, "decompress", compress_decompress, -1);
+    rb_define_module_function(mMultiCompress, "zstd_single_frame_info", zstd_single_frame_info, 1);
     rb_define_module_function(mMultiCompress, "crc32", compress_crc32, -1);
     rb_define_module_function(mMultiCompress, "adler32", compress_adler32, -1);
     rb_define_module_function(mMultiCompress, "algorithms", compress_algorithms, 0);

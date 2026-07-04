@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PG_CONFIG="${PG_CONFIG:-pg_config}"
+
+usage() {
+  cat <<'TEXT'
+Usage: ./bin/doctor [--pg-config PATH]
+
+Checks whether this PostgreSQL host can build the MultiCompress extension.
+TEXT
+}
+
+die() {
+  echo "multi_compress postgres doctor: $*" >&2
+  exit 2
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --pg-config)
+      [ "$#" -ge 2 ] || die "--pg-config requires a path"
+      PG_CONFIG="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+if [[ "$PG_CONFIG" == */* ]]; then
+  [ -x "$PG_CONFIG" ] || die "pg_config is not executable: $PG_CONFIG"
+else
+  PG_CONFIG="$(command -v "$PG_CONFIG" || true)"
+  [ -n "$PG_CONFIG" ] || die "pg_config was not found; install PostgreSQL server development files or pass --pg-config PATH"
+fi
+
+command -v make >/dev/null 2>&1 || die "make is required"
+command -v cc >/dev/null 2>&1 || die "a C compiler is required (cc/gcc/clang)"
+command -v ar >/dev/null 2>&1 || die "ar is required"
+
+PGXS="$($PG_CONFIG --pgxs 2>/dev/null || true)"
+HEADERS="$($PG_CONFIG --includedir-server 2>/dev/null || true)"
+[ -f "$PGXS" ] || die "PGXS is missing; install postgresql-server-dev for $($PG_CONFIG --version)"
+[ -f "$HEADERS/postgres.h" ] || die "PostgreSQL server headers are missing; install postgresql-server-dev for $($PG_CONFIG --version)"
+
+printf '%s\n' \
+  "PostgreSQL: $($PG_CONFIG --version)" \
+  "pg_config: $PG_CONFIG" \
+  "PGXS: $PGXS" \
+  "headers: $HEADERS" \
+  "library directory: $($PG_CONFIG --pkglibdir)" \
+  "extension directory: $($PG_CONFIG --sharedir)/extension" \
+  "bundle: $ROOT" \
+  "doctor: OK"
