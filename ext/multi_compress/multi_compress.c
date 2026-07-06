@@ -1560,6 +1560,20 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
     return Qnil;
 }
 
+static VALUE zstd_frame_dictionary_id(VALUE self, VALUE data) {
+    (void)self;
+    StringValue(data);
+
+    const void *src = RSTRING_PTR(data);
+    size_t src_len = (size_t)RSTRING_LEN(data);
+    size_t frame_size = ZSTD_findFrameCompressedSize(src, src_len);
+    if (ZSTD_isError(frame_size) || frame_size != src_len)
+        rb_raise(eDataError, "zstd: expected exactly one valid frame with no trailing bytes");
+
+    RB_GC_GUARD(data);
+    return UINT2NUM(ZSTD_getDictID_fromFrame(src, src_len));
+}
+
 static VALUE zstd_single_frame_info(VALUE self, VALUE data) {
     (void)self;
     StringValue(data);
@@ -3471,6 +3485,20 @@ static VALUE dict_algo(VALUE self) {
     return algo_to_sym(d->algo);
 }
 
+static VALUE dict_bytes(VALUE self) {
+    dictionary_t *d;
+    TypedData_Get_Struct(self, dictionary_t, &dictionary_type, d);
+    return rb_binary_str_new((const char *)d->data, (long)d->size);
+}
+
+static VALUE dict_zstd_id(VALUE self) {
+    dictionary_t *d;
+    TypedData_Get_Struct(self, dictionary_t, &dictionary_type, d);
+    if (d->algo != ALGO_ZSTD)
+        rb_raise(eUnsupportedError, "zstd_id is available only for zstd dictionaries");
+    return UINT2NUM(ZSTD_getDictID_fromDict(d->data, d->size));
+}
+
 static VALUE dict_size(VALUE self) {
     dictionary_t *d;
     TypedData_Get_Struct(self, dictionary_t, &dictionary_type, d);
@@ -3508,6 +3536,8 @@ void Init_multi_compress(void) {
     rb_define_module_function(mMultiCompress, "compress", compress_compress, -1);
     rb_define_module_function(mMultiCompress, "decompress", compress_decompress, -1);
     rb_define_module_function(mMultiCompress, "zstd_single_frame_info", zstd_single_frame_info, 1);
+    rb_define_module_function(mMultiCompress, "zstd_frame_dictionary_id", zstd_frame_dictionary_id,
+                              1);
     rb_define_module_function(mMultiCompress, "crc32", compress_crc32, -1);
     rb_define_module_function(mMultiCompress, "adler32", compress_adler32, -1);
     rb_define_module_function(mMultiCompress, "algorithms", compress_algorithms, 0);
@@ -3542,6 +3572,8 @@ void Init_multi_compress(void) {
     rb_define_singleton_method(cDictionary, "load", dict_load, -1);
     rb_define_method(cDictionary, "save", dict_save, 1);
     rb_define_method(cDictionary, "algo", dict_algo, 0);
+    rb_define_method(cDictionary, "bytes", dict_bytes, 0);
+    rb_define_method(cDictionary, "zstd_id", dict_zstd_id, 0);
     rb_define_method(cDictionary, "size", dict_size, 0);
     rb_define_singleton_method(mZstd, "train_dictionary", zstd_train_dictionary, -1);
     rb_define_singleton_method(mBrotli, "train_dictionary", brotli_train_dictionary, -1);

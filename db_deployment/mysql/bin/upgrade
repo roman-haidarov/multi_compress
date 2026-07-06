@@ -44,9 +44,20 @@ mcdb_resolve_mysql
 mcdb_mysql_args
 mcdb_read_udf_state
 mcdb_require_clean_owned_state
-mcdb_state_is_clean_enabled || mcdb_die 'upgrade requires all three MultiCompress UDFs to be enabled'
+LEGACY_MCDB1_ONLY=0
+if mcdb_state_is_clean_v1_enabled; then
+  LEGACY_MCDB1_ONLY=1
+elif ! mcdb_state_is_clean_enabled; then
+  mcdb_die 'upgrade requires either a complete MCDB1-only or MCDB1/MCDB2 owned UDF state'
+fi
 CAPTURED_REGISTRATIONS=("${MCDB_REGISTERED_ROWS[@]}")
-mcdb_smoke_check
+if [ "$LEGACY_MCDB1_ONLY" -eq 1 ]; then
+  # A genuine 0.5.x library does not advertise MCDB2 yet. Verify only its
+  # MCDB1 surface before the required DROP -> replace -> CREATE transition.
+  mcdb_v1_smoke_check
+else
+  mcdb_smoke_check
+fi
 
 restore_captured_registrations() {
   local registration name dl returns
@@ -54,8 +65,8 @@ restore_captured_registrations() {
   for registration in "${CAPTURED_REGISTRATIONS[@]}"; do
     IFS=$'\t' read -r name dl <<< "$registration"
     case "$name" in
-      multi_compress_db_version|multi_compress_db_decompress) returns='STRING' ;;
-      multi_compress_db_is_valid) returns='INTEGER' ;;
+      multi_compress_db_version|multi_compress_db_decompress|multi_compress_db_dictionary_sha256|multi_compress_db_decompress_dict) returns='STRING' ;;
+      multi_compress_db_is_valid|multi_compress_db_original_size|multi_compress_db_dictionary_ref|multi_compress_db_dictionary_zstd_id|multi_compress_db_is_valid_dict) returns='INTEGER' ;;
       *) mcdb_die "captured unexpected UDF registration: $name" ;;
     esac
     mcdb_query "CREATE FUNCTION ${name} RETURNS ${returns} SONAME '${dl}';"
@@ -89,7 +100,8 @@ fi
 
 mv -f "$TEMP_LIBRARY" "$LIBRARY"
 if mcdb_register_expected_udfs && mcdb_smoke_check; then
-  [ "${#CAPTURED_REGISTRATIONS[@]}" -eq 3 ] || mcdb_die 'captured registration state is incomplete'
+  mcdb_read_udf_state
+  mcdb_state_is_clean_enabled || mcdb_die 'upgrade did not register the complete MCDB1/MCDB2 UDF surface'
   rm -f "$BACKUP"
   RESTORED=1
   echo 'MultiCompress MySQL UDFs upgraded successfully.'

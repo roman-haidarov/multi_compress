@@ -1,4 +1,4 @@
-comment = 'MCDB1 reader for MultiCompress database envelopes'
-default_version = '0.5.0'
+comment = 'MultiCompress MCDB1/MCDB2 zstd reader'
+default_version = '0.6.0'
 module_pathname = '$libdir/multi_compress_pg'
 relocatable = true

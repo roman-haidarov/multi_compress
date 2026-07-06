@@ -19,6 +19,8 @@ class TestPostgresExtensionFiles < Minitest::Test
       src/multi_compress_pg.c
       src/mcdb_format.c
       sql/multi_compress--0.5.0.sql
+      sql/multi_compress--0.6.0.sql
+      sql/multi_compress--0.5.0--0.6.0.sql
       sql/uninstall.sql
       sql/views.sql
       sql/examples.sql
@@ -28,15 +30,18 @@ class TestPostgresExtensionFiles < Minitest::Test
     end
   end
 
-  def test_control_and_sql_expose_the_three_public_functions
+  def test_control_and_sql_expose_mcdb1_and_mcdb2_functions
     control = read("multi_compress.control")
-    sql = read("sql/multi_compress--0.5.0.sql")
+    sql = read("sql/multi_compress--0.6.0.sql")
 
-    assert_includes control, "default_version = '0.5.0'"
+    assert_includes control, "default_version = '0.6.0'"
     assert_includes control, "module_pathname = '$libdir/multi_compress_pg'"
     assert_includes sql, "CREATE FUNCTION multi_compress_db_version()"
     assert_includes sql, "CREATE FUNCTION multi_compress_db_is_valid(blob bytea)"
     assert_includes sql, "CREATE FUNCTION multi_compress_db_decompress(blob bytea)"
+    assert_includes sql, "CREATE FUNCTION multi_compress_db_original_size(blob bytea)"
+    assert_includes sql, "CREATE FUNCTION multi_compress_db_dictionary_ref(blob bytea)"
+    assert_includes sql, "CREATE FUNCTION multi_compress_db_decompress_dict("
     assert_includes sql, "STRICT"
     assert_includes sql, "PARALLEL SAFE"
   end
@@ -66,9 +71,13 @@ class TestPostgresExtensionFiles < Minitest::Test
       pg_finfo_multi_compress_db_version
       pg_finfo_multi_compress_db_is_valid
       pg_finfo_multi_compress_db_decompress
+      pg_finfo_multi_compress_db_original_size
+      pg_finfo_multi_compress_db_decompress_dict
       multi_compress_db_version
       multi_compress_db_is_valid
       multi_compress_db_decompress
+      multi_compress_db_original_size
+      multi_compress_db_decompress_dict
     ].each { |symbol| assert_includes exports, symbol }
     assert_includes exports, "local:"
     assert_includes exports, "*;"
@@ -92,6 +101,10 @@ class TestPostgresExtensionFiles < Minitest::Test
     assert_includes script, "mcdb_other_schema"
     assert_includes script, "read role reads generated Unicode view"
     assert_includes script, "generated readable view"
+    assert_includes script, "db_cli registry postgres"
+    assert_includes script, "MCDB2 dictionary view roundtrip"
+    assert_includes script, "MCDB2 registry owner has schema usage"
+    assert_includes script, "MCDB2 view preserves indexed LIMIT plan"
     assert_includes script, "trap cleanup EXIT"
     refute_includes script, "copy_postgres_build_tree"
     refute_includes script, "MCDB_PG_SO"

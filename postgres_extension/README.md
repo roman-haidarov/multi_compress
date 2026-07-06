@@ -110,3 +110,51 @@ make e2e
 
 `test/run_e2e.sh` builds against a pinned PostgreSQL Docker target and is the
 server-side acceptance gate. It is not part of the end-user installation flow.
+
+## MCDB2 dictionary-backed columns
+
+MCDB2 is an opt-in companion for one homogeneous column containing many similar
+small JSON/text values. It does not replace MCDB1. First install the 0.6 reader
+on every host, then run `make enable` once again to execute `ALTER EXTENSION
+multi_compress UPDATE` and refresh function grants.
+
+The dictionary is application data, not an extension file. Create the append-only
+registry under a dedicated NOLOGIN owner and retain every version referenced by a
+payload:
+
+```bash
+bundle exec multi_compress db registry postgres \
+  --schema app \
+  --owner mcdb_dictionary_owner \
+  --migration-role app_migrations \
+  --output db/mcdb_dictionary_registry.sql
+```
+
+For a new MCDB2 column, add a `payload_dictionary_id bigint NOT NULL` FK to
+`app.mcdb_dictionary_versions`, register one strict
+`MultiCompress::Database::Dictionary`, then generate the readable view:
+
+```bash
+bundle exec multi_compress db view postgres \
+  --table app.events \
+  --column payload_compressed \
+  --dictionary-table app.mcdb_dictionary_versions \
+  --dictionary-id-column payload_dictionary_id \
+  --view admin.events_readable \
+  --columns id,created_at,status \
+  --as payload \
+  --output db/views/events_readable.sql
+```
+
+The generated view uses an `INNER JOIN` and calls the four-argument native
+function with payload, registry id, dictionary SHA-256 and bytes. It keeps raw
+payloads/dictionary bytes out of the DBeaver role. The view owner needs source
+and registry access; DBeaver needs `SELECT` on the view and the decoder
+`EXECUTE` grant made by `make enable`.
+
+Check production query shape with `EXPLAIN (ANALYZE, BUFFERS)` on an indexed
+filter plus `LIMIT`. Do not search/order/group by decoded payload text. See
+[`docs/database-envelope-v2.md`](../docs/database-envelope-v2.md) for the full
+format and rollback contract.
+
+For MCDB2 registry DDL, pass `--payload-table`, `--payload-column`, and `--payload-dictionary-id-column` to `multi_compress db registry`; this creates the payload FK and enforces header dictionary-reference consistency.

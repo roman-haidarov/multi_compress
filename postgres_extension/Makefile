@@ -1,7 +1,7 @@
 EXTENSION   = multi_compress
 MODULE_big  = multi_compress_pg
 OBJS        = src/multi_compress_pg.o src/mcdb_format.o
-DATA        = sql/multi_compress--0.5.0.sql
+DATA        = sql/multi_compress--0.5.0.sql sql/multi_compress--0.6.0.sql sql/multi_compress--0.5.0--0.6.0.sql
 
 PG_CONFIG   ?= pg_config
 ZSTD_DIR    ?= ../ext/multi_compress/vendor/zstd/lib
@@ -56,7 +56,7 @@ $(ZSTD_OBJ_DIR)/%.o: $(ZSTD_DIR)/%.S
 $(ZSTD_LIB): $(ZSTD_OBJS) | $(BUILD)
 	$(AR) rcs $@ $^
 
-# The source wrapper includes the common MCDB1 decoder; it is not a fork.
+# The source wrapper includes the shared MCDB1/MCDB2 decoder; it is not a fork.
 src/mcdb_format.o: src/mcdb_format.c $(CORE_DIR)/src/mcdb_format.c $(CORE_DIR)/include/mcdb_format.h
 
 # Golden fixtures are committed. Regeneration is a development action only.

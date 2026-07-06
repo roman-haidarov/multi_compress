@@ -40,3 +40,22 @@ correctly. Filter by indexed, uncompressed columns before selecting through it.
 `make verify` catches accidental corruption after extraction; it does not
 authenticate an archive. The mysql client uses `--max_allowed_packet=32M`, but
 mysqld, the Ruby driver and DBeaver/JDBC must each allow the 16 MiB MCDB1 limit.
+
+## MCDB2 after reader installation
+
+After the 0.6 UDF is installed/enabled, the application owns dictionaries:
+
+```bash
+multi_compress db registry mysql --database app
+multi_compress db view mysql \
+  --table app.events --column payload_compressed \
+  --dictionary-table app.mcdb_dictionary_versions \
+  --dictionary-id-column payload_dictionary_id \
+  --view admin.events_readable --columns id,created_at,status
+```
+
+Do not put dictionary files in this bundle. MCDB2 dictionary bytes are immutable
+application records that must travel with backups and replication. Keep generated
+MySQL views MERGE-able and verify `EXPLAIN` before granting DBeaver access.
+
+For MCDB2 registry DDL, pass `--payload-table`, `--payload-column`, and `--payload-dictionary-id-column` to `multi_compress db registry`; this creates the payload FK and enforces header dictionary-reference consistency.

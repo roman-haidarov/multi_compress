@@ -58,3 +58,27 @@ columns first; do not use it for unbounded `LIKE '%text%'` searches.
 `make verify` catches accidental corruption after extraction; it does not
 authenticate an archive. Use an out-of-band SHA-256, a minisign/GPG signature,
 or signed release provenance for a real trust chain.
+
+## MCDB2 after reader installation
+
+Reader installation is deliberately separate from application data. Once a 0.6
+reader is installed and `make enable` has run, generate application-owned
+append-only dictionary registry DDL and a dictionary-readable view from the gem:
+
+```bash
+multi_compress db registry postgres \
+  --schema app --owner mcdb_dictionary_owner --migration-role app_migrations
+
+multi_compress db view postgres \
+  --table app.events --column payload_compressed \
+  --dictionary-table app.mcdb_dictionary_versions \
+  --dictionary-id-column payload_dictionary_id \
+  --view admin.events_readable --columns id,created_at,status
+```
+
+Do not place trained dictionaries in this DBA bundle. They belong in the registry
+so backups, replicas and restored databases retain the exact bytes needed by each
+MCDB2 row. The registry generator grants schema `USAGE` to its dedicated NOLOGIN
+owner because PostgreSQL internal FK checks execute with relation-owner privileges.
+
+For MCDB2 registry DDL, pass `--payload-table`, `--payload-column`, and `--payload-dictionary-id-column` to `multi_compress db registry`; this creates the payload FK and enforces header dictionary-reference consistency.

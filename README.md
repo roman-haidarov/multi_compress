@@ -187,7 +187,7 @@ single database column (optional ActiveRecord `Type`/`Coder` adapters and
 optional Base64 for text columns). It is **not** the format for SQL-side
 inspection.
 
-For MySQL 5.7 or PostgreSQL + DBeaver, use the separate, frozen `MCDB1` API instead:
+For MySQL 5.7 or PostgreSQL + DBeaver, use the SQL-readable database API. `MCDB1` is dictionary-free; `MCDB2` is opt-in for a homogeneous column with an immutable zstd dictionary registry:
 
 ```ruby
 require "multi_compress/database"
@@ -195,6 +195,17 @@ require "multi_compress/database"
 blob = MultiCompress::Database.compress("JSON or UTF-8 text") # store in LONGBLOB / bytea
 text = MultiCompress::Database.decompress(blob)
 ```
+
+For repeated small JSON/text records with the same shape, use MCDB2 and keep the
+dictionary as append-only application data:
+
+```ruby
+dictionary = MultiCompress::Database::Dictionary.train(samples, id: 42)
+blob = MultiCompress::Database.compress(payload_json, dictionary: dictionary)
+```
+
+See [`docs/database-envelope-v2.md`](docs/database-envelope-v2.md) for the
+registry, generated view, rollout and DBeaver flow.
 
 For database-side reading, the installed gem creates a **self-contained DBA
 bundle** from the exact gem version — no Git clone, manual `.so` copy, or
@@ -236,3 +247,5 @@ app-server → DBA → DBeaver flow.
 ## License
 
 MIT — see [LICENSE.txt](LICENSE.txt).
+
+For MCDB2 registry DDL, pass `--payload-table`, `--payload-column`, and `--payload-dictionary-id-column` to `multi_compress db registry`; this creates the payload FK and enforces header dictionary-reference consistency.

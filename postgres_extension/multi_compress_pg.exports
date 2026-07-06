@@ -4,9 +4,21 @@
     pg_finfo_multi_compress_db_version;
     pg_finfo_multi_compress_db_is_valid;
     pg_finfo_multi_compress_db_decompress;
+    pg_finfo_multi_compress_db_original_size;
+    pg_finfo_multi_compress_db_dictionary_ref;
+    pg_finfo_multi_compress_db_dictionary_zstd_id;
+    pg_finfo_multi_compress_db_dictionary_sha256;
+    pg_finfo_multi_compress_db_is_valid_dict;
+    pg_finfo_multi_compress_db_decompress_dict;
     multi_compress_db_version;
     multi_compress_db_is_valid;
     multi_compress_db_decompress;
+    multi_compress_db_original_size;
+    multi_compress_db_dictionary_ref;
+    multi_compress_db_dictionary_zstd_id;
+    multi_compress_db_dictionary_sha256;
+    multi_compress_db_is_valid_dict;
+    multi_compress_db_decompress_dict;
   local:
     *;
 };

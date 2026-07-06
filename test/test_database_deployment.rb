@@ -34,7 +34,7 @@ class TestDatabaseDeployment < Minitest::Test
       assert_equal "#{archive}\n", out
       assert File.file?(archive)
 
-      root = "multi_compress-postgres-0.5.0"
+      root = "multi_compress-postgres-0.6.0"
       entries = tar_entries(archive)
       %W[
         #{root}/Makefile
@@ -51,6 +51,10 @@ class TestDatabaseDeployment < Minitest::Test
         #{root}/postgres_extension/src/multi_compress_pg.c
         #{root}/postgres_extension/multi_compress.control
         #{root}/postgres_extension/sql/multi_compress--0.5.0.sql
+        #{root}/postgres_extension/sql/multi_compress--0.6.0.sql
+        #{root}/postgres_extension/sql/multi_compress--0.5.0--0.6.0.sql
+        #{root}/docs/database-envelope-v2.md
+        #{root}/docs/rfcs/0002-mcdb2-dictionaries.md
         #{root}/ext/multi_compress/vendor/zstd/lib/zstd.h
         #{root}/THIRD_PARTY_NOTICES.md
       ].each { |entry| assert_includes entries, entry }
@@ -67,7 +71,7 @@ class TestDatabaseDeployment < Minitest::Test
       _out, err, status = run_cli("package", "mysql", "--output", archive)
 
       assert_equal 0, status.exitstatus, err
-      root = "multi_compress-mysql-0.5.0"
+      root = "multi_compress-mysql-0.6.0"
       entries = tar_entries(archive)
       %W[
         #{root}/Makefile
@@ -103,6 +107,78 @@ class TestDatabaseDeployment < Minitest::Test
     assert_includes out, 'source."id"'
     assert_includes out, '"mc_reader".multi_compress_db_decompress(source."payload_compressed") AS "payload"'
     refute_includes out, 'payload_compressed,'
+  end
+
+  def test_dictionary_view_sql_uses_inner_join_and_four_argument_decoder
+    out, err, status = run_cli(
+      "view", "postgres",
+      "--table", "app.events",
+      "--column", "payload_compressed",
+      "--dictionary-table", "app.mcdb_dictionary_versions",
+      "--dictionary-id-column", "payload_dictionary_id",
+      "--view", "admin.events_readable",
+      "--columns", "id"
+    )
+
+    assert_equal 0, status.exitstatus, err
+    assert_includes out, 'JOIN "app"."mcdb_dictionary_versions" AS dictionary'
+    assert_includes out, 'multi_compress_db_decompress_dict(source."payload_compressed", source."payload_dictionary_id", dictionary."sha256", dictionary."bytes")'
+    refute_includes out, "LEFT JOIN"
+  end
+
+  def test_mysql_dictionary_view_forces_source_first_straight_join
+    out, err, status = run_cli(
+      "view", "mysql",
+      "--table", "app.events",
+      "--column", "payload_compressed",
+      "--dictionary-table", "app.mcdb_dictionary_versions",
+      "--dictionary-id-column", "payload_dictionary_id",
+      "--view", "admin.events_readable",
+      "--columns", "id"
+    )
+
+    assert_equal 0, status.exitstatus, err
+    assert_includes out, "CREATE OR REPLACE ALGORITHM=MERGE SQL SECURITY DEFINER VIEW `admin`.`events_readable`"
+    assert_includes out, "STRAIGHT_JOIN `app`.`mcdb_dictionary_versions` AS dictionary"
+    refute_includes out, "\nJOIN `app`.`mcdb_dictionary_versions`"
+  end
+
+  def test_registry_generator_emits_append_only_validation_for_both_targets
+    pg, pg_err, pg_status = run_cli(
+      "registry", "postgres", "--schema", "app", "--owner", "mcdb_dictionary_owner", "--migration-role", "app_migrations",
+      "--payload-table", "events", "--payload-column", "payload_compressed",
+      "--payload-dictionary-id-column", "payload_dictionary_id"
+    )
+    assert_equal 0, pg_status.exitstatus, pg_err
+    assert_includes pg, "mcdb_dictionary_version_validate"
+    assert_includes pg, "mcdb_dictionary_version_frozen"
+    assert_includes pg, "multi_compress_db_dictionary_sha256"
+    assert_includes pg, 'OWNER TO "mcdb_dictionary_owner"'
+    assert_includes pg, 'GRANT USAGE ON SCHEMA "app" TO "mcdb_dictionary_owner"'
+    assert_includes pg, 'multi_compress_db_dictionary_ref(NEW."payload_compressed")'
+    assert_includes pg, 'ADD CONSTRAINT "mcdb_payload_dictionary_'
+
+    mysql, mysql_err, mysql_status = run_cli(
+      "registry", "mysql", "--database", "app",
+      "--payload-table", "events", "--payload-column", "payload_compressed",
+      "--payload-dictionary-id-column", "payload_dictionary_id"
+    )
+    assert_equal 0, mysql_status.exitstatus, mysql_err
+    assert_includes mysql, "USE `app`;"
+    assert_includes mysql, "BEFORE INSERT ON `mcdb_dictionary_versions`"
+    assert_includes mysql, "SIGNAL SQLSTATE '45000'"
+    assert_includes mysql, 'multi_compress_db_dictionary_ref(NEW.`payload_compressed`)'
+    assert_includes mysql, 'FOREIGN KEY (`payload_dictionary_id`)'
+  end
+
+  def test_registry_generator_requires_all_payload_consistency_options_together
+    _out, err, status = run_cli(
+      "registry", "postgres", "--schema", "app", "--owner", "mcdb_dictionary_owner", "--migration-role", "app_migrations",
+      "--payload-table", "events"
+    )
+
+    assert_equal 2, status.exitstatus
+    assert_match(/must be used together/, err)
   end
 
   def test_mysql_view_sql_forces_utf8mb4
@@ -224,6 +300,9 @@ class TestDatabaseDeployment < Minitest::Test
 
     refute_includes enable, "uninstall.sql"
     assert_includes enable, "already enabled; no changes made"
+    assert_includes enable, "MCDB1-only UDF registrations were found"
+    assert_includes upgrade, "mcdb_state_is_clean_v1_enabled"
+    assert_includes upgrade, "complete MCDB1/MCDB2 UDF surface"
     drop_index = upgrade.index("if ! mcdb_drop_owned_udfs")
     backup_index = upgrade.index('if ! cp -p "$LIBRARY" "$BACKUP"')
     replace_index = upgrade.index('mv -f "$TEMP_LIBRARY" "$LIBRARY"')
@@ -246,6 +325,7 @@ class TestDatabaseDeployment < Minitest::Test
     assert_includes postgres_enable, "SHOW server_encoding"
     assert_includes postgres_enable, "pg_extension"
     assert_includes postgres_enable, "REVOKE EXECUTE ON ALL FUNCTIONS"
+    assert_includes postgres_enable, "ALTER EXTENSION multi_compress UPDATE"
     assert_includes postgres_makefile, "MIGRATION_ROLE"
     assert_includes postgres_makefile, "READ_ROLE"
   end
@@ -280,6 +360,8 @@ class TestDatabaseDeployment < Minitest::Test
       db_deployment/mysql/bin/status
       db_deployment/mysql/bin/upgrade
       THIRD_PARTY_NOTICES.md
+      docs/database-envelope-v2.md
+      docs/rfcs/0002-mcdb2-dictionaries.md
     ].each do |path|
       assert_includes specification.files, path
     end

@@ -28,6 +28,12 @@ class TestMysqlUdfE2EScript < Minitest::Test
     assert_includes source, "gem unpack"
     assert_includes source, "db_cli package mysql"
     assert_includes source, "db_cli view mysql"
+    assert_includes source, "db_cli registry mysql"
+    assert_includes source, "MCDB2 generated readable view"
+    assert_includes source, "MCDB2 view is MERGE-able and keeps the source PRIMARY range scan"
+    assert_includes source, "MCDB2 view did not use the source PRIMARY range scan"
+    assert_includes source, "Using temporary` / `Using filesort` here belongs to the outer ORDER BY"
+    assert_includes source, "awk -F '\\t' '$3 == \"source\" && $5 == \"range\" && $7 == \"PRIMARY\""
     assert_includes source, "make verify"
     assert_includes source, "make doctor"
     assert_includes source, "make install"
@@ -52,6 +58,8 @@ class TestMysqlUdfE2EScript < Minitest::Test
     assert_includes header, "typedef struct st_udf_init"
     assert_includes udf, "MCDB_MYSQL_UDF_ABI_57"
     assert_includes udf, "#include <zstd.h>"
+    assert_includes udf, "multi_compress_db_decompress_dict"
+    assert_includes udf, "multi_compress_db_original_size"
     refute_match(/^#ifndef ZSTD_VERSION_STRING$/, udf)
   end
 
@@ -63,6 +71,17 @@ class TestMysqlUdfE2EScript < Minitest::Test
 
     assert_includes source, "for name in corrupt_magic corrupt_payload corrupt_crc invalid_utf8 nul_text trailing_skippable trailing_frame"
     assert_includes source, 'check "$name -> NULL"'
+  end
+
+  def test_upgrade_accepts_a_real_mcdb1_only_library_before_mcdb2_is_registered
+    common = File.read(File.join(ROOT, "db_deployment/mysql/bin/common"))
+    upgrade = File.read(File.join(ROOT, "db_deployment/mysql/bin/upgrade"))
+
+    assert_includes common, "mcdb_v1_smoke_check()"
+    assert_includes common, "*'MCDB1'*)"
+    assert_includes upgrade, "LEGACY_MCDB1_ONLY=0"
+    assert_includes upgrade, "mcdb_v1_smoke_check"
+    assert_includes upgrade, "mcdb_smoke_check"
   end
 
   def test_uses_the_server_plugin_dir_and_committed_adversarial_fixtures

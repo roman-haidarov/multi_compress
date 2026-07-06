@@ -1051,3 +1051,22 @@ to the `Type` to enable `changed_in_place?` (which decompresses the old value
 on each check).
 
 This guide covers comprehensive usage of the MultiCompress gem. For advanced use cases or questions, see the source code or create an issue on GitHub.
+
+
+## MCDB2 dictionary-backed SQL columns
+
+Use `MultiCompress::Database` when PostgreSQL/MySQL/DBeaver must read a compressed
+column. MCDB1 is dictionary-free. MCDB2 is for many small, similarly shaped JSON or
+text rows and requires one immutable dictionary registry version per row:
+
+```ruby
+dictionary = MultiCompress::Database::Dictionary.train(samples, id: 42, size: 32 * 1024)
+blob = MultiCompress::Database.compress(payload_json, dictionary: dictionary)
+```
+
+Install/upgrade the native database reader before writing MCDB2 data, generate the
+append-only registry DDL with `multi_compress db registry`, then generate an INNER
+JOIN readable view with `multi_compress db view --dictionary-table ...`. The complete
+protocol and rollout contract are in [`docs/database-envelope-v2.md`](docs/database-envelope-v2.md).
+
+For MCDB2 registry DDL, pass `--payload-table`, `--payload-column`, and `--payload-dictionary-id-column` to `multi_compress db registry`; this creates the payload FK and enforces header dictionary-reference consistency.
