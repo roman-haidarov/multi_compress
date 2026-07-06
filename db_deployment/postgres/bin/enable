@@ -120,6 +120,8 @@ if [ -z "$EXISTING_SCHEMA" ]; then
 CREATE SCHEMA IF NOT EXISTS "$SCHEMA";
 CREATE EXTENSION multi_compress WITH SCHEMA "$SCHEMA";
 SQL
+else
+  "$PSQL" "${ARGS[@]}" -c 'ALTER EXTENSION multi_compress UPDATE;'
 fi
 
 "$PSQL" "${ARGS[@]}" <<SQL

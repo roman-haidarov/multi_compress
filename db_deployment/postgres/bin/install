@@ -92,13 +92,15 @@ EXTENSION_DIR="$($RUNTIME_PG_CONFIG --sharedir)/extension"
 install -d -m 0755 "$PKGLIBDIR" "$EXTENSION_DIR"
 install -m 0755 "$ROOT/postgres_extension/multi_compress_pg.so" "$PKGLIBDIR/multi_compress_pg.so"
 install -m 0644 "$ROOT/postgres_extension/multi_compress.control" "$EXTENSION_DIR/multi_compress.control"
-install -m 0644 "$ROOT/postgres_extension/sql/multi_compress--0.5.0.sql" "$EXTENSION_DIR/multi_compress--0.5.0.sql"
+for sql in "$ROOT"/postgres_extension/sql/multi_compress--*.sql; do
+  install -m 0644 "$sql" "$EXTENSION_DIR/$(basename "$sql")"
+done
 
 printf '%s\n' \
   'MultiCompress PostgreSQL files installed.' \
   "  library: $PKGLIBDIR/multi_compress_pg.so" \
   "  control: $EXTENSION_DIR/multi_compress.control" \
-  "  SQL:     $EXTENSION_DIR/multi_compress--0.5.0.sql" \
+  "  SQL:     $EXTENSION_DIR/multi_compress--0.6.0.sql (plus upgrade scripts)" \
   '' \
   'Activate once per application database:' \
   '  sudo -u postgres make enable DB=app_production'

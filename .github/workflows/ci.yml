@@ -50,7 +50,7 @@ jobs:
         run: ruby -I lib demo.rb
 
   mysql-e2e:
-    name: MySQL 5.7 UDF e2e
+    name: MySQL 5.7 MCDB1/MCDB2 UDF e2e
     needs: ruby
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -78,11 +78,13 @@ jobs:
       - name: Compile Ruby extension
         run: bundle exec rake compile
 
-      - name: Run MySQL UDF end-to-end test
+      - name: Run MySQL 5.7 MCDB1/MCDB2 end-to-end test
+        # Includes packaged-gem deployment, immutable dictionary registry,
+        # generated MERGE view, wrong-dictionary rejection and EXPLAIN checks.
         run: bash mysql_udf/test/run_e2e.sh
 
   postgres-e2e:
-    name: PostgreSQL 17 extension e2e
+    name: PostgreSQL 17 MCDB1/MCDB2 extension e2e
     needs: ruby
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -123,5 +125,7 @@ jobs:
       - name: Compile Ruby extension
         run: bundle exec rake compile
 
-      - name: Run PostgreSQL extension end-to-end test
+      - name: Run PostgreSQL 17 MCDB1/MCDB2 end-to-end test
+        # Includes extension upgrade, immutable dictionary registry, generated
+        # INNER JOIN view, read-role access and indexed LIMIT plan checks.
         run: bash postgres_extension/test/run_e2e.sh

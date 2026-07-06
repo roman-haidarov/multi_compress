@@ -74,6 +74,23 @@ compress_hex() {
     -e 'print MultiCompress::Database.compress(ENV.fetch("MCDB_TEXT")).unpack1("H*")'
 }
 
+mcdb2_fixture() {
+  MCDB_TEXT="$1" ruby -Ilib -r multi_compress -r multi_compress/database <<'RUBY'
+    samples = 256.times.map do |i|
+      %({"kind":"event","tenant":#{i % 8},"metadata":{"source":"worker","version":1,"name":"same-shape-#{i % 16}"},"payload":"#{"x" * (48 + i % 64)}"})
+    end
+
+    dictionary = MultiCompress::Database::Dictionary.train(samples, id: 42, size: 4096)
+    blob = MultiCompress::Database.compress(ENV.fetch("MCDB_TEXT"), dictionary: dictionary)
+
+    puts dictionary.id
+    puts dictionary.zstd_id
+    puts dictionary.sha256.unpack1("H*")
+    puts dictionary.bytes.unpack1("H*")
+    puts blob.unpack1("H*")
+RUBY
+}
+
 bundle_name() {
   ruby -I "$PACKAGED_GEM_ROOT/lib" -r multi_compress/version \
     -e 'print "multi_compress-mysql-#{MultiCompress::VERSION}"'
@@ -138,6 +155,26 @@ apply_readable_view() {
   docker exec -i "$CONTAINER" mysql --default-character-set=utf8mb4 < "$path"
 }
 
+apply_dictionary_readable_view() {
+  local path="$1"
+  local warnings
+  db_cli view mysql \
+    --table app.dictionary_events \
+    --column payload_compressed \
+    --dictionary-table app.mcdb_dictionary_versions \
+    --dictionary-id-column payload_dictionary_id \
+    --view admin.dictionary_events_readable \
+    --columns id \
+    --output "$path"
+  warnings=$( { cat "$path"; printf '\nSHOW WARNINGS;\n'; } | docker exec -i "$CONTAINER" mysql \
+    --default-character-set=utf8mb4 --batch --skip-column-names --raw)
+  if printf '%s\n' "$warnings" | grep -Eqi '(undefined|merge)'; then
+    echo "MySQL refused the required MERGE view algorithm:" >&2
+    printf '%s\n' "$warnings" >&2
+    exit 1
+  fi
+}
+
 ensure_ruby_extension
 prepare_packaged_gem
 build_deployment_bundle
@@ -151,9 +188,23 @@ BIG=$(ruby -e 'print "a" * 300')
 VALID_HEX=$(compress_hex "$TEXT")
 BIG_HEX=$(compress_hex "$BIG")
 CORRUPT_HEX=$(fixture_hex test/fixtures/database_v1/corrupt_crc.mcdb)
+MCDB2_FIXTURE_OUTPUT="$(mcdb2_fixture "$TEXT")"
+readarray -t MCDB2_FIXTURE <<< "$MCDB2_FIXTURE_OUTPUT"
+if [ "${#MCDB2_FIXTURE[@]}" -ne 5 ] || [ -z "${MCDB2_FIXTURE[0]}" ] || [ -z "${MCDB2_FIXTURE[4]}" ]; then
+  echo "MCDB2 fixture generator returned an invalid payload" >&2
+  exit 2
+fi
+DICT_REF="${MCDB2_FIXTURE[0]}"
+DICT_ZSTD_ID="${MCDB2_FIXTURE[1]}"
+DICT_SHA_HEX="${MCDB2_FIXTURE[2]}"
+DICT_HEX="${MCDB2_FIXTURE[3]}"
+DICT_BLOB_HEX="${MCDB2_FIXTURE[4]}"
+TEXT_BYTES=$(MCDB_TEXT="$TEXT" ruby -e 'print ENV.fetch("MCDB_TEXT").bytesize')
 BUNDLE_NAME="$(bundle_name)"
 VIEW_SQL="$(mktemp -t multi-compress-mysql-view.XXXXXX.sql)"
-trap 'rm -f "$VIEW_SQL"; cleanup' EXIT
+DICT_VIEW_SQL="$(mktemp -t multi-compress-mysql-dictionary-view.XXXXXX.sql)"
+REGISTRY_SQL="$(mktemp -t multi-compress-mysql-registry.XXXXXX.sql)"
+trap 'rm -f "$VIEW_SQL" "$DICT_VIEW_SQL" "$REGISTRY_SQL"; cleanup' EXIT
 
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker run --platform "$PLATFORM" -d --name "$CONTAINER" \
@@ -202,6 +253,35 @@ q "DROP DATABASE IF EXISTS app;
      (6, UNHEX('$VALID_HEX'));"
 apply_readable_view "$VIEW_SQL"
 
+# MCDB2: registry DDL lives in app and the generated view supplies dictionary bytes through an INNER JOIN.
+q "USE app;
+   CREATE TABLE dictionary_events (
+     id INT PRIMARY KEY,
+     payload_compressed LONGBLOB NOT NULL,
+     payload_dictionary_id BIGINT UNSIGNED NOT NULL
+   ) ENGINE=InnoDB;"
+db_cli registry mysql --database app \
+  --payload-table dictionary_events --payload-column payload_compressed \
+  --payload-dictionary-id-column payload_dictionary_id \
+  --output "$REGISTRY_SQL"
+docker exec -i "$CONTAINER" mysql --default-character-set=utf8mb4 < "$REGISTRY_SQL"
+q "USE app;
+   INSERT INTO mcdb_dictionary_versions (id, family, zstd_dict_id, sha256, bytes)
+     VALUES ($DICT_REF, 'events_payload_v1', $DICT_ZSTD_ID, UNHEX('$DICT_SHA_HEX'), UNHEX('$DICT_HEX'));
+   INSERT INTO dictionary_events (id, payload_compressed, payload_dictionary_id)
+   SELECT seq.id, UNHEX('$DICT_BLOB_HEX'), $DICT_REF
+   FROM (
+     SELECT ones.n + tens.n * 10 + hundreds.n * 100 + 1 AS id
+     FROM (SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+           UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) AS ones
+     CROSS JOIN (SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+                 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) AS tens
+     CROSS JOIN (SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+                 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) AS hundreds
+   ) AS seq
+   WHERE seq.id <= 1000;"
+apply_dictionary_readable_view "$DICT_VIEW_SQL"
+
 fails=0
 check() {
   if [ "$2" = "$3" ]; then echo "  PASS  $1"; else echo "  FAIL  $1 (got [$2] want [$3])"; fails=$((fails + 1)); fi
@@ -238,18 +318,56 @@ done
 check "is_valid false (crc)" \
   "$(q "SELECT multi_compress_db_is_valid(UNHEX('$(fixture_hex test/fixtures/database_v1/corrupt_crc.mcdb)'));")" \
   "0"
+check "MCDB2 dictionary reference" "$(q 'USE app; SELECT multi_compress_db_dictionary_ref(payload_compressed) FROM dictionary_events WHERE id=1;')" "$DICT_REF"
+check "MCDB2 original size" "$(q 'USE app; SELECT multi_compress_db_original_size(payload_compressed) FROM dictionary_events WHERE id=1;')" "$TEXT_BYTES"
+check "MCDB2 generated readable view" "$(q 'SELECT payload FROM admin.dictionary_events_readable WHERE id=1;')" "$TEXT"
+check "MCDB2 dictionary is valid" \
+  "$(q 'USE app; SELECT multi_compress_db_is_valid_dict(e.payload_compressed, e.payload_dictionary_id, d.sha256, d.bytes) FROM dictionary_events e JOIN mcdb_dictionary_versions d ON d.id = e.payload_dictionary_id WHERE e.id=1;')" \
+  "1"
+check_err "MCDB2 payload/FK mismatch rejected" "USE app; INSERT INTO dictionary_events VALUES (1001, UNHEX('$DICT_BLOB_HEX'), $((DICT_REF + 1)));"
+check "MCDB2 rejects wrong dictionary digest" \
+  "$(q 'USE app; SELECT multi_compress_db_is_valid_dict(e.payload_compressed, e.payload_dictionary_id, UNHEX(REPEAT("00", 32)), d.bytes) FROM dictionary_events e JOIN mcdb_dictionary_versions d ON d.id = e.payload_dictionary_id WHERE e.id=1;')" \
+  "0"
+MYSQL_DICT_PLAN="$(q 'EXPLAIN SELECT id, payload FROM admin.dictionary_events_readable WHERE id BETWEEN 100 AND 900 ORDER BY id LIMIT 100;')"
+if printf '%s\n' "$MYSQL_DICT_PLAN" | grep -Fq '<derived'; then
+  echo "  FAIL  MCDB2 view materialized as a derived table"
+  printf '%s\n' "$MYSQL_DICT_PLAN" >&2
+  fails=$((fails + 1))
+elif ! printf '%s\n' "$MYSQL_DICT_PLAN" | awk -F '\t' '$3 == "source" && $5 == "range" && $7 == "PRIMARY" { found = 1 } END { exit(found ? 0 : 1) }'; then
+  echo "  FAIL  MCDB2 view did not use the source PRIMARY range scan"
+  printf '%s\n' "$MYSQL_DICT_PLAN" >&2
+  fails=$((fails + 1))
+else
+  # `Using temporary` / `Using filesort` here belongs to the outer ORDER BY
+  # over a joined projection. It is not evidence that the view was materialized:
+  # MySQL reports materialized views as <derived...>. The important contract is
+  # that the source predicate is merged and reaches the PRIMARY range scan.
+  echo "  PASS  MCDB2 view is MERGE-able and keeps the source PRIMARY range scan"
+fi
 check "max_allowed_packet is reported" "$(q 'SELECT @@GLOBAL.max_allowed_packet > 0;')" "1"
 
 MYSQL_SOCKET_PATH="$(q 'SELECT @@socket;' | tr -d '\r\n')"
+# Simulate an installed 0.5.x server: only the three MCDB1 UDF registrations
+# remain. 0.6 must recognise this as upgradeable, not partial, then use the
+# documented DROP -> replace library -> CREATE lifecycle to register all nine.
 docker exec -u 0 \
   -e "MCDB_BUNDLE_ROOT=${BUNDLE_PARENT}/${BUNDLE_NAME}" \
   -e "MCDB_MYSQL_SOCKET=$MYSQL_SOCKET_PATH" \
   "$CONTAINER" sh -ceu '
+    mysql --protocol=SOCKET --socket="$MCDB_MYSQL_SOCKET" -e "
+      DROP FUNCTION multi_compress_db_decompress_dict;
+      DROP FUNCTION multi_compress_db_is_valid_dict;
+      DROP FUNCTION multi_compress_db_dictionary_sha256;
+      DROP FUNCTION multi_compress_db_dictionary_zstd_id;
+      DROP FUNCTION multi_compress_db_dictionary_ref;
+      DROP FUNCTION multi_compress_db_original_size;"
     cd "$MCDB_BUNDLE_ROOT"
+    make status MYSQL_SOCKET="$MCDB_MYSQL_SOCKET" | grep -F "state: MCDB1-only"
     make doctor MYSQL_SOCKET="$MCDB_MYSQL_SOCKET" | grep -F "server socket: $MCDB_MYSQL_SOCKET"
     make upgrade CONFIRM=UPGRADE_MULTI_COMPRESS MYSQL_SOCKET="$MCDB_MYSQL_SOCKET"
     make status MYSQL_SOCKET="$MCDB_MYSQL_SOCKET" | grep -F "state: enabled"
   '
+check "upgrade from MCDB1-only restores MCDB2 functions" "$(q 'SELECT multi_compress_db_original_size(payload_compressed) FROM app.dictionary_events WHERE id=1;')" "$TEXT_BYTES"
 check "upgrade keeps version() available" "$(q 'SELECT LOCATE(CHAR(77,67,68,66,49), multi_compress_db_version()) > 0;')" "1"
 
 # Register one expected name to a different SONAME and prove enable refuses without

@@ -93,3 +93,48 @@ invokes it.
 `make verify` catches accidental corruption after extraction; it does not
 authenticate an archive. Use an out-of-band SHA-256, minisign/GPG signature, or
 signed release provenance for a real trust chain.
+
+## MCDB2 dictionary-backed columns
+
+MCDB2 is opt-in for one homogeneous column with many similar small JSON/text
+values. Upgrade the UDF library first; the controlled `make upgrade` flow keeps
+all MCDB1 and MCDB2 functions registered.
+
+Dictionary bytes are application data. Generate the append-only registry in the
+application database, register immutable versions, and retain all referenced
+versions in backups and replicas:
+
+```bash
+bundle exec multi_compress db registry mysql --database app \
+  --output db/mcdb_dictionary_registry.sql
+```
+
+For a new MCDB2 column add `payload_dictionary_id BIGINT UNSIGNED NOT NULL` with
+a foreign key to `mcdb_dictionary_versions(id)`, then generate the view:
+
+```bash
+bundle exec multi_compress db view mysql \
+  --table app.events \
+  --column payload_compressed \
+  --dictionary-table app.mcdb_dictionary_versions \
+  --dictionary-id-column payload_dictionary_id \
+  --view admin.events_readable \
+  --columns id,created_at,status \
+  --as payload \
+  --output db/views/events_readable.sql
+```
+
+The generated MCDB2 view requests `ALGORITHM=MERGE SQL SECURITY DEFINER` and uses
+a source-first `STRAIGHT_JOIN` to the registry. That keeps an indexed outer source
+predicate from starting at the registry. It passes payload, registry id, SHA-256
+and dictionary bytes to the UDF. Keep the definition free of `DISTINCT`, aggregates,
+`GROUP BY`, `UNION`, subqueries and inner `LIMIT`; validate real queries with
+`EXPLAIN`: source must be a selective `range`/`ref` access and no `<derived>` row
+may appear. MySQL 5.7 can still report `Using temporary; Using filesort` for an
+outer `ORDER BY` over the joined projection; that is sorting, not view
+materialization. A stable definer account must remain part of backup/restore
+procedures.
+
+Details are in [`docs/database-envelope-v2.md`](../docs/database-envelope-v2.md).
+
+For MCDB2 registry DDL, pass `--payload-table`, `--payload-column`, and `--payload-dictionary-id-column` to `multi_compress db registry`; this creates the payload FK and enforces header dictionary-reference consistency.

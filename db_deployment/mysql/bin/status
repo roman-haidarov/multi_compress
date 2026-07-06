@@ -57,6 +57,8 @@ fi
 if mcdb_state_is_clean_enabled; then
   mcdb_smoke_check
   echo 'state: enabled'
+elif mcdb_state_is_clean_v1_enabled; then
+  echo 'state: MCDB1-only; run make upgrade before writing MCDB2 values'
 elif mcdb_state_is_clean_absent; then
   echo 'state: absent'
 else

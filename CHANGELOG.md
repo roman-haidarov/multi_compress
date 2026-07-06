@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.6.0]
+
+### Added
+- **MCDB2** — opt-in dictionary-backed SQL-readable envelopes for a homogeneous
+  `bytea`/`LONGBLOB` column. MCDB1 remains immutable and dictionary-free.
+- **`MultiCompress::Database::Dictionary`** — strict zstd dictionary wrapper with
+  a signed-bigint-compatible application registry id, non-zero zstd DictID and
+  SHA-256 fingerprint. `MultiCompress::Database.compress(..., dictionary:)`
+  emits the 27-byte MCDB2 envelope.
+- **Dictionary registry generator** — `multi_compress db registry postgres|mysql`
+  emits append-only registry/head DDL, metadata validation and freeze triggers.
+- **Dictionary readable views** — `multi_compress db view ... --dictionary-table
+  ... --dictionary-id-column ...` emits an INNER JOIN view that supplies the
+  registry dictionary to native decoder functions. MySQL output requests
+  `ALGORITHM=MERGE SQL SECURITY DEFINER`.
+- **Native MCDB2 readers** for PostgreSQL and MySQL 5.7: dictionary reference,
+  dictionary SHA-256/DictID helpers, validity check and dictionary decode functions.
+  They use bounded DDict caches keyed by dictionary id + SHA-256 and verify bytes
+  before cache reuse.
+- **`multi_compress_db_original_size(blob)`** on PostgreSQL and MySQL for optional
+  size-aware administrative filtering.
+- PostgreSQL 17 and MySQL 5.7 E2E coverage for dictionary registry validation,
+  generated INNER JOIN views, wrong-dictionary rejection and plan shape checks.
+
+### Changed
+- PostgreSQL deployment `make enable` upgrades an existing extension before
+  refreshing grants, so reader deployment precedes MCDB2 writes.
+- MySQL UDF upgrade now preserves registrations for all MCDB1 and MCDB2 functions.
+
+### Notes
+- A dictionary is application data, not part of a DBA reader archive. It must stay
+  immutable and be backed up/replicated with every payload that references it.
+- After the first MCDB2 write, retain a 0.6 reader on every reader host until all
+  MCDB2 rows have been retired; a 0.5 reader cannot decode version 2 envelopes.
+
 ## [0.5.0]
 
 - MCDB1 now rejects trailing bytes, skippable frames, and concatenated zstd frames.

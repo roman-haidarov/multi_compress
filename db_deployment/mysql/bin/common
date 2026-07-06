@@ -1,11 +1,22 @@
 #!/usr/bin/env bash
 
 MCDB_UDF_LIBRARY='multi_compress_mysql.so'
+MCDB_V1_UDF_NAMES=(
+  multi_compress_db_version
+  multi_compress_db_is_valid
+  multi_compress_db_decompress
+)
 MCDB_EMPTY_ENVELOPE_HEX='4d43444201010000000000000000000000000028b52ffd2000010000'
 MCDB_UDF_NAMES=(
   multi_compress_db_version
   multi_compress_db_is_valid
   multi_compress_db_decompress
+  multi_compress_db_original_size
+  multi_compress_db_dictionary_ref
+  multi_compress_db_dictionary_zstd_id
+  multi_compress_db_dictionary_sha256
+  multi_compress_db_is_valid_dict
+  multi_compress_db_decompress_dict
 )
 
 mcdb_die() {
@@ -83,24 +94,31 @@ mcdb_read_udf_state() {
   MCDB_UNEXPECTED_LIBRARY=0
   MCDB_REGISTERED_ROWS=()
 
-  rows="$(mcdb_query "SELECT name, dl FROM mysql.func WHERE dl = '${MCDB_UDF_LIBRARY}' OR name IN ('multi_compress_db_version', 'multi_compress_db_is_valid', 'multi_compress_db_decompress') ORDER BY name;")"
+  local names_sql=""
+  local expected=()
+  for name in "${MCDB_UDF_NAMES[@]}"; do
+    expected+=("'${name}'")
+  done
+  names_sql="$(IFS=,; printf '%s' "${expected[*]}")"
+
+  rows="$(mcdb_query "SELECT name, dl FROM mysql.func WHERE dl = '${MCDB_UDF_LIBRARY}' OR name IN (${names_sql}) ORDER BY name;")"
   while IFS=$'\t' read -r name dl; do
     [ -n "$name" ] || continue
     MCDB_REGISTERED_ROWS+=("$name"$'\t'"$dl")
-    case "$name" in
-      multi_compress_db_version|multi_compress_db_is_valid|multi_compress_db_decompress)
-        if [ "$dl" = "$MCDB_UDF_LIBRARY" ]; then
-          MCDB_EXPECTED_OWNED=$((MCDB_EXPECTED_OWNED + 1))
-        else
-          MCDB_FOREIGN_EXPECTED=$((MCDB_FOREIGN_EXPECTED + 1))
-        fi
-        ;;
-      *)
-        if [ "$dl" = "$MCDB_UDF_LIBRARY" ]; then
-          MCDB_UNEXPECTED_LIBRARY=$((MCDB_UNEXPECTED_LIBRARY + 1))
-        fi
-        ;;
-    esac
+    local expected_name=0
+    local candidate
+    for candidate in "${MCDB_UDF_NAMES[@]}"; do
+      if [ "$candidate" = "$name" ]; then expected_name=1; break; fi
+    done
+    if [ "$expected_name" -eq 1 ]; then
+      if [ "$dl" = "$MCDB_UDF_LIBRARY" ]; then
+        MCDB_EXPECTED_OWNED=$((MCDB_EXPECTED_OWNED + 1))
+      else
+        MCDB_FOREIGN_EXPECTED=$((MCDB_FOREIGN_EXPECTED + 1))
+      fi
+    elif [ "$dl" = "$MCDB_UDF_LIBRARY" ]; then
+      MCDB_UNEXPECTED_LIBRARY=$((MCDB_UNEXPECTED_LIBRARY + 1))
+    fi
   done <<< "$rows"
 }
 
@@ -109,7 +127,31 @@ mcdb_state_is_clean_absent() {
 }
 
 mcdb_state_is_clean_enabled() {
-  [ "$MCDB_EXPECTED_OWNED" -eq 3 ] && [ "$MCDB_FOREIGN_EXPECTED" -eq 0 ] && [ "$MCDB_UNEXPECTED_LIBRARY" -eq 0 ]
+  [ "$MCDB_EXPECTED_OWNED" -eq "${#MCDB_UDF_NAMES[@]}" ] && [ "$MCDB_FOREIGN_EXPECTED" -eq 0 ] && [ "$MCDB_UNEXPECTED_LIBRARY" -eq 0 ]
+}
+
+mcdb_has_owned_registration() {
+  local target="$1" registration name dl
+  for registration in "${MCDB_REGISTERED_ROWS[@]}"; do
+    IFS=$'\t' read -r name dl <<< "$registration"
+    [ "$name" = "$target" ] && [ "$dl" = "$MCDB_UDF_LIBRARY" ] && return 0
+  done
+  return 1
+}
+
+# A 0.5.x host has only the three MCDB1 UDF registrations. It is a known,
+# upgradeable state, not a partial installation. The 0.6 upgrade replaces the
+# library using MySQL's required DROP -> replace -> CREATE order and registers
+# the full MCDB1/MCDB2 surface.
+mcdb_state_is_clean_v1_enabled() {
+  local name
+  [ "$MCDB_EXPECTED_OWNED" -eq "${#MCDB_V1_UDF_NAMES[@]}" ] || return 1
+  [ "$MCDB_FOREIGN_EXPECTED" -eq 0 ] || return 1
+  [ "$MCDB_UNEXPECTED_LIBRARY" -eq 0 ] || return 1
+  for name in "${MCDB_V1_UDF_NAMES[@]}"; do
+    mcdb_has_owned_registration "$name" || return 1
+  done
+  return 0
 }
 
 mcdb_require_clean_owned_state() {
@@ -121,15 +163,25 @@ mcdb_require_clean_owned_state() {
   fi
 }
 
-mcdb_smoke_check() {
+mcdb_v1_smoke_check() {
   local version decoded
   version="$(mcdb_query 'SELECT multi_compress_db_version();' | tr -d '\r\n')"
   case "$version" in
     *'MCDB1'*) ;;
-    *) mcdb_die "version() smoke check failed: $version" ;;
+    *) mcdb_die "MCDB1 version() smoke check failed: $version" ;;
   esac
   decoded="$(mcdb_query "SELECT multi_compress_db_decompress(UNHEX('${MCDB_EMPTY_ENVELOPE_HEX}')) = '';" | tr -d '\r\n')"
   [ "$decoded" = '1' ] || mcdb_die 'decode smoke check failed'
+}
+
+mcdb_smoke_check() {
+  local version
+  mcdb_v1_smoke_check
+  version="$(mcdb_query 'SELECT multi_compress_db_version();' | tr -d '\r\n')"
+  case "$version" in
+    *'MCDB1'*'MCDB2'*) ;;
+    *) mcdb_die "MCDB1/MCDB2 version() smoke check failed: $version" ;;
+  esac
 }
 
 mcdb_drop_owned_udfs() {

@@ -10,7 +10,7 @@ usage() {
   cat <<'TEXT'
 Usage: MYSQL_SOCKET=/run/mysqld/mysqld.sock ./bin/enable [--mysql PATH] [--defaults-extra-file PATH]
 
-Registers the three MultiCompress UDFs once. Existing healthy registrations are
+Registers the MultiCompress MCDB1/MCDB2 UDFs once. Existing healthy registrations are
 left untouched; this command never drops functions automatically.
 TEXT
 }
@@ -51,6 +51,10 @@ if mcdb_state_is_clean_enabled; then
   mcdb_smoke_check
   echo 'MultiCompress MySQL UDFs are already enabled; no changes made.'
   exit 0
+fi
+
+if mcdb_state_is_clean_v1_enabled; then
+  mcdb_die 'MCDB1-only UDF registrations were found; run make upgrade to install the MCDB2 reader surface'
 fi
 
 mcdb_require_clean_owned_state

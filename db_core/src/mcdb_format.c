@@ -1,63 +1,29 @@
 #include "mcdb_format.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
 #include <zstd.h>
 
-typedef char
-    mcdb_envelope_bound_check[(MCDB_MAX_ENVELOPE ==
-                               (unsigned)(MCDB_HEADER_SIZE + ZSTD_COMPRESSBOUND(MCDB_MAX_OUTPUT)))
-                                  ? 1
-                                  : -1];
-
-static const uint32_t MCDB_CRC32_TABLE[256] = {
-    0x00000000U, 0x77073096U, 0xEE0E612CU, 0x990951BAU, 0x076DC419U, 0x706AF48FU, 0xE963A535U,
-    0x9E6495A3U, 0x0EDB8832U, 0x79DCB8A4U, 0xE0D5E91EU, 0x97D2D988U, 0x09B64C2BU, 0x7EB17CBDU,
-    0xE7B82D07U, 0x90BF1D91U, 0x1DB71064U, 0x6AB020F2U, 0xF3B97148U, 0x84BE41DEU, 0x1ADAD47DU,
-    0x6DDDE4EBU, 0xF4D4B551U, 0x83D385C7U, 0x136C9856U, 0x646BA8C0U, 0xFD62F97AU, 0x8A65C9ECU,
-    0x14015C4FU, 0x63066CD9U, 0xFA0F3D63U, 0x8D080DF5U, 0x3B6E20C8U, 0x4C69105EU, 0xD56041E4U,
-    0xA2677172U, 0x3C03E4D1U, 0x4B04D447U, 0xD20D85FDU, 0xA50AB56BU, 0x35B5A8FAU, 0x42B2986CU,
-    0xDBBBC9D6U, 0xACBCF940U, 0x32D86CE3U, 0x45DF5C75U, 0xDCD60DCFU, 0xABD13D59U, 0x26D930ACU,
-    0x51DE003AU, 0xC8D75180U, 0xBFD06116U, 0x21B4F4B5U, 0x56B3C423U, 0xCFBA9599U, 0xB8BDA50FU,
-    0x2802B89EU, 0x5F058808U, 0xC60CD9B2U, 0xB10BE924U, 0x2F6F7C87U, 0x58684C11U, 0xC1611DABU,
-    0xB6662D3DU, 0x76DC4190U, 0x01DB7106U, 0x98D220BCU, 0xEFD5102AU, 0x71B18589U, 0x06B6B51FU,
-    0x9FBFE4A5U, 0xE8B8D433U, 0x7807C9A2U, 0x0F00F934U, 0x9609A88EU, 0xE10E9818U, 0x7F6A0DBBU,
-    0x086D3D2DU, 0x91646C97U, 0xE6635C01U, 0x6B6B51F4U, 0x1C6C6162U, 0x856530D8U, 0xF262004EU,
-    0x6C0695EDU, 0x1B01A57BU, 0x8208F4C1U, 0xF50FC457U, 0x65B0D9C6U, 0x12B7E950U, 0x8BBEB8EAU,
-    0xFCB9887CU, 0x62DD1DDFU, 0x15DA2D49U, 0x8CD37CF3U, 0xFBD44C65U, 0x4DB26158U, 0x3AB551CEU,
-    0xA3BC0074U, 0xD4BB30E2U, 0x4ADFA541U, 0x3DD895D7U, 0xA4D1C46DU, 0xD3D6F4FBU, 0x4369E96AU,
-    0x346ED9FCU, 0xAD678846U, 0xDA60B8D0U, 0x44042D73U, 0x33031DE5U, 0xAA0A4C5FU, 0xDD0D7CC9U,
-    0x5005713CU, 0x270241AAU, 0xBE0B1010U, 0xC90C2086U, 0x5768B525U, 0x206F85B3U, 0xB966D409U,
-    0xCE61E49FU, 0x5EDEF90EU, 0x29D9C998U, 0xB0D09822U, 0xC7D7A8B4U, 0x59B33D17U, 0x2EB40D81U,
-    0xB7BD5C3BU, 0xC0BA6CADU, 0xEDB88320U, 0x9ABFB3B6U, 0x03B6E20CU, 0x74B1D29AU, 0xEAD54739U,
-    0x9DD277AFU, 0x04DB2615U, 0x73DC1683U, 0xE3630B12U, 0x94643B84U, 0x0D6D6A3EU, 0x7A6A5AA8U,
-    0xE40ECF0BU, 0x9309FF9DU, 0x0A00AE27U, 0x7D079EB1U, 0xF00F9344U, 0x8708A3D2U, 0x1E01F268U,
-    0x6906C2FEU, 0xF762575DU, 0x806567CBU, 0x196C3671U, 0x6E6B06E7U, 0xFED41B76U, 0x89D32BE0U,
-    0x10DA7A5AU, 0x67DD4ACCU, 0xF9B9DF6FU, 0x8EBEEFF9U, 0x17B7BE43U, 0x60B08ED5U, 0xD6D6A3E8U,
-    0xA1D1937EU, 0x38D8C2C4U, 0x4FDFF252U, 0xD1BB67F1U, 0xA6BC5767U, 0x3FB506DDU, 0x48B2364BU,
-    0xD80D2BDAU, 0xAF0A1B4CU, 0x36034AF6U, 0x41047A60U, 0xDF60EFC3U, 0xA867DF55U, 0x316E8EEFU,
-    0x4669BE79U, 0xCB61B38CU, 0xBC66831AU, 0x256FD2A0U, 0x5268E236U, 0xCC0C7795U, 0xBB0B4703U,
-    0x220216B9U, 0x5505262FU, 0xC5BA3BBEU, 0xB2BD0B28U, 0x2BB45A92U, 0x5CB36A04U, 0xC2D7FFA7U,
-    0xB5D0CF31U, 0x2CD99E8BU, 0x5BDEAE1DU, 0x9B64C2B0U, 0xEC63F226U, 0x756AA39CU, 0x026D930AU,
-    0x9C0906A9U, 0xEB0E363FU, 0x72076785U, 0x05005713U, 0x95BF4A82U, 0xE2B87A14U, 0x7BB12BAEU,
-    0x0CB61B38U, 0x92D28E9BU, 0xE5D5BE0DU, 0x7CDCEFB7U, 0x0BDBDF21U, 0x86D3D2D4U, 0xF1D4E242U,
-    0x68DDB3F8U, 0x1FDA836EU, 0x81BE16CDU, 0xF6B9265BU, 0x6FB077E1U, 0x18B74777U, 0x88085AE6U,
-    0xFF0F6A70U, 0x66063BCAU, 0x11010B5CU, 0x8F659EFFU, 0xF862AE69U, 0x616BFFD3U, 0x166CCF45U,
-    0xA00AE278U, 0xD70DD2EEU, 0x4E048354U, 0x3903B3C2U, 0xA7672661U, 0xD06016F7U, 0x4969474DU,
-    0x3E6E77DBU, 0xAED16A4AU, 0xD9D65ADCU, 0x40DF0B66U, 0x37D83BF0U, 0xA9BCAE53U, 0xDEBB9EC5U,
-    0x47B2CF7FU, 0x30B5FFE9U, 0xBDBDF21CU, 0xCABAC28AU, 0x53B39330U, 0x24B4A3A6U, 0xBAD03605U,
-    0xCDD70693U, 0x54DE5729U, 0x23D967BFU, 0xB3667A2EU, 0xC4614AB8U, 0x5D681B02U, 0x2A6F2B94U,
-    0xB40BBE37U, 0xC30C8EA1U, 0x5A05DF1BU, 0x2D02EF8DU,
-};
+typedef char mcdb_v1_envelope_bound_check
+    [(MCDB_MAX_ENVELOPE_V1 == (unsigned)(MCDB_V1_HEADER_SIZE + ZSTD_COMPRESSBOUND(MCDB_MAX_OUTPUT)))
+         ? 1
+         : -1];
+typedef char mcdb_v2_envelope_bound_check
+    [(MCDB_MAX_ENVELOPE_V2 == (unsigned)(MCDB_V2_HEADER_SIZE + ZSTD_COMPRESSBOUND(MCDB_MAX_OUTPUT)))
+         ? 1
+         : -1];
 
 static uint32_t mcdb_crc32(const unsigned char *data, size_t len) {
     uint32_t crc = 0xFFFFFFFFU;
     size_t i;
+    int bit;
 
     for (i = 0; i < len; i++) {
-        crc = MCDB_CRC32_TABLE[(crc ^ data[i]) & 0xFFU] ^ (crc >> 8);
+        crc ^= data[i];
+        for (bit = 0; bit < 8; bit++)
+            crc = (crc & 1U) ? ((crc >> 1) ^ 0xEDB88320U) : (crc >> 1);
     }
     return crc ^ 0xFFFFFFFFU;
 }
@@ -65,7 +31,6 @@ static uint32_t mcdb_crc32(const unsigned char *data, size_t len) {
 static uint64_t read_u64_le(const unsigned char *p) {
     uint64_t v = 0;
     int i;
-
     for (i = 0; i < 8; i++)
         v |= (uint64_t)p[i] << (8 * i);
     return v;
@@ -77,122 +42,169 @@ static uint32_t read_u32_le(const unsigned char *p) {
 
 static int mcdb_is_valid_utf8(const unsigned char *s, size_t len) {
     size_t i = 0;
-
     while (i < len) {
-        unsigned char c;
+        unsigned char c = s[i];
         size_t n;
-        uint32_t cp;
-        unsigned char lo2;
-        unsigned char hi2;
+        unsigned char lo2 = 0x80;
+        unsigned char hi2 = 0xBF;
         size_t k;
-
-        c = s[i];
-        n = 0;
-        cp = 0;
-        lo2 = 0x80;
-        hi2 = 0xBF;
 
         if (c < 0x80) {
             if (c == 0)
                 return 0;
-            i += 1;
+            i++;
             continue;
         }
-
         if ((c & 0xE0) == 0xC0) {
-            n = 2;
-            cp = c & 0x1F;
             if (c < 0xC2)
                 return 0;
+            n = 2;
         } else if ((c & 0xF0) == 0xE0) {
             n = 3;
-            cp = c & 0x0F;
             if (c == 0xE0)
-                lo2 = 0xA0; /* no overlong */
+                lo2 = 0xA0;
             if (c == 0xED)
-                hi2 = 0x9F; /* no surrogates */
+                hi2 = 0x9F;
         } else if ((c & 0xF8) == 0xF0) {
-            n = 4;
-            cp = c & 0x07;
-            if (c < 0xF0 || c > 0xF4)
+            if (c > 0xF4)
                 return 0;
+            n = 4;
             if (c == 0xF0)
-                lo2 = 0x90; /* no overlong */
+                lo2 = 0x90;
             if (c == 0xF4)
-                hi2 = 0x8F; /* <= U+10FFFF */
+                hi2 = 0x8F;
         } else {
             return 0;
         }
-
         if (i + n > len)
             return 0;
         for (k = 1; k < n; k++) {
-            unsigned char cc;
-            unsigned char lo;
-            unsigned char hi;
-
-            cc = s[i + k];
-            lo = (k == 1) ? lo2 : 0x80;
-            hi = (k == 1) ? hi2 : 0xBF;
+            unsigned char cc = s[i + k];
+            unsigned char lo = k == 1 ? lo2 : 0x80;
+            unsigned char hi = k == 1 ? hi2 : 0xBF;
             if (cc < lo || cc > hi)
                 return 0;
-            cp = (cp << 6) | (cc & 0x3F);
         }
-        (void)cp;
         i += n;
     }
     return 1;
 }
 
-mcdb_status mcdb_validate_header(const unsigned char *in, size_t in_len,
-                                 uint64_t *out_original_size) {
-    uint64_t original_size;
+mcdb_status mcdb_parse_header(const unsigned char *in, size_t in_len, mcdb_header *out_header) {
+    mcdb_header header;
+    size_t max_envelope;
 
-    if (in == NULL || in_len < MCDB_HEADER_SIZE)
+    if (in == NULL || in_len < MCDB_V1_HEADER_SIZE)
         return MCDB_ERR_TRUNCATED;
-    if (in_len > MCDB_MAX_ENVELOPE)
-        return MCDB_ERR_ENVELOPE_SIZE;
     if (in[0] != MCDB_MAGIC0 || in[1] != MCDB_MAGIC1 || in[2] != MCDB_MAGIC2 ||
         in[3] != MCDB_MAGIC3)
         return MCDB_ERR_MAGIC;
-    if (in[4] != MCDB_VERSION)
+    if (in[4] != MCDB_VERSION_V1 && in[4] != MCDB_VERSION_V2)
         return MCDB_ERR_VERSION;
+
+    memset(&header, 0, sizeof(header));
+    header.version = in[4];
+    header.header_size =
+        header.version == MCDB_VERSION_V2 ? MCDB_V2_HEADER_SIZE : MCDB_V1_HEADER_SIZE;
+    max_envelope = header.version == MCDB_VERSION_V2 ? MCDB_MAX_ENVELOPE_V2 : MCDB_MAX_ENVELOPE_V1;
+
+    if (in_len < header.header_size)
+        return MCDB_ERR_TRUNCATED;
+    if (in_len > max_envelope)
+        return MCDB_ERR_ENVELOPE_SIZE;
     if (in[5] != MCDB_CODEC_ZSTD)
         return MCDB_ERR_CODEC;
-    if (in[6] != MCDB_FLAGS_V1)
+    if (in[6] != MCDB_FLAGS_NONE)
         return MCDB_ERR_FLAGS;
 
-    original_size = read_u64_le(in + 7);
-    if (original_size > MCDB_MAX_OUTPUT)
+    header.original_size = read_u64_le(in + MCDB_ORIGINAL_SIZE_OFFSET);
+    if (header.original_size > MCDB_MAX_OUTPUT)
         return MCDB_ERR_SIZE_LIMIT;
 
-    if (out_original_size)
-        *out_original_size = original_size;
+    if (header.version == MCDB_VERSION_V2) {
+        header.dictionary_ref = read_u64_le(in + MCDB_DICTIONARY_REF_OFFSET);
+        if (header.dictionary_ref == 0 || header.dictionary_ref > MCDB_MAX_DICTIONARY_REF)
+            return MCDB_ERR_DICTIONARY_REF;
+    }
+
+    if (out_header)
+        *out_header = header;
     return MCDB_OK;
 }
 
-static mcdb_status mcdb_decode_payload(const unsigned char *in, size_t in_len,
-                                       uint64_t original_size, unsigned char *out,
-                                       size_t out_capacity, size_t *out_len, char *errbuf) {
-    const unsigned char *frame;
-    size_t frame_len;
-    size_t frame_size;
-    unsigned long long frame_content_size;
-    size_t produced;
-    uint32_t expected_crc;
-    uint32_t actual_crc;
+mcdb_status mcdb_validate_header(const unsigned char *in, size_t in_len,
+                                 uint64_t *out_original_size) {
+    mcdb_header header;
+    mcdb_status st = mcdb_parse_header(in, in_len, &header);
+    if (st != MCDB_OK)
+        return st;
+    if (header.version != MCDB_VERSION_V1)
+        return MCDB_ERR_VERSION;
+    if (out_original_size)
+        *out_original_size = header.original_size;
+    return MCDB_OK;
+}
 
-    if (out_len)
-        *out_len = 0;
+mcdb_status mcdb_validate_v2_header(const unsigned char *in, size_t in_len,
+                                    uint64_t *out_original_size, uint64_t *out_dictionary_ref) {
+    mcdb_header header;
+    mcdb_status st = mcdb_parse_header(in, in_len, &header);
+    if (st != MCDB_OK)
+        return st;
+    if (header.version != MCDB_VERSION_V2)
+        return MCDB_ERR_VERSION;
+    if (out_original_size)
+        *out_original_size = header.original_size;
+    if (out_dictionary_ref)
+        *out_dictionary_ref = header.dictionary_ref;
+    return MCDB_OK;
+}
 
-    if (out == NULL || out_capacity < (size_t)original_size) {
-        if (errbuf)
-            snprintf(errbuf, MCDB_ERRLEN, "MCDB: output buffer is too small");
-        return MCDB_ERR_SIZE_MISMATCH;
+mcdb_status mcdb_validate_dictionary(const unsigned char *dictionary, size_t dictionary_len,
+                                     uint32_t *out_zstd_dictionary_id) {
+    uint32_t dict_id;
+    if (dictionary == NULL || dictionary_len == 0 || dictionary_len > MCDB_MAX_DICTIONARY_BYTES)
+        return MCDB_ERR_DICTIONARY_SIZE;
+    dict_id = ZSTD_getDictID_fromDict(dictionary, dictionary_len);
+    if (dict_id == 0)
+        return MCDB_ERR_DICTIONARY_ID;
+    if (out_zstd_dictionary_id)
+        *out_zstd_dictionary_id = dict_id;
+    return MCDB_OK;
+}
+
+uint32_t mcdb_zstd_frame_dictionary_id(const unsigned char *frame, size_t frame_len) {
+    if (frame == NULL || frame_len == 0)
+        return 0;
+    return ZSTD_getDictID_fromFrame(frame, frame_len);
+}
+
+uint64_t mcdb_dictionary_ref(const unsigned char *in, size_t in_len, mcdb_status *out_status) {
+    mcdb_header header;
+    mcdb_status st = mcdb_parse_header(in, in_len, &header);
+    if (out_status)
+        *out_status = st;
+    if (st != MCDB_OK || header.version != MCDB_VERSION_V2) {
+        if (out_status && st == MCDB_OK)
+            *out_status = MCDB_ERR_VERSION;
+        return 0;
     }
+    return header.dictionary_ref;
+}
 
-    frame = in + MCDB_HEADER_SIZE;
-    frame_len = in_len - MCDB_HEADER_SIZE;
+static mcdb_status mcdb_validate_frame(const unsigned char *in, size_t in_len,
+                                       const mcdb_header *header, const unsigned char **out_frame,
+                                       size_t *out_frame_len, char *errbuf) {
+    const unsigned char *frame = in + header->header_size;
+    size_t frame_len = in_len - header->header_size;
+    size_t frame_size;
+    unsigned long long content_size;
+
+    if (frame_len == 0) {
+        if (errbuf)
+            snprintf(errbuf, MCDB_ERRLEN, "MCDB: missing zstd frame");
+        return MCDB_ERR_DECOMPRESS;
+    }
     frame_size = ZSTD_findFrameCompressedSize(frame, frame_len);
     if (ZSTD_isError(frame_size)) {
         if (errbuf)
@@ -206,28 +218,31 @@ static mcdb_status mcdb_decode_payload(const unsigned char *in, size_t in_len,
                      "MCDB: zstd frame has trailing bytes or concatenated frames");
         return MCDB_ERR_TRAILING_DATA;
     }
-
-    frame_content_size = ZSTD_getFrameContentSize(frame, frame_len);
-    if (frame_content_size == ZSTD_CONTENTSIZE_ERROR ||
-        frame_content_size == ZSTD_CONTENTSIZE_UNKNOWN || frame_content_size != original_size) {
+    content_size = ZSTD_getFrameContentSize(frame, frame_len);
+    if (content_size == ZSTD_CONTENTSIZE_ERROR || content_size == ZSTD_CONTENTSIZE_UNKNOWN ||
+        content_size != header->original_size) {
         if (errbuf)
             snprintf(errbuf, MCDB_ERRLEN, "MCDB: zstd frame content size does not match header");
         return MCDB_ERR_FRAME_CONTENT_SIZE;
     }
+    if (out_frame)
+        *out_frame = frame;
+    if (out_frame_len)
+        *out_frame_len = frame_len;
+    return MCDB_OK;
+}
 
-    produced = ZSTD_decompress(out, (size_t)original_size, frame, frame_len);
-    if (ZSTD_isError(produced)) {
-        if (errbuf)
-            snprintf(errbuf, MCDB_ERRLEN, "MCDB: zstd error: %s", ZSTD_getErrorName(produced));
-        return MCDB_ERR_DECOMPRESS;
-    }
-    if (produced != original_size) {
+static mcdb_status mcdb_finish_decoded(const unsigned char *in, const mcdb_header *header,
+                                       unsigned char *out, size_t produced, size_t *out_len,
+                                       char *errbuf) {
+    uint32_t expected_crc;
+    uint32_t actual_crc;
+    if (produced != header->original_size) {
         if (errbuf)
             snprintf(errbuf, MCDB_ERRLEN, "MCDB: size mismatch (header %llu, got %zu)",
-                     (unsigned long long)original_size, produced);
+                     (unsigned long long)header->original_size, produced);
         return MCDB_ERR_SIZE_MISMATCH;
     }
-
     expected_crc = read_u32_le(in + MCDB_CRC_OFFSET);
     actual_crc = mcdb_crc32(out, produced);
     if (actual_crc != expected_crc) {
@@ -236,14 +251,12 @@ static mcdb_status mcdb_decode_payload(const unsigned char *in, size_t in_len,
                      expected_crc, actual_crc);
         return MCDB_ERR_CRC;
     }
-
     if (!mcdb_is_valid_utf8(out, produced)) {
         if (errbuf)
             snprintf(errbuf, MCDB_ERRLEN,
                      "MCDB: payload is not valid UTF-8 text or contains a NUL byte");
         return MCDB_ERR_UTF8;
     }
-
     if (out_len)
         *out_len = produced;
     return MCDB_OK;
@@ -251,56 +264,288 @@ static mcdb_status mcdb_decode_payload(const unsigned char *in, size_t in_len,
 
 mcdb_status mcdb_decode_into(const unsigned char *in, size_t in_len, unsigned char *out,
                              size_t out_capacity, size_t *out_len, char *errbuf) {
-    uint64_t original_size = 0;
+    mcdb_header header;
+    const unsigned char *frame;
+    size_t frame_len;
+    size_t produced;
+    mcdb_status st;
 
     if (out_len)
         *out_len = 0;
     if (errbuf)
         errbuf[0] = '\0';
-
-    original_size = read_u64_le(in + 7);
-    return mcdb_decode_payload(in, in_len, original_size, out, out_capacity, out_len, errbuf);
+    st = mcdb_parse_header(in, in_len, &header);
+    if (st != MCDB_OK)
+        return st;
+    if (header.version != MCDB_VERSION_V1)
+        return MCDB_ERR_VERSION;
+    if (out == NULL || out_capacity < header.original_size)
+        return MCDB_ERR_SIZE_MISMATCH;
+    st = mcdb_validate_frame(in, in_len, &header, &frame, &frame_len, errbuf);
+    if (st != MCDB_OK)
+        return st;
+    produced = ZSTD_decompress(out, (size_t)header.original_size, frame, frame_len);
+    if (ZSTD_isError(produced)) {
+        if (errbuf)
+            snprintf(errbuf, MCDB_ERRLEN, "MCDB: zstd error: %s", ZSTD_getErrorName(produced));
+        return MCDB_ERR_DECOMPRESS;
+    }
+    return mcdb_finish_decoded(in, &header, out, produced, out_len, errbuf);
 }
 
 mcdb_status mcdb_decode(const unsigned char *in, size_t in_len, unsigned char **out,
                         size_t *out_len, char *errbuf) {
-    uint64_t original_size = 0;
-    mcdb_status st;
+    mcdb_header header;
     unsigned char *buf;
-
+    mcdb_status st;
     if (out)
         *out = NULL;
     if (out_len)
         *out_len = 0;
     if (errbuf)
         errbuf[0] = '\0';
-
-    st = mcdb_validate_header(in, in_len, &original_size);
+    st = mcdb_validate_header(in, in_len, &header.original_size);
     if (st != MCDB_OK) {
         if (errbuf)
             snprintf(errbuf, MCDB_ERRLEN, "MCDB: %s", mcdb_status_str(st));
         return st;
     }
-
-    buf = (unsigned char *)malloc(original_size ? original_size : 1);
+    buf = (unsigned char *)malloc(header.original_size ? (size_t)header.original_size : 1);
     if (buf == NULL) {
         if (errbuf)
             snprintf(errbuf, MCDB_ERRLEN, "MCDB: out of memory");
         return MCDB_ERR_ALLOC;
     }
-
-    st =
-        mcdb_decode_payload(in, in_len, original_size, buf, (size_t)original_size, out_len, errbuf);
+    st = mcdb_decode_into(in, in_len, buf, (size_t)header.original_size, out_len, errbuf);
     if (st != MCDB_OK) {
         free(buf);
         return st;
     }
-
     if (out)
         *out = buf;
     else
         free(buf);
     return MCDB_OK;
+}
+
+mcdb_status mcdb_decode_v2_into(const unsigned char *in, size_t in_len,
+                                uint64_t supplied_dictionary_ref, const unsigned char *dictionary,
+                                size_t dictionary_len, ZSTD_DCtx *dctx, ZSTD_DDict *ddict,
+                                unsigned char *out, size_t out_capacity, size_t *out_len,
+                                char *errbuf) {
+    mcdb_header header;
+    const unsigned char *frame;
+    size_t frame_len;
+    size_t produced;
+    uint32_t dictionary_id;
+    uint32_t frame_dictionary_id;
+    mcdb_status st;
+    int own_dctx = 0;
+
+    if (out_len)
+        *out_len = 0;
+    if (errbuf)
+        errbuf[0] = '\0';
+    st = mcdb_parse_header(in, in_len, &header);
+    if (st != MCDB_OK)
+        return st;
+    if (header.version != MCDB_VERSION_V2)
+        return MCDB_ERR_VERSION;
+    if (supplied_dictionary_ref != header.dictionary_ref)
+        return MCDB_ERR_DICTIONARY_REF;
+    if (out == NULL || out_capacity < header.original_size)
+        return MCDB_ERR_SIZE_MISMATCH;
+    st = mcdb_validate_dictionary(dictionary, dictionary_len, &dictionary_id);
+    if (st != MCDB_OK)
+        return st;
+    st = mcdb_validate_frame(in, in_len, &header, &frame, &frame_len, errbuf);
+    if (st != MCDB_OK)
+        return st;
+    frame_dictionary_id = mcdb_zstd_frame_dictionary_id(frame, frame_len);
+    if (frame_dictionary_id == 0 || frame_dictionary_id != dictionary_id)
+        return MCDB_ERR_DICTIONARY_ID;
+    if (ddict == NULL)
+        return MCDB_ERR_DICTIONARY_REQUIRED;
+    if (dctx == NULL) {
+        dctx = ZSTD_createDCtx();
+        if (dctx == NULL)
+            return MCDB_ERR_ALLOC;
+        own_dctx = 1;
+    }
+    produced = ZSTD_decompress_usingDDict(dctx, out, (size_t)header.original_size, frame, frame_len,
+                                          ddict);
+    if (own_dctx)
+        ZSTD_freeDCtx(dctx);
+    if (ZSTD_isError(produced)) {
+        if (errbuf)
+            snprintf(errbuf, MCDB_ERRLEN, "MCDB: zstd dictionary error: %s",
+                     ZSTD_getErrorName(produced));
+        return MCDB_ERR_DECOMPRESS;
+    }
+    return mcdb_finish_decoded(in, &header, out, produced, out_len, errbuf);
+}
+
+mcdb_status mcdb_decode_v2(const unsigned char *in, size_t in_len, uint64_t supplied_dictionary_ref,
+                           const unsigned char *dictionary, size_t dictionary_len,
+                           unsigned char **out, size_t *out_len, char *errbuf) {
+    mcdb_header header;
+    ZSTD_DDict *ddict;
+    mcdb_status st;
+    unsigned char *buf;
+    if (out)
+        *out = NULL;
+    if (out_len)
+        *out_len = 0;
+    st = mcdb_validate_v2_header(in, in_len, &header.original_size, NULL);
+    if (st != MCDB_OK)
+        return st;
+    st = mcdb_validate_dictionary(dictionary, dictionary_len, NULL);
+    if (st != MCDB_OK)
+        return st;
+    ddict = ZSTD_createDDict(dictionary, dictionary_len);
+    if (ddict == NULL)
+        return MCDB_ERR_ALLOC;
+    buf = (unsigned char *)malloc(header.original_size ? (size_t)header.original_size : 1);
+    if (buf == NULL) {
+        ZSTD_freeDDict(ddict);
+        return MCDB_ERR_ALLOC;
+    }
+    st = mcdb_decode_v2_into(in, in_len, supplied_dictionary_ref, dictionary, dictionary_len, NULL,
+                             ddict, buf, (size_t)header.original_size, out_len, errbuf);
+    ZSTD_freeDDict(ddict);
+    if (st != MCDB_OK) {
+        free(buf);
+        return st;
+    }
+    if (out)
+        *out = buf;
+    else
+        free(buf);
+    return MCDB_OK;
+}
+
+/* Tiny SHA-256 implementation; dictionary registry validation must not depend on pgcrypto/OpenSSL.
+ */
+typedef struct {
+    uint32_t state[8];
+    uint64_t bitlen;
+    unsigned char data[64];
+    size_t datalen;
+} mcdb_sha256_ctx;
+
+#define MCDB_ROTR32(x, n) (((x) >> (n)) | ((x) << (32u - (n))))
+#define MCDB_CH(x, y, z)  (((x) & (y)) ^ (~(x) & (z)))
+#define MCDB_MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define MCDB_EP0(x)       (MCDB_ROTR32((x), 2) ^ MCDB_ROTR32((x), 13) ^ MCDB_ROTR32((x), 22))
+#define MCDB_EP1(x)       (MCDB_ROTR32((x), 6) ^ MCDB_ROTR32((x), 11) ^ MCDB_ROTR32((x), 25))
+#define MCDB_SIG0(x)      (MCDB_ROTR32((x), 7) ^ MCDB_ROTR32((x), 18) ^ ((x) >> 3))
+#define MCDB_SIG1(x)      (MCDB_ROTR32((x), 17) ^ MCDB_ROTR32((x), 19) ^ ((x) >> 10))
+
+static const uint32_t MCDB_SHA256_K[64] = {
+    0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU, 0x59f111f1U, 0x923f82a4U,
+    0xab1c5ed5U, 0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U, 0x72be5d74U, 0x80deb1feU,
+    0x9bdc06a7U, 0xc19bf174U, 0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU, 0x2de92c6fU,
+    0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU, 0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
+    0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U, 0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU,
+    0x53380d13U, 0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U, 0xa2bfe8a1U, 0xa81a664bU,
+    0xc24b8b70U, 0xc76c51a3U, 0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U, 0x19a4c116U,
+    0x1e376c08U, 0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+    0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U, 0x90befffaU, 0xa4506cebU, 0xbef9a3f7U,
+    0xc67178f2U,
+};
+
+static void mcdb_sha256_transform(mcdb_sha256_ctx *ctx, const unsigned char data[64]) {
+    uint32_t m[64];
+    uint32_t a, b, c, d, e, f, g, h;
+    uint32_t t1, t2;
+    size_t i;
+    for (i = 0; i < 16; i++) {
+        m[i] = ((uint32_t)data[i * 4] << 24) | ((uint32_t)data[i * 4 + 1] << 16) |
+               ((uint32_t)data[i * 4 + 2] << 8) | (uint32_t)data[i * 4 + 3];
+    }
+    for (i = 16; i < 64; i++)
+        m[i] = MCDB_SIG1(m[i - 2]) + m[i - 7] + MCDB_SIG0(m[i - 15]) + m[i - 16];
+    a = ctx->state[0];
+    b = ctx->state[1];
+    c = ctx->state[2];
+    d = ctx->state[3];
+    e = ctx->state[4];
+    f = ctx->state[5];
+    g = ctx->state[6];
+    h = ctx->state[7];
+    for (i = 0; i < 64; i++) {
+        t1 = h + MCDB_EP1(e) + MCDB_CH(e, f, g) + MCDB_SHA256_K[i] + m[i];
+        t2 = MCDB_EP0(a) + MCDB_MAJ(a, b, c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+    ctx->state[0] += a;
+    ctx->state[1] += b;
+    ctx->state[2] += c;
+    ctx->state[3] += d;
+    ctx->state[4] += e;
+    ctx->state[5] += f;
+    ctx->state[6] += g;
+    ctx->state[7] += h;
+}
+
+static void mcdb_sha256_init(mcdb_sha256_ctx *ctx) {
+    static const uint32_t initial[8] = {0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+                                        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U};
+    memcpy(ctx->state, initial, sizeof(initial));
+    ctx->bitlen = 0;
+    ctx->datalen = 0;
+}
+
+static void mcdb_sha256_update(mcdb_sha256_ctx *ctx, const unsigned char *data, size_t len) {
+    size_t i;
+    for (i = 0; i < len; i++) {
+        ctx->data[ctx->datalen++] = data[i];
+        if (ctx->datalen == 64) {
+            mcdb_sha256_transform(ctx, ctx->data);
+            ctx->bitlen += 512;
+            ctx->datalen = 0;
+        }
+    }
+}
+
+static void mcdb_sha256_final(mcdb_sha256_ctx *ctx, unsigned char out[MCDB_SHA256_BYTES]) {
+    size_t i;
+    uint64_t bitlen;
+    ctx->bitlen += (uint64_t)ctx->datalen * 8u;
+    ctx->data[ctx->datalen++] = 0x80;
+    if (ctx->datalen > 56) {
+        while (ctx->datalen < 64)
+            ctx->data[ctx->datalen++] = 0;
+        mcdb_sha256_transform(ctx, ctx->data);
+        ctx->datalen = 0;
+    }
+    while (ctx->datalen < 56)
+        ctx->data[ctx->datalen++] = 0;
+    bitlen = ctx->bitlen;
+    for (i = 0; i < 8; i++)
+        ctx->data[63 - i] = (unsigned char)(bitlen >> (8u * i));
+    mcdb_sha256_transform(ctx, ctx->data);
+    for (i = 0; i < 8; i++) {
+        out[i * 4] = (unsigned char)(ctx->state[i] >> 24);
+        out[i * 4 + 1] = (unsigned char)(ctx->state[i] >> 16);
+        out[i * 4 + 2] = (unsigned char)(ctx->state[i] >> 8);
+        out[i * 4 + 3] = (unsigned char)ctx->state[i];
+    }
+}
+
+void mcdb_sha256(const unsigned char *data, size_t len, unsigned char out[MCDB_SHA256_BYTES]) {
+    mcdb_sha256_ctx ctx;
+    mcdb_sha256_init(&ctx);
+    if (data != NULL && len > 0)
+        mcdb_sha256_update(&ctx, data, len);
+    mcdb_sha256_final(&ctx, out);
 }
 
 const char *mcdb_status_str(mcdb_status s) {
@@ -321,6 +566,14 @@ const char *mcdb_status_str(mcdb_status s) {
         return "reserved flags must be 0";
     case MCDB_ERR_SIZE_LIMIT:
         return "declared size over limit";
+    case MCDB_ERR_DICTIONARY_REQUIRED:
+        return "dictionary is required";
+    case MCDB_ERR_DICTIONARY_REF:
+        return "dictionary reference mismatch or invalid reference";
+    case MCDB_ERR_DICTIONARY_SIZE:
+        return "dictionary is empty or over limit";
+    case MCDB_ERR_DICTIONARY_ID:
+        return "zstd dictionary identifier mismatch or missing identifier";
     case MCDB_ERR_DECOMPRESS:
         return "corrupt zstd payload";
     case MCDB_ERR_TRAILING_DATA:

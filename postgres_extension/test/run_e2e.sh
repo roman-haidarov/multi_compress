@@ -75,6 +75,23 @@ compress_hex() {
     -e 'print MultiCompress::Database.compress(ENV.fetch("MCDB_TEXT")).unpack1("H*")'
 }
 
+mcdb2_fixture() {
+  MCDB_TEXT="$1" ruby -Ilib -r multi_compress -r multi_compress/database <<'RUBY'
+    samples = 256.times.map do |i|
+      %({"kind":"event","tenant":#{i % 8},"metadata":{"source":"worker","version":1,"name":"same-shape-#{i % 16}"},"payload":"#{"x" * (48 + i % 64)}"})
+    end
+
+    dictionary = MultiCompress::Database::Dictionary.train(samples, id: 42, size: 4096)
+    blob = MultiCompress::Database.compress(ENV.fetch("MCDB_TEXT"), dictionary: dictionary)
+
+    puts dictionary.id
+    puts dictionary.zstd_id
+    puts dictionary.sha256.unpack1("H*")
+    puts dictionary.bytes.unpack1("H*")
+    puts blob.unpack1("H*")
+RUBY
+}
+
 bundle_name() {
   ruby -I "$PACKAGED_GEM_ROOT/lib" -r multi_compress/version \
     -e 'print "multi_compress-postgres-#{MultiCompress::VERSION}"'
@@ -187,6 +204,19 @@ apply_readable_view() {
   docker exec -i "$CONTAINER" psql -X -U app_migrations -d postgres -v ON_ERROR_STOP=1 < "$path"
 }
 
+apply_dictionary_readable_view() {
+  local path="$1"
+  db_cli view postgres \
+    --table app.dictionary_events \
+    --column payload_compressed \
+    --dictionary-table app.mcdb_dictionary_versions \
+    --dictionary-id-column payload_dictionary_id \
+    --view admin.dictionary_events_readable \
+    --columns id \
+    --output "$path"
+  docker exec -i "$CONTAINER" psql -X -U app_migrations -d postgres -v ON_ERROR_STOP=1 < "$path"
+}
+
 ensure_ruby_extension
 prepare_packaged_gem
 build_deployment_bundle
@@ -199,9 +229,23 @@ TEXT='Привет, DBeaver! Сәлем! 🌍'
 BIG=$(ruby -e 'print "a" * 300')
 VALID_HEX=$(compress_hex "$TEXT")
 BIG_HEX=$(compress_hex "$BIG")
+MCDB2_FIXTURE_OUTPUT="$(mcdb2_fixture "$TEXT")"
+readarray -t MCDB2_FIXTURE <<< "$MCDB2_FIXTURE_OUTPUT"
+if [ "${#MCDB2_FIXTURE[@]}" -ne 5 ] || [ -z "${MCDB2_FIXTURE[0]}" ] || [ -z "${MCDB2_FIXTURE[4]}" ]; then
+  echo "MCDB2 fixture generator returned an invalid payload" >&2
+  exit 2
+fi
+DICT_REF="${MCDB2_FIXTURE[0]}"
+DICT_ZSTD_ID="${MCDB2_FIXTURE[1]}"
+DICT_SHA_HEX="${MCDB2_FIXTURE[2]}"
+DICT_HEX="${MCDB2_FIXTURE[3]}"
+DICT_BLOB_HEX="${MCDB2_FIXTURE[4]}"
+TEXT_BYTES=$(MCDB_TEXT="$TEXT" ruby -e 'print ENV.fetch("MCDB_TEXT").bytesize')
 BUNDLE_NAME="$(bundle_name)"
 VIEW_SQL="$(mktemp -t multi-compress-postgres-view.XXXXXX.sql)"
-trap 'rm -f "$VIEW_SQL"; cleanup' EXIT
+DICT_VIEW_SQL="$(mktemp -t multi-compress-postgres-dictionary-view.XXXXXX.sql)"
+REGISTRY_SQL="$(mktemp -t multi-compress-postgres-registry.XXXXXX.sql)"
+trap 'rm -f "$VIEW_SQL" "$DICT_VIEW_SQL" "$REGISTRY_SQL"; cleanup' EXIT
 
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker run --platform "$PLATFORM" -d --name "$CONTAINER" \
@@ -234,6 +278,7 @@ install_bundle_on_db_host "$BUNDLE_NAME" "$BUILD_PG_CONFIG" "$RUNTIME_PG_CONFIG"
 
 q "CREATE ROLE app_migrations LOGIN;
    CREATE ROLE dbeaver_readonly LOGIN;
+   CREATE ROLE mcdb_dictionary_owner NOLOGIN;
    CREATE SCHEMA app;
    CREATE SCHEMA admin;
    CREATE TABLE app.events (id integer PRIMARY KEY, payload_compressed bytea NULL);
@@ -251,6 +296,28 @@ docker exec -u postgres -e "MCDB_BUNDLE_ROOT=${BUNDLE_PARENT}/${BUNDLE_NAME}" "$
 '
 apply_readable_view "$VIEW_SQL"
 q 'GRANT SELECT ON admin.events_readable TO dbeaver_readonly;'
+
+# MCDB2: package-provided registry DDL, immutable dictionary row, generated INNER JOIN view.
+q "CREATE TABLE app.dictionary_events (
+     id integer PRIMARY KEY,
+     payload_compressed bytea NOT NULL,
+     payload_dictionary_id bigint NOT NULL
+   );
+   GRANT SELECT ON app.dictionary_events TO app_migrations;"
+db_cli registry postgres \
+  --schema app --owner mcdb_dictionary_owner --migration-role app_migrations \
+  --payload-table dictionary_events --payload-column payload_compressed \
+  --payload-dictionary-id-column payload_dictionary_id \
+  --output "$REGISTRY_SQL"
+docker exec -i "$CONTAINER" psql -X -U postgres -d postgres -v ON_ERROR_STOP=1 < "$REGISTRY_SQL"
+q "
+   INSERT INTO app.mcdb_dictionary_versions (id, family, zstd_dict_id, sha256, bytes)
+   VALUES ($DICT_REF, 'events_payload_v1', $DICT_ZSTD_ID, decode('$DICT_SHA_HEX', 'hex'), decode('$DICT_HEX', 'hex'));
+   INSERT INTO app.dictionary_events (id, payload_compressed, payload_dictionary_id)
+   SELECT g, decode('$DICT_BLOB_HEX', 'hex'), $DICT_REF FROM generate_series(1, 1000) AS g;
+   ANALYZE app.dictionary_events;"
+apply_dictionary_readable_view "$DICT_VIEW_SQL"
+q 'GRANT SELECT ON admin.dictionary_events_readable TO dbeaver_readonly;'
 
 q "CREATE DATABASE mcdb_latin1 WITH TEMPLATE template0 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C';"
 docker exec -u postgres -e "MCDB_BUNDLE_ROOT=${BUNDLE_PARENT}/${BUNDLE_NAME}" "$CONTAINER" sh -ceu '
@@ -305,8 +372,29 @@ for name in corrupt_magic corrupt_payload corrupt_crc invalid_utf8 nul_text trai
   check_err "$name errors" "SELECT multi_compress.multi_compress_db_decompress(decode('$hex', 'hex'));"
 done
 check "is_valid false (crc)" "$(q "SELECT multi_compress.multi_compress_db_is_valid(decode('$(fixture_hex test/fixtures/database_v1/corrupt_crc.mcdb)', 'hex'));" | tr -d '\r\n')" "f"
+check "MCDB2 registry owner has schema usage" "$(q "SELECT has_schema_privilege('mcdb_dictionary_owner', 'app', 'USAGE');" | tr -d '\r\n')" "t"
+check "MCDB2 dictionary reference" "$(q 'SELECT multi_compress.multi_compress_db_dictionary_ref(payload_compressed) FROM app.dictionary_events WHERE id=1;' | tr -d '\r\n')" "$DICT_REF"
+check "MCDB2 original size" "$(q 'SELECT multi_compress.multi_compress_db_original_size(payload_compressed) FROM app.dictionary_events WHERE id=1;' | tr -d '\r\n')" "$TEXT_BYTES"
+check "MCDB2 dictionary view roundtrip" "$(q_read 'SELECT payload FROM admin.dictionary_events_readable WHERE id=1;' | tr -d '\r')" "$TEXT"
+check "MCDB2 dictionary is valid" "$(q "SELECT multi_compress.multi_compress_db_is_valid_dict(e.payload_compressed, e.payload_dictionary_id, d.sha256, d.bytes) FROM app.dictionary_events e JOIN app.mcdb_dictionary_versions d ON d.id = e.payload_dictionary_id WHERE e.id=1;" | tr -d '\r\n')" "t"
+check_err "MCDB2 payload/FK mismatch rejected" "INSERT INTO app.dictionary_events VALUES (1001, decode('$DICT_BLOB_HEX', 'hex'), $((DICT_REF + 1)));"
+check "MCDB2 rejects wrong dictionary digest" "$(q "SELECT multi_compress.multi_compress_db_is_valid_dict(e.payload_compressed, e.payload_dictionary_id, decode(repeat('00', 32), 'hex'), d.bytes) FROM app.dictionary_events e JOIN app.mcdb_dictionary_versions d ON d.id = e.payload_dictionary_id WHERE e.id=1;" | tr -d '\r\n')" "f"
+if q_read_fail 'SELECT bytes FROM app.mcdb_dictionary_versions WHERE id=42;'; then
+  echo "  PASS  read role cannot read dictionary registry"
+else
+  echo "  FAIL  read role unexpectedly read dictionary registry"
+  fails=$((fails + 1))
+fi
+PG_DICT_PLAN="$(q 'SET enable_seqscan = off; EXPLAIN (COSTS OFF) SELECT id, payload FROM admin.dictionary_events_readable WHERE id >= 3 ORDER BY id LIMIT 100;')"
+if printf '%s\n' "$PG_DICT_PLAN" | grep -Eq 'Index Scan|Index Only Scan'; then
+  echo "  PASS  MCDB2 view preserves indexed LIMIT plan"
+else
+  echo "  FAIL  MCDB2 view did not expose an indexed LIMIT plan"
+  printf '%s\n' "$PG_DICT_PLAN" >&2
+  fails=$((fails + 1))
+fi
 
-q 'DROP VIEW admin.events_readable; DROP EXTENSION multi_compress;'
+q 'DROP VIEW admin.events_readable; DROP VIEW admin.dictionary_events_readable; DROP EXTENSION multi_compress;'
 docker exec "$CONTAINER" psql -X -U postgres -d mcdb_other_schema -v ON_ERROR_STOP=1 -c 'DROP EXTENSION multi_compress;' >/dev/null
 docker exec -u 0 -e "MCDB_BUNDLE_ROOT=${BUNDLE_PARENT}/${BUNDLE_NAME}" -e "MCDB_RUNTIME_PG_CONFIG=$RUNTIME_PG_CONFIG" "$CONTAINER" sh -ceu '
   cd "$MCDB_BUNDLE_ROOT"

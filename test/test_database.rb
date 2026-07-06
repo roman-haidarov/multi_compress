@@ -58,7 +58,7 @@ class TestDatabase < Minitest::Test
   def test_oversized_stored_envelope_rejected_on_read
     oversized = D.compress("x") + ("\x00".b * (D::MAX_ENVELOPE))
     error = assert_raises(MultiCompress::DataError) { D.decompress(oversized) }
-    assert_match(/envelope too large/, error.message)
+    assert_match(/over the .*byte limit/, error.message)
   end
 
   def test_non_string_rejected
@@ -130,5 +130,78 @@ class TestDatabase < Minitest::Test
       blob = File.binread(File.join(FIX, "#{name}.mcdb"))
       assert_raises(MultiCompress::DataError, "fixture #{name} must be rejected") { D.decompress(blob) }
     end
+  end
+end
+
+class TestDatabaseMcdb2 < Minitest::Test
+  D = MultiCompress::Database
+
+  def dictionary
+    @dictionary ||= begin
+      samples = 256.times.map do |i|
+        %({"kind":"event","tenant":#{i % 8},"metadata":{"source":"worker","version":1,"name":"same-shape-#{i % 16}"},"payload":"#{'x' * (48 + i % 64)}"})
+      end
+      D::Dictionary.train(samples, id: 42, size: 4096)
+    end
+  end
+
+  def other_dictionary
+    @other_dictionary ||= begin
+      samples = 256.times.map do |i|
+        %({"kind":"other","stream":#{i % 11},"fields":{"different":true,"sequence":#{i}},"body":"#{'y' * (64 + i % 32)}"})
+      end
+      D::Dictionary.train(samples, id: 43, size: 4096)
+    end
+  end
+
+  def test_mcdb2_header_is_27_bytes_and_carries_registry_ref
+    text = '{"kind":"event","metadata":{"source":"worker"}}'
+    blob = D.compress(text, dictionary: dictionary)
+    header = blob.byteslice(0, D::V2_HEADER_SIZE)
+
+    assert_equal "MCDB".b, header.byteslice(0, 4)
+    assert_equal D::VERSION_V2, header.getbyte(4)
+    assert_equal D::CODEC_ZSTD, header.getbyte(5)
+    assert_equal D::FLAGS_NONE, header.getbyte(6)
+    assert_equal text.bytesize, header.byteslice(D::ORIGINAL_SIZE_OFFSET, 8).unpack1("Q<")
+    assert_equal dictionary.id, header.byteslice(D::DICTIONARY_REF_OFFSET, 8).unpack1("Q<")
+    assert_equal dictionary.id, D.dictionary_ref(blob)
+    assert_equal text.bytesize, D.original_size(blob)
+    refute_equal 0, MultiCompress.zstd_frame_dictionary_id(blob.byteslice(D::V2_HEADER_SIZE..))
+  end
+
+  def test_mcdb2_round_trip_and_valid_predicate
+    text = '{"kind":"event","message":"Привет 🌍","metadata":{"source":"worker"}}'
+    blob = D.compress(text, dictionary: dictionary)
+
+    assert_equal text, D.decompress(blob, dictionary: dictionary)
+    assert D.valid?(blob, dictionary: dictionary)
+    refute D.valid?(blob, dictionary: other_dictionary)
+  end
+
+  def test_mcdb2_rejects_wrong_registry_reference_and_wrong_dictionary
+    blob = D.compress('{"kind":"event","metadata":{"source":"worker"}}', dictionary: dictionary)
+
+    assert_raises(MultiCompress::DataError) { D.decompress(blob, dictionary: other_dictionary) }
+    tampered = blob.dup
+    tampered.setbyte(D::DICTIONARY_REF_OFFSET, tampered.getbyte(D::DICTIONARY_REF_OFFSET) ^ 0x01)
+    assert_raises(MultiCompress::DataError) { D.decompress(tampered, dictionary: dictionary) }
+  end
+
+  def test_mcdb2_dictionary_contract_is_strict
+    raw = MultiCompress::Dictionary.new("raw dictionary bytes", algo: :zstd)
+    assert_raises(ArgumentError) { D::Dictionary.wrap(raw, id: 1) }
+    assert_raises(ArgumentError) { D::Dictionary.wrap(dictionary.native, id: 0) }
+    assert_equal 32, dictionary.sha256.bytesize
+    assert_equal dictionary.sha256.unpack1("H*"), dictionary.sha256_hex
+    assert_equal dictionary.id, dictionary.registry_attributes.fetch(:id)
+  end
+
+  def test_mcdb1_remains_dictionary_free
+    blob = D.compress("MCDB1 still works")
+    assert_equal D::VERSION_V1, blob.getbyte(4)
+    assert_equal "MCDB1 still works", D.decompress(blob)
+    assert_raises(ArgumentError) { D.decompress(blob, dictionary: dictionary) }
+    assert_nil D.dictionary_ref(blob)
   end
 end
