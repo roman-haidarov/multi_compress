@@ -32,9 +32,9 @@ LIBS = {
     keep_files: %w[LICENSE],
   },
   brotli: {
-    version: "1.2.0", # Requires extconf wrappers for enc/dec static_init.c basename collision
+    version: "1.2.1", # Requires extconf wrappers for enc/dec static_init.c basename collision
     url:     "https://github.com/google/brotli/archive/refs/tags/v%<version>s.tar.gz",
-    sha256:  "816c96e8e8f193b40151dad7e8ff37b1221d019dbcb9c35cd3fadbfe6477dfec",
+    sha256:  "98d35d11a78dc453aebb7d10c3748f3f73ff78c8267c0dc697b8631f67bf7e8f",
     strip:   "brotli-%<version>s",
     keep:    %w[c/common c/enc c/dec c/include],
     keep_files: %w[LICENSE],

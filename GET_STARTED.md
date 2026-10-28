@@ -681,7 +681,7 @@ MultiCompress.available?(:fake)    # => false
 # Get library versions
 MultiCompress.version(:zstd)       # => "1.5.7"
 MultiCompress.version(:lz4)        # => "1.10.0"
-MultiCompress.version(:brotli)     # => "1.2.0"
+MultiCompress.version(:brotli)     # => "1.2.1"
 ```
 
 ### Data Integrity

@@ -8,8 +8,9 @@
 #include <brotli/decode.h>
 #include <brotli/encode.h>
 #include <lz4.h>
-#include <lz4hc.h>
+#include <limits.h>
 #include <lz4frame.h>
+#include <lz4hc.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -518,30 +519,42 @@ static compress_algo_t detect_algo(const uint8_t *data, size_t len) {
     return ALGO_ZSTD;
 }
 
-static inline VALUE rb_binary_str_new(const char *ptr, long len) {
-    VALUE str = rb_str_new(ptr, len);
+static inline long rb_checked_string_length(size_t len) {
+    if ((uintmax_t)len > (uintmax_t)LONG_MAX)
+        rb_raise(eDataError, "string size exceeds Ruby's maximum length");
+
+    return (long)len;
+}
+
+static inline VALUE rb_binary_str_new(const char *ptr, size_t len) {
+    VALUE str = rb_str_new(ptr, rb_checked_string_length(len));
     rb_enc_associate(str, binary_encoding);
     return str;
 }
 
-static inline VALUE rb_binary_str_buf_new(long capa) {
-    VALUE str = rb_str_buf_new(capa);
+static inline VALUE rb_binary_str_buf_new(size_t capa) {
+    VALUE str = rb_str_buf_new(rb_checked_string_length(capa));
     rb_enc_associate(str, binary_encoding);
     return str;
 }
 
-static inline VALUE rb_binary_str_buf_reserve(long capa) {
-    VALUE str = rb_str_buf_new(capa);
+static inline VALUE rb_binary_str_buf_reserve(size_t capa) {
+    VALUE str = rb_str_buf_new(rb_checked_string_length(capa));
     rb_enc_associate(str, binary_encoding);
     return str;
+}
+
+static inline void rb_binary_str_set_len(VALUE str, size_t len) {
+    rb_str_set_len(str, rb_checked_string_length(len));
 }
 
 static inline void grow_binary_str(VALUE str, size_t cur_len, size_t new_cap) {
     size_t cur_cap = (size_t)rb_str_capacity(str);
     if (new_cap <= cur_cap)
         return;
-    rb_str_set_len(str, (long)cur_len);
-    rb_str_modify_expand(str, (long)(new_cap - cur_len));
+    (void)rb_checked_string_length(new_cap);
+    rb_binary_str_set_len(str, cur_len);
+    rb_str_modify_expand(str, rb_checked_string_length(new_cap - cur_len));
 }
 
 typedef struct {
@@ -562,6 +575,8 @@ static void limits_config_apply_parsed(const mc_opts_t *opts, limits_config_t *l
         size_t max_output_size = NUM2SIZET(val);
         if (max_output_size == 0)
             rb_raise(rb_eArgError, "max_output_size must be greater than 0");
+        if ((uintmax_t)max_output_size > (uintmax_t)LONG_MAX)
+            rb_raise(rb_eArgError, "max_output_size exceeds Ruby's maximum string length");
         limits->max_output_size = max_output_size;
     }
 
@@ -1306,7 +1321,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
                 rb_raise(eMemError, "zstd: failed to create context");
             if (ZSTD_isError(csize))
                 rb_raise(eError, "zstd compress: %s", ZSTD_getErrorName(csize));
-            rb_str_set_len(dst, (long)csize);
+            rb_binary_str_set_len(dst, csize);
             RB_GC_GUARD(data);
             RB_GC_GUARD(dict_val);
             return dst;
@@ -1343,7 +1358,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
                     rb_raise(eError, "zstd compress: %s", ZSTD_getErrorName(fargs.result));
                 }
 
-                VALUE result = rb_binary_str_new(out_buf, (long)fargs.result);
+                VALUE result = rb_binary_str_new(out_buf, fargs.result);
                 free(out_buf);
                 RB_GC_GUARD(data);
                 RB_GC_GUARD(dict_val);
@@ -1370,7 +1385,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             if (ZSTD_isError(args.result))
                 rb_raise(eError, "zstd compress: %s", ZSTD_getErrorName(args.result));
 
-            rb_str_set_len(dst, (long)args.result);
+            rb_binary_str_set_len(dst, args.result);
             RB_GC_GUARD(data);
             RB_GC_GUARD(dict_val);
             return dst;
@@ -1383,7 +1398,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             prefs.frameInfo.blockChecksumFlag = LZ4F_blockChecksumEnabled;
             prefs.frameInfo.contentChecksumFlag = LZ4F_contentChecksumEnabled;
             size_t bound = LZ4F_compressFrameBound(slen, &prefs);
-            VALUE dst = rb_binary_str_buf_reserve((long)bound);
+            VALUE dst = rb_binary_str_buf_reserve(bound);
             lz4frame_compress_args_t args = {
                 .src = src,
                 .src_len = slen,
@@ -1401,7 +1416,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             if (args.error_code)
                 rb_raise(eError, "lz4 frame compress failed: %s",
                          LZ4F_getErrorName(args.error_code));
-            rb_str_set_len(dst, (long)args.result);
+            rb_binary_str_set_len(dst, args.result);
             RB_GC_GUARD(data);
             return dst;
         }
@@ -1438,7 +1453,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             size_t total = 8 + (size_t)csize;
             write_le_u32((uint8_t *)out + total, 0);
 
-            rb_str_set_len(dst, (long)(total + 4));
+            rb_binary_str_set_len(dst, total + 4);
             RB_GC_GUARD(data);
             return dst;
         } else {
@@ -1460,7 +1475,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             size_t total = 8 + csize;
             write_le_u32((uint8_t *)out + total, 0);
 
-            rb_str_set_len(dst, total + 4);
+            rb_binary_str_set_len(dst, total + 4);
             RB_GC_GUARD(data);
             return dst;
         }
@@ -1516,7 +1531,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             if (!ok)
                 rb_raise(eError, "brotli compress with dict failed");
 
-            rb_str_set_len(dst, initial_out - available_out);
+            rb_binary_str_set_len(dst, initial_out - available_out);
             RB_GC_GUARD(data);
             RB_GC_GUARD(dict_val);
             return dst;
@@ -1540,7 +1555,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
             if (!args.result)
                 rb_raise(eError, "brotli compress failed");
 
-            rb_str_set_len(dst, (long)actual_out_len);
+            rb_binary_str_set_len(dst, actual_out_len);
             RB_GC_GUARD(data);
             return dst;
         } else {
@@ -1550,7 +1565,7 @@ static VALUE compress_compress(int argc, VALUE *argv, VALUE self) {
                                       (const uint8_t *)src, &out_len, (uint8_t *)RSTRING_PTR(dst));
             if (!ok)
                 rb_raise(eError, "brotli compress failed");
-            rb_str_set_len(dst, out_len);
+            rb_binary_str_set_len(dst, out_len);
             RB_GC_GUARD(data);
             return dst;
         }
@@ -1690,7 +1705,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
 
                 enforce_output_and_ratio_limits(dsize, slen, limits.max_output_size,
                                                 limits.max_ratio_enabled, limits.max_ratio);
-                rb_str_set_len(dst, (long)dsize);
+                rb_binary_str_set_len(dst, dsize);
                 RB_GC_GUARD(data);
                 RB_GC_GUARD(dict_val);
                 return dst;
@@ -1714,7 +1729,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                     rb_raise(eDataError, "zstd decompress: %s", ZSTD_getErrorName(dsize));
                 enforce_output_and_ratio_limits(dsize, slen, limits.max_output_size,
                                                 limits.max_ratio_enabled, limits.max_ratio);
-                rb_str_set_len(dst, dsize);
+                rb_binary_str_set_len(dst, dsize);
                 RB_GC_GUARD(data);
                 RB_GC_GUARD(dict_val);
                 return dst;
@@ -1787,7 +1802,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                 break;
         }
 
-        rb_str_set_len(dst, total_out);
+        rb_binary_str_set_len(dst, total_out);
         RB_GC_GUARD(data);
         RB_GC_GUARD(dict_val);
         return dst;
@@ -1800,7 +1815,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                 alloc_size = limits.max_output_size < 4096 ? limits.max_output_size : 4096;
             if (alloc_size == 0)
                 alloc_size = limits.max_output_size;
-            VALUE dst = rb_binary_str_buf_reserve((long)alloc_size);
+            VALUE dst = rb_binary_str_buf_reserve(alloc_size);
             while (1) {
                 lz4frame_decompress_args_t args = {
                     .src = src,
@@ -1835,7 +1850,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
                              LZ4F_getErrorName(args.error_code));
                 enforce_output_and_ratio_limits(args.result, slen, limits.max_output_size,
                                                 limits.max_ratio_enabled, limits.max_ratio);
-                rb_str_set_len(dst, (long)args.result);
+                rb_binary_str_set_len(dst, args.result);
                 RB_GC_GUARD(data);
                 return dst;
             }
@@ -1890,7 +1905,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
 
         enforce_output_and_ratio_limits(args.out_offset, slen, limits.max_output_size,
                                         limits.max_ratio_enabled, limits.max_ratio);
-        rb_str_set_len(result, args.out_offset);
+        rb_binary_str_set_len(result, args.out_offset);
         RB_GC_GUARD(data);
         return result;
     }
@@ -1976,7 +1991,7 @@ static VALUE compress_decompress(int argc, VALUE *argv, VALUE self) {
         if (res != BROTLI_DECODER_RESULT_SUCCESS) {
             rb_raise(eDataError, "brotli decompress failed");
         }
-        rb_str_set_len(dst, total_out);
+        rb_binary_str_set_len(dst, total_out);
         RB_GC_GUARD(data);
         RB_GC_GUARD(dict_val);
         return dst;
@@ -2132,10 +2147,44 @@ _Static_assert(LZ4_RING_BUFFER_TOTAL == 2 * LZ4_RING_BUFFER_SIZE,
                "ring buffer total must be exactly twice the window size");
 
 typedef struct {
+    int *active;
+    VALUE self;
+    VALUE argument;
+    VALUE (*operation)(VALUE, VALUE);
+} stream_operation_t;
+
+static VALUE stream_operation_body(VALUE opaque) {
+    stream_operation_t *call = (stream_operation_t *)(uintptr_t)opaque;
+    return call->operation(call->self, call->argument);
+}
+
+static VALUE stream_operation_ensure(VALUE opaque) {
+    stream_operation_t *call = (stream_operation_t *)(uintptr_t)opaque;
+    *call->active = 0;
+    return Qnil;
+}
+
+static VALUE stream_operation_call(int *active, VALUE self, VALUE argument,
+                                   VALUE (*operation)(VALUE, VALUE)) {
+    if (*active)
+        rb_raise(eStreamError, "stream operation already in progress");
+
+    stream_operation_t call = {
+        .active = active, .self = self, .argument = argument, .operation = operation};
+    *active = 1;
+    VALUE result = rb_ensure(stream_operation_body, (VALUE)(uintptr_t)&call,
+                             stream_operation_ensure, (VALUE)(uintptr_t)&call);
+    RB_GC_GUARD(self);
+    RB_GC_GUARD(argument);
+    return result;
+}
+
+typedef struct {
     compress_algo_t algo;
     int level;
     int closed;
     int finished;
+    int operation_active;
 
     union {
         ZSTD_CStream *zstd;
@@ -2179,6 +2228,9 @@ static size_t deflater_memsize(const void *ptr) {
         return 0;
 
     size_t s = sizeof(deflater_t);
+    if (d->operation_active)
+        return s;
+
     switch (d->algo) {
     case ALGO_ZSTD:
         if (d->ctx.zstd)
@@ -2325,7 +2377,7 @@ static VALUE lz4_compress_ring_block(deflater_t *d) {
 
     write_le_u32((uint8_t *)out + 4, (uint32_t)csize);
 
-    rb_str_set_len(output, 8 + csize);
+    rb_binary_str_set_len(output, 8 + csize);
     d->lz4_ring.pending = 0;
 
     if (d->lz4_ring.ring_offset >= LZ4_RING_BUFFER_SIZE) {
@@ -2335,7 +2387,7 @@ static VALUE lz4_compress_ring_block(deflater_t *d) {
     return output;
 }
 
-static VALUE deflater_write(VALUE self, VALUE chunk) {
+static VALUE deflater_write_impl(VALUE self, VALUE chunk) {
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
     if (d->closed)
@@ -2405,7 +2457,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
             }
             result_len += output.pos;
         }
-        rb_str_set_len(result, result_len);
+        rb_binary_str_set_len(result, result_len);
         RB_GC_GUARD(chunk);
         return result;
     }
@@ -2471,7 +2523,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
                 }
             }
         }
-        rb_str_set_len(result, result_len);
+        rb_binary_str_set_len(result, result_len);
         RB_GC_GUARD(chunk);
         return result;
     }
@@ -2517,7 +2569,7 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
                 }
             }
         }
-        rb_str_set_len(result, result_len);
+        rb_binary_str_set_len(result, result_len);
         RB_GC_GUARD(chunk);
         return result;
     }
@@ -2525,7 +2577,14 @@ static VALUE deflater_write(VALUE self, VALUE chunk) {
     return rb_binary_str_new("", 0);
 }
 
-static VALUE deflater_flush(VALUE self) {
+static VALUE deflater_write(VALUE self, VALUE chunk) {
+    deflater_t *d;
+    TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
+    return stream_operation_call(&d->operation_active, self, chunk, deflater_write_impl);
+}
+
+static VALUE deflater_flush_impl(VALUE self, VALUE unused) {
+    (void)unused;
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
     if (d->closed)
@@ -2554,7 +2613,7 @@ static VALUE deflater_flush(VALUE self) {
             result_len += output.pos;
         } while (ret > 0);
 
-        rb_str_set_len(result, result_len);
+        rb_binary_str_set_len(result, result_len);
         return result;
     }
     case ALGO_BROTLI: {
@@ -2586,7 +2645,7 @@ static VALUE deflater_flush(VALUE self) {
             }
         } while (BrotliEncoderHasMoreOutput(d->ctx.brotli));
 
-        rb_str_set_len(result, result_len);
+        rb_binary_str_set_len(result, result_len);
         return result;
     }
     case ALGO_LZ4:
@@ -2595,7 +2654,14 @@ static VALUE deflater_flush(VALUE self) {
     return rb_binary_str_new("", 0);
 }
 
-static VALUE deflater_finish(VALUE self) {
+static VALUE deflater_flush(VALUE self) {
+    deflater_t *d;
+    TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
+    return stream_operation_call(&d->operation_active, self, Qnil, deflater_flush_impl);
+}
+
+static VALUE deflater_finish_impl(VALUE self, VALUE unused) {
+    (void)unused;
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
     if (d->closed)
@@ -2625,7 +2691,7 @@ static VALUE deflater_finish(VALUE self) {
             result_len += output.pos;
         } while (ret > 0);
 
-        rb_str_set_len(result, result_len);
+        rb_binary_str_set_len(result, result_len);
         return result;
     }
     case ALGO_BROTLI: {
@@ -2658,7 +2724,7 @@ static VALUE deflater_finish(VALUE self) {
         } while (BrotliEncoderHasMoreOutput(d->ctx.brotli) ||
                  !BrotliEncoderIsFinished(d->ctx.brotli));
 
-        rb_str_set_len(result, result_len);
+        rb_binary_str_set_len(result, result_len);
         return result;
     }
     case ALGO_LZ4: {
@@ -2689,14 +2755,21 @@ static VALUE deflater_finish(VALUE self) {
         write_le_u32((uint8_t *)out, 0);
         result_len += 4;
 
-        rb_str_set_len(result, result_len);
+        rb_binary_str_set_len(result, result_len);
         return result;
     }
     }
     return rb_binary_str_new("", 0);
 }
 
-static VALUE deflater_reset(VALUE self) {
+static VALUE deflater_finish(VALUE self) {
+    deflater_t *d;
+    TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
+    return stream_operation_call(&d->operation_active, self, Qnil, deflater_finish_impl);
+}
+
+static VALUE deflater_reset_impl(VALUE self, VALUE unused) {
+    (void)unused;
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
 
@@ -2752,7 +2825,14 @@ static VALUE deflater_reset(VALUE self) {
     return self;
 }
 
-static VALUE deflater_close(VALUE self) {
+static VALUE deflater_reset(VALUE self) {
+    deflater_t *d;
+    TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
+    return stream_operation_call(&d->operation_active, self, Qnil, deflater_reset_impl);
+}
+
+static VALUE deflater_close_impl(VALUE self, VALUE unused) {
+    (void)unused;
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
     if (d->closed)
@@ -2782,6 +2862,12 @@ static VALUE deflater_close(VALUE self) {
     return Qnil;
 }
 
+static VALUE deflater_close(VALUE self) {
+    deflater_t *d;
+    TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
+    return stream_operation_call(&d->operation_active, self, Qnil, deflater_close_impl);
+}
+
 static VALUE deflater_closed_p(VALUE self) {
     deflater_t *d;
     TypedData_Get_Struct(self, deflater_t, &deflater_type, d);
@@ -2792,6 +2878,7 @@ typedef struct {
     compress_algo_t algo;
     int closed;
     int finished;
+    int operation_active;
     size_t max_output_size;
     size_t total_output;
     size_t total_input;
@@ -2838,6 +2925,9 @@ static size_t inflater_memsize(const void *ptr) {
         return 0;
 
     size_t s = sizeof(inflater_t);
+    if (inf->operation_active)
+        return s;
+
     switch (inf->algo) {
     case ALGO_ZSTD:
         if (inf->ctx.zstd)
@@ -2932,7 +3022,7 @@ static VALUE inflater_initialize(int argc, VALUE *argv, VALUE self) {
     return self;
 }
 
-static VALUE inflater_write(VALUE self, VALUE chunk) {
+static VALUE inflater_write_impl(VALUE self, VALUE chunk) {
     inflater_t *inf;
     TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
     if (inf->closed)
@@ -3017,7 +3107,7 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
                                             "compressed input exceeds representable size");
         inf->total_output = checked_add_size(inf->total_output, result_len,
                                              "decompressed output exceeds representable size");
-        rb_str_set_len(result, result_len);
+        rb_binary_str_set_len(result, result_len);
         RB_GC_GUARD(chunk);
         return result;
     }
@@ -3098,7 +3188,7 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
                                             "compressed input exceeds representable size");
         inf->total_output = checked_add_size(inf->total_output, result_len,
                                              "decompressed output exceeds representable size");
-        rb_str_set_len(result, result_len);
+        rb_binary_str_set_len(result, result_len);
         RB_GC_GUARD(chunk);
         return result;
     }
@@ -3201,7 +3291,7 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
         inf->lz4_buf.offset = pos;
         inf->total_output = checked_add_size(inf->total_output, result_len,
                                              "decompressed output exceeds representable size");
-        rb_str_set_len(result, result_len);
+        rb_binary_str_set_len(result, result_len);
         RB_GC_GUARD(chunk);
         return result;
     }
@@ -3209,7 +3299,14 @@ static VALUE inflater_write(VALUE self, VALUE chunk) {
     return rb_binary_str_new("", 0);
 }
 
-static VALUE inflater_finish(VALUE self) {
+static VALUE inflater_write(VALUE self, VALUE chunk) {
+    inflater_t *inf;
+    TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
+    return stream_operation_call(&inf->operation_active, self, chunk, inflater_write_impl);
+}
+
+static VALUE inflater_finish_impl(VALUE self, VALUE unused) {
+    (void)unused;
     inflater_t *inf;
     TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
     if (inf->closed)
@@ -3218,7 +3315,14 @@ static VALUE inflater_finish(VALUE self) {
     return rb_binary_str_new("", 0);
 }
 
-static VALUE inflater_reset(VALUE self) {
+static VALUE inflater_finish(VALUE self) {
+    inflater_t *inf;
+    TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
+    return stream_operation_call(&inf->operation_active, self, Qnil, inflater_finish_impl);
+}
+
+static VALUE inflater_reset_impl(VALUE self, VALUE unused) {
+    (void)unused;
     inflater_t *inf;
     TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
 
@@ -3263,7 +3367,14 @@ static VALUE inflater_reset(VALUE self) {
     return self;
 }
 
-static VALUE inflater_close(VALUE self) {
+static VALUE inflater_reset(VALUE self) {
+    inflater_t *inf;
+    TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
+    return stream_operation_call(&inf->operation_active, self, Qnil, inflater_reset_impl);
+}
+
+static VALUE inflater_close_impl(VALUE self, VALUE unused) {
+    (void)unused;
     inflater_t *inf;
     TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
     if (inf->closed)
@@ -3287,6 +3398,12 @@ static VALUE inflater_close(VALUE self) {
     }
     inf->closed = 1;
     return Qnil;
+}
+
+static VALUE inflater_close(VALUE self) {
+    inflater_t *inf;
+    TypedData_Get_Struct(self, inflater_t, &inflater_type, inf);
+    return stream_operation_call(&inf->operation_active, self, Qnil, inflater_close_impl);
 }
 
 static VALUE inflater_closed_p(VALUE self) {
@@ -3409,6 +3526,59 @@ static VALUE brotli_train_dictionary(int argc, VALUE *argv, VALUE self) {
     return train_dictionary_internal(samples, parsed_opts.size, ALGO_BROTLI);
 }
 
+typedef struct {
+    FILE *file;
+    VALUE path_value;
+    const char *path;
+    uint8_t *data;
+    size_t size;
+    int loaded;
+} dict_file_read_t;
+
+static VALUE dict_file_read_body(VALUE opaque) {
+    dict_file_read_t *read = (dict_file_read_t *)(uintptr_t)opaque;
+
+    if (fseek(read->file, 0, SEEK_END) != 0)
+        rb_sys_fail(read->path);
+
+    long file_size = ftell(read->file);
+    if (file_size < 0)
+        rb_sys_fail(read->path);
+    if (file_size == 0)
+        rb_raise(eDataError, "dictionary file is empty: %s", read->path);
+    if ((unsigned long long)file_size > DICT_FILE_MAX_SIZE)
+        rb_raise(eDataError, "dictionary file too large (%ld bytes, max=%d)", file_size,
+                 (int)DICT_FILE_MAX_SIZE);
+    if (fseek(read->file, 0, SEEK_SET) != 0)
+        rb_sys_fail(read->path);
+
+    read->data = ALLOC_N(uint8_t, file_size);
+    read->path = RSTRING_PTR(read->path_value);
+    read->size = (size_t)file_size;
+    size_t read_bytes = fread(read->data, 1, read->size, read->file);
+    if (read_bytes != read->size) {
+        xfree(read->data);
+        read->data = NULL;
+        rb_raise(eDataError, "failed to read dictionary: %s", read->path);
+    }
+
+    read->loaded = 1;
+    return Qnil;
+}
+
+static VALUE dict_file_read_ensure(VALUE opaque) {
+    dict_file_read_t *read = (dict_file_read_t *)(uintptr_t)opaque;
+    if (read->file) {
+        fclose(read->file);
+        read->file = NULL;
+    }
+    if (!read->loaded && read->data) {
+        xfree(read->data);
+        read->data = NULL;
+    }
+    return Qnil;
+}
+
 static VALUE dict_load(int argc, VALUE *argv, VALUE self) {
     VALUE path, opts;
     scan_one_required_keywords(argc, argv, &path, &opts);
@@ -3425,40 +3595,23 @@ static VALUE dict_load(int argc, VALUE *argv, VALUE self) {
     if (algo == ALGO_LZ4)
         rb_raise(eUnsupportedError, "LZ4 does not support dictionaries");
 
-    const char *cpath = RSTRING_PTR(path);
-    FILE *f = fopen(cpath, "rb");
-    if (!f)
-        rb_sys_fail(cpath);
-
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (file_size <= 0) {
-        fclose(f);
-        rb_raise(eDataError, "dictionary file is empty: %s", cpath);
-    }
-    if ((unsigned long long)file_size > DICT_FILE_MAX_SIZE) {
-        fclose(f);
-        rb_raise(eDataError, "dictionary file too large (%ld bytes, max=%d)", file_size,
-                 (int)DICT_FILE_MAX_SIZE);
-    }
-
-    uint8_t *buf = ALLOC_N(uint8_t, file_size);
-    size_t read_bytes = fread(buf, 1, file_size, f);
-    fclose(f);
-
-    if ((long)read_bytes != file_size) {
-        xfree(buf);
-        rb_raise(eDataError, "failed to read dictionary: %s", cpath);
-    }
-
     VALUE dict_obj = dict_alloc(cDictionary);
     dictionary_t *d;
     TypedData_Get_Struct(dict_obj, dictionary_t, &dictionary_type, d);
+
+    const char *cpath = RSTRING_PTR(path);
+    FILE *file = fopen(cpath, "rb");
+    if (!file)
+        rb_sys_fail(cpath);
+
+    dict_file_read_t read = {.file = file, .path_value = path, .path = cpath};
+    rb_ensure(dict_file_read_body, (VALUE)(uintptr_t)&read, dict_file_read_ensure,
+              (VALUE)(uintptr_t)&read);
+
     d->algo = algo;
-    d->data = buf;
-    d->size = (size_t)file_size;
+    d->data = read.data;
+    d->size = read.size;
+    read.data = NULL;
     return dict_obj;
 }
 
@@ -3488,7 +3641,7 @@ static VALUE dict_algo(VALUE self) {
 static VALUE dict_bytes(VALUE self) {
     dictionary_t *d;
     TypedData_Get_Struct(self, dictionary_t, &dictionary_type, d);
-    return rb_binary_str_new((const char *)d->data, (long)d->size);
+    return rb_binary_str_new((const char *)d->data, d->size);
 }
 
 static VALUE dict_zstd_id(VALUE self) {

@@ -8,7 +8,7 @@ MultiCompress vendors C sources from upstream compression libraries so the gem c
 |---|---:|---|---|
 | Zstandard (`zstd`) | 1.5.7 | `lib/` | BSD side of upstream BSD OR GPLv2 licensing |
 | LZ4 | 1.10.0 | `lib/` | BSD 2-Clause |
-| Brotli | 1.2.0 | `c/common`, `c/enc`, `c/dec`, `c/include` | MIT |
+| Brotli | 1.2.1 | `c/common`, `c/enc`, `c/dec`, `c/include` | MIT |
 
 ## Notes
 

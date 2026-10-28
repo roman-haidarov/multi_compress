@@ -9,7 +9,7 @@ Modern compression technology: **zstd**, **lz4**, **brotli** — unified compres
 Bundled library versions in the current release:
 - **zstd 1.5.7**
 - **lz4 1.10.0**
-- **brotli 1.2.0**
+- **brotli 1.2.1**
 
 📖 **[Get Started →](GET_STARTED.md)** — Complete technology overview, algorithms, and implementation details
 
