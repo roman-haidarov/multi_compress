@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.1]
+
+### Changed
+- Update vendored Brotli to 1.2.1, including the upstream security fix for an
+  out-of-bounds write.
+- Refactor Ruby streaming, database, and deployment code into focused modules and
+  collaborators without changing the public API.
+- Use a consistent singleton-method style and accessor macros for internal
+  configuration and adapter state.
+
 ## [0.6.0]
 
 ### Added

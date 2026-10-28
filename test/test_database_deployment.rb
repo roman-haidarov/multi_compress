@@ -5,6 +5,7 @@ require "open3"
 require "rubygems/package"
 require "tmpdir"
 require "zlib"
+require_relative "../lib/multi_compress/version"
 
 class TestDatabaseDeployment < Minitest::Test
   ROOT = File.expand_path("..", __dir__)
@@ -34,7 +35,7 @@ class TestDatabaseDeployment < Minitest::Test
       assert_equal "#{archive}\n", out
       assert File.file?(archive)
 
-      root = "multi_compress-postgres-0.6.0"
+      root = "multi_compress-postgres-#{MultiCompress::VERSION}"
       entries = tar_entries(archive)
       %W[
         #{root}/Makefile
@@ -71,7 +72,7 @@ class TestDatabaseDeployment < Minitest::Test
       _out, err, status = run_cli("package", "mysql", "--output", archive)
 
       assert_equal 0, status.exitstatus, err
-      root = "multi_compress-mysql-0.6.0"
+      root = "multi_compress-mysql-#{MultiCompress::VERSION}"
       entries = tar_entries(archive)
       %W[
         #{root}/Makefile

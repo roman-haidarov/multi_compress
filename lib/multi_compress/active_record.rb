@@ -12,6 +12,9 @@ end
 module MultiCompress
   module ActiveRecordSupport
     class Type < ActiveModel::Type::Value
+      attr_reader :codec, :mutable
+      private :codec, :mutable
+
       def initialize(mutable: false, **codec_opts)
         @codec   = MultiCompress::Codec.new(**codec_opts)
         @mutable = mutable
@@ -29,32 +32,35 @@ module MultiCompress
 
       # DB -> in-memory (unwrap)
       def deserialize(value)
-        @codec.load(value)
+        codec.load(value)
       end
 
       # in-memory -> DB (compress)
       def serialize(value)
-        @codec.dump(value)
+        codec.dump(value)
       end
 
       def changed_in_place?(raw_old_value, new_value)
-        return false unless @mutable
+        return false unless mutable
 
         deserialize(raw_old_value) != new_value
       end
     end
 
     class Coder
+      attr_reader :codec
+      private :codec
+
       def initialize(**codec_opts)
         @codec = MultiCompress::Codec.new(**codec_opts)
       end
 
       def dump(value)
-        @codec.dump(value)
+        codec.dump(value)
       end
 
       def load(value)
-        @codec.load(value)
+        codec.load(value)
       end
     end
   end

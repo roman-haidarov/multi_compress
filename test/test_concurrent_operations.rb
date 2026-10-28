@@ -11,6 +11,58 @@ class TestConcurrentOperations < Minitest::Test
     @compression_data = "A" * 100_000
   end
 
+  def test_stream_rejects_concurrent_operations_and_recovers
+    deflater = MultiCompress::Deflater.new(algo: :zstd)
+    deflater_entered = Queue.new
+    deflater_resume = Queue.new
+    input = Object.new
+    input.define_singleton_method(:to_str) do
+      deflater_entered << true
+      deflater_resume.pop
+      "stream input"
+    end
+    deflater_thread = Thread.new { deflater.write(input) }
+
+    begin
+      Timeout.timeout(5) { deflater_entered.pop }
+      assert_raises(MultiCompress::StreamError) { deflater.write("concurrent") }
+    ensure
+      deflater_resume << true
+    end
+
+    begin
+      compressed = deflater_thread.value + deflater.finish
+      assert_equal "stream input", MultiCompress.decompress(compressed, algo: :zstd)
+    ensure
+      deflater.close
+    end
+
+    compressed = MultiCompress.compress("inflater input", algo: :zstd)
+    inflater = MultiCompress::Inflater.new(algo: :zstd)
+    inflater_entered = Queue.new
+    inflater_resume = Queue.new
+    input = Object.new
+    input.define_singleton_method(:to_str) do
+      inflater_entered << true
+      inflater_resume.pop
+      compressed
+    end
+    inflater_thread = Thread.new { inflater.write(input) }
+
+    begin
+      Timeout.timeout(5) { inflater_entered.pop }
+      assert_raises(MultiCompress::StreamError) { inflater.write(compressed) }
+    ensure
+      inflater_resume << true
+    end
+
+    begin
+      assert_equal "inflater input", inflater_thread.value
+    ensure
+      inflater.close
+    end
+  end
+
   def test_concurrent_dictionary_usage_zstd
     dict_data = "common patterns for zstd compression dictionary test data"
     dict = MultiCompress::Dictionary.new(dict_data, algo: :zstd)

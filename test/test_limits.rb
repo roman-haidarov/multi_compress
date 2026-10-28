@@ -98,6 +98,16 @@ class TestLimits < Minitest::Test
     assert_match(/exceeds limit/i, error.message)
   end
 
+  def test_max_output_size_rejects_values_larger_than_ruby_string_limit
+    too_large = 1 << (0.size * 8 - 1)
+
+    error = assert_raises(ArgumentError) do
+      MultiCompress.decompress("", algo: :zstd, max_output_size: too_large)
+    end
+
+    assert_match(/maximum string length/i, error.message)
+  end
+
 
   def test_streaming_ratio_guard_uses_consumed_input_for_mid_chunk_trigger
     compressible = ("A" * (512 * 1024)).b

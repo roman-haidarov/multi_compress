@@ -26,10 +26,10 @@ class TestVendoredVersions < Minitest::Test
       [name, version]
     end
 
-    assert_equal "1.2.0", versions.fetch("brotli")
+    assert_equal "1.2.1", versions.fetch("brotli")
   end
 
   def test_runtime_uses_brotli_1_2_0
-    assert_equal "1.2.0", MultiCompress.version(:brotli)
+    assert_equal "1.2.1", MultiCompress.version(:brotli)
   end
 end
